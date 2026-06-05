@@ -1,9 +1,0 @@
-{
-  "name": "scicode-native-validator-extension",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Chrome extension package using local Python native messaging backend",
-  "scripts": {
-    "pack": "powershell -NoProfile -Command \"if (Test-Path dist) { Remove-Item -Recurse -Force dist }; New-Item -ItemType Directory -Path dist | Out-Null; Compress-Archive -Path manifest.json,popup.html,popup.js,styles.css,README.md -DestinationPath dist/scicode-native-validator-extension.zip -Force\""
-  }
-}

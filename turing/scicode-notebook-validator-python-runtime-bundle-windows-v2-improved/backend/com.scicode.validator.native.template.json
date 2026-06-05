@@ -1,9 +1,0 @@
-{
-  "name": "com.scicode.validator.native",
-  "description": "SciCode local Python validator native messaging host",
-  "path": "C:\\Users\\User\\AppData\\Roaming\\SciCodeNative\\backend\\run_scicode_native_host.cmd",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://bgpcmigfmeddldfldpfidjpiegmjalag/"
-  ]
-}

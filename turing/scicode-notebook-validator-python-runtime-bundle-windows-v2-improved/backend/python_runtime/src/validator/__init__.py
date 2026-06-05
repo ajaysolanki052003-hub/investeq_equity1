@@ -1,1 +1,0 @@
-# SciCode JSON task validator
