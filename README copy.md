@@ -225,80 +225,18 @@ All panes share a time axis and crosshair; pan/zoom one and the others follow.
 The notebook builds a short-straddle strategy:
 
 - **Entry**: sell ATM CE+PE at the trading day **before expiry** at 15:20 IST
-- **Exit**: buy back at 09:20 IST on expiry day — same strike that was sold (no re-ATM)
-- 296 weekly events from 2020-01 to 2026-03 → 147 with full v2 features (52-week IV-rank warmup drops the first year)
+- **Exit**: buy back at 09:20 IST on expiry day
+- 294 weekly events from 2020-12 to 2026-03 → 146 with full v2 features (52-week IV-rank warmup drops the first year)
 
 Baseline (blind, no filter):
 
-- Win rate **73.0%**, mean P&L **+3.07 pts/trade**, total **+909.70 pts**
-- Worst trade **−523.35** (2026-02-03, 25100 ATM, +764 pt overnight gap), best +115.60
-- By year (win %): 71.7 / 78.8 / 71.7 / 70.5 / 65.1 / 77.1 / 80.0  (2020 → 2026)
-
-> **Earlier headline numbers (95.2% win, +8,190 pts, worst −125)** were the result of a buy-back bug: the notebook re-picked ATM on expiry-day spot at exit instead of buying back the strike that was sold. Fixed 2026-05-21 — see commit history and the `_regen_straddle_pnl.py` helper.
+- Win rate **95.2%**, mean P&L **+27.9 pts/trade**, total **+8,190 pts**
+- Worst trade −125, best +129; by year: 100/98/96/95/88/96/78 % wins
 
 ML results on the v2 feature set (PCR, max-pain distance, IV term-slope, intraday/last-hour returns, DTE/DOW, plus the v1 IV-rank/RV/IV-RV-spread features):
 
 | Model | CV mean AUC | Holdout AUC |
 |---|---|---|
-| Logistic (v1) | 0.492 | 0.458 |
-| LightGBM (v2) | 0.521 | 0.473 |
-| MLP (v2)      | 0.385 | — |
-
-With realistic labels (73% wins instead of 95%) LGBM's OOF probabilities now spread out — min 0.065, median 0.886, max 0.997 — so threshold-based filtering actually moves the equity curve. At threshold **0.84** the filter takes 69/147 trades for **+568.8 pts** (max DD −276.8). The Logistic + LGBM holdout AUCs are now slightly below 0.5, so the model's edge on out-of-sample data is marginal at best — the v2 features capture in-sample CV signal that doesn't generalise. Real progress will need either richer features, probability calibration, or switching to expected-P&L regression rather than win/loss classification.
-
-Each notebook run writes:
-
-- `ML_DL/features/straddle_lgbm_<YYYYMMDD_HHMM>.parquet` (146 events × all features + OOF probabilities)
-- `ML_DL/models/straddle_lgbm_<…>.pkl` (LGBM + features list + best threshold)
-- `ML_DL/outputs/straddle_lgbm_<…>_metrics.json`
-- `ML_DL/plots/straddle_lgbm_<…>_equity.png`
-
-See `ML_DL/README.md` for the full spec (task catalogue, feature catalogue, labelling protocols, validation rules, references).
-
----
-
-## Data layout
-
-Detailed schema lives at `DATA/README.md`. TL;DR:
-
-| Source | Purpose | Join key |
-|---|---|---|
-| `DATA/spot/YYYYMMDD.parquet` | 1-min NIFTY spot OHLCV | `timestamp` |
-| `DATA/options/YYYYMMDD.parquet` | 1-min OHLCV per option contract | `timestamp, expiry, strike, option_type` |
-| `DATA/oi/YYYYMMDD.parquet` | 1-min OI per contract | same as options |
-| `DATA/index/expiries.parquet` | full expiry list | — |
-| `DATA/straddle_pnl.parquet` | notebook output: 294 weekly straddle events | `expiry` |
-
-Gotchas (from `DATA/README.md`):
-
-- Timestamps are **strings, no tz**, IST — cast and localise.
-- Contract minutes are **sparse** — reindex against the session grid before sequence modelling.
-- **Lot size** changed over the window (75 → 50 → 25 → 75) — load from a date-keyed table, never hardcode.
-- **No survivorship adjustment needed** — every traded contract is present, including those that expired worthless.
-- Derive the trading calendar from `spot/` filenames, not `trading_days.parquet`.
-
-The EMA scanners read CSVs from a separate location (`ajs/data/{1h,1d}/` or `ema_scanner/data/{1h,1d}/`) refreshed by `ema_scanner/incremental_fetch.py`.
-
----
-
-## Stop / clean-up
-
-Windows — kill whatever's listening on a port:
-
-```powershell
-$pids = (Get-NetTCPConnection -LocalPort 8703 -ErrorAction SilentlyContinue).OwningProcess | Sort-Object -Unique
-$pids | ForEach-Object { Stop-Process -Id $_ -Force }
-```
-
-Bash:
-
-```bash
-lsof -ti :8703 | xargs -r kill -9    # POSIX
-netstat -ano | grep ':8703'          # Windows, then taskkill /PID <pid> /F
-```
-
----
-
-## Reference UI (external)
-
-`http://34.100.162.71:8765/` — teammate's pre-existing option-chain-replay site, hosted on the GCP VM that originally stored the dataset. Not in this repo; used as design inspiration for `app_option_replay_tv.py`.
+| Logistic (v1) | 0.494 | 0.615 |
+| LightGBM (v2) | 0.334 | 0.602 |
+| MLP (v2)      | 0.326 | — |

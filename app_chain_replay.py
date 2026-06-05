@@ -753,10 +753,11 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
     <button data-ind="rv" title="Realized vol % of spot">RV</button>
   </span>
 
-  <label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin-left:6px;">
-    <input id="idx-on" type="checkbox" style="margin:0;">
-    <span style="font-size:11px; color:var(--gold); letter-spacing:1.2px;">INDEX</span>
-  </label>
+  <label>View</label>
+  <span class="tf-grp" id="view-grp">
+    <button data-view="option" class="on" title="CE and PE charts side-by-side">OPTION</button>
+    <button data-view="index" title="NIFTY spot chart only">INDEX</button>
+  </span>
   <input id="rv-lookback" type="number" min="3" max="200" value="30"
          title="RV lookback (bars)"
          style="width:58px; background:var(--panel-2); border:1px solid var(--border-hi); color:var(--text); border-radius:5px; padding:5px 7px; font:inherit; font-family:'JetBrains Mono', monospace;" />
@@ -907,8 +908,8 @@ const state = {
   ceStrike: null, peStrike: null, atm: null,
   ceChart: null, ceCandle: null, ceBars: [],
   peChart: null, peCandle: null, peBars: [],
-  // INDEX (NIFTY spot) sub-pane between CE and PE; hidden by default
-  idxChart: null, idxCandle: null, idxBars: [], showIdx: false,
+  // View mode: 'option' (CE+PE side-by-side, default) or 'index' (spot only)
+  idxChart: null, idxCandle: null, idxBars: [], viewMode: 'option',
   // Indicator line series (created in makeAllCharts)
   sOiCE: null, sIvCE: null, sRvCE: null,
   sOiPE: null, sIvPE: null, sRvPE: null,
@@ -1149,9 +1150,9 @@ function refitAllCharts() {
   });
 }
 
-// ── INDEX (NIFTY spot) — drawn between CE and PE when the checkbox is on ─
+// ── INDEX (NIFTY spot) — full-width chart when View = INDEX ───────────────
 async function loadIndex() {
-  if (!state.date || !state.showIdx) {
+  if (!state.date || state.viewMode !== 'index') {
     if (state.idxCandle) state.idxCandle.setData([]);
     state.idxBars = [];
     return;
@@ -1189,8 +1190,11 @@ async function loadRV() {
 function syncPaneVisibility() {
   $('pane-oi').classList.toggle('hidden', !state.showOI);
   $('pane-vol').classList.toggle('hidden', !state.showIV && !state.showRV);
-  // INDEX sub-pane between CE and PE — flex auto-redistributes width when hidden
-  $('opt-sub-idx').classList.toggle('hidden', !state.showIdx);
+  // View toggle: OPTION shows CE+PE, hides IDX. INDEX shows IDX only, hides CE+PE.
+  const indexMode = state.viewMode === 'index';
+  document.querySelector('.opt-sub.ce').classList.toggle('hidden', indexMode);
+  document.querySelector('.opt-sub.pe').classList.toggle('hidden', indexMode);
+  $('opt-sub-idx').classList.toggle('hidden', !indexMode);
   // After visibility changes, charts may need a re-measure
   setTimeout(() => {
     if (state.oiChart)  state.oiChart.applyOptions({ autoSize: true });
@@ -1204,9 +1208,12 @@ function syncPaneVisibility() {
 // ── Cursor line (gold vertical) — placed via pixel offset on the chart ───
 function updateCursors() {
   const t = minuteToUnix(state.date, state.minute);
-  placeCursor($('cur-ce'),  state.ceChart,  state.ceBars, t);
-  placeCursor($('cur-pe'),  state.peChart,  state.peBars, t);
-  if (state.showIdx)                placeCursor($('cur-idx'), state.idxChart, state.idxBars, t);
+  if (state.viewMode === 'option') {
+    placeCursor($('cur-ce'),  state.ceChart,  state.ceBars, t);
+    placeCursor($('cur-pe'),  state.peChart,  state.peBars, t);
+  } else {
+    placeCursor($('cur-idx'), state.idxChart, state.idxBars, t);
+  }
   // Indicator panes use any available bar series for x-coordinate lookup
   if (state.showOI)                 placeCursor($('cur-oi'),  state.oiChart,  state.ceOI.length ? state.ceOI : state.peOI, t);
   if (state.showIV || state.showRV) placeCursor($('cur-vol'), state.volChart, state.rvLine.length ? state.rvLine : (state.ceIV.length ? state.ceIV : state.peIV), t);
@@ -1299,7 +1306,7 @@ async function selectDay(d) {
   await loadStrikes();
   setMinute(0);
   await loadOption();
-  if (state.showIdx) await loadIndex();   // re-fetch spot for the new date
+  if (state.viewMode === 'index') await loadIndex();   // re-fetch spot for new date
   loadChain();
 }
 
@@ -1478,14 +1485,19 @@ function attach() {
     });
   });
 
-  // INDEX checkbox — toggle the spot chart between CE and PE.
-  // When checked: fetch /api/spot at the current TF, show the sub-pane.
-  // When unchecked: hide; CE and PE flex back to full width.
-  $('idx-on').addEventListener('change', async e => {
-    state.showIdx = !!e.target.checked;
-    if (state.showIdx) await loadIndex();
-    syncPaneVisibility();
-    updateCursors();
+  // View-mode toggle (OPTION ⇄ INDEX). OPTION shows CE+PE side-by-side
+  // (default). INDEX shows the NIFTY spot chart full-width with CE/PE hidden.
+  document.querySelectorAll('#view-grp button').forEach(b => {
+    b.addEventListener('click', async () => {
+      const v = b.dataset.view;
+      if (state.viewMode === v) return;
+      document.querySelectorAll('#view-grp button').forEach(x => x.classList.remove('on'));
+      b.classList.add('on');
+      state.viewMode = v;
+      if (v === 'index') await loadIndex();
+      syncPaneVisibility();
+      updateCursors();
+    });
   });
 
   // RV lookback editor — only refetches RV when changed (cheap)
