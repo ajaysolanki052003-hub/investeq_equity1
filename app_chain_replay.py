@@ -184,6 +184,69 @@ def strikes(date: str = Query(...), expiry: str = Query(...)):
     return {"strikes": ks, "atm": atm}
 
 
+@lru_cache(maxsize=2)
+def _full_spot_history(tf: str) -> pd.DataFrame:
+    """Aggregate every spot/YYYYMMDD.parquet into a single OHLC series at the
+    requested TF. Cached for the lifetime of the process — the underlying
+    files don't change inside a run."""
+    files = sorted(SPOT_DIR.glob("*.parquet"))
+    if not files:
+        return pd.DataFrame()
+    if tf == "1d":
+        # Fast path: aggregate each day's 1-min bars to one OHLC row without
+        # paying the full concat-and-resample cost.
+        rows = []
+        for f in files:
+            try:
+                df = pd.read_parquet(f, columns=["open", "high", "low", "close"])
+                if df.empty:
+                    continue
+                ts = pd.to_datetime(f.stem, format="%Y%m%d") + pd.Timedelta(hours=9, minutes=15)
+                rows.append({
+                    "timestamp": ts,
+                    "open":  float(df["open"].iloc[0]),
+                    "high":  float(df["high"].max()),
+                    "low":   float(df["low"].min()),
+                    "close": float(df["close"].iloc[-1]),
+                })
+            except Exception:
+                continue
+        return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+    # Other TFs: read all, concat, resample once
+    frames = []
+    for f in files:
+        try:
+            frames.append(pd.read_parquet(
+                f, columns=["timestamp", "open", "high", "low", "close"]))
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    full = pd.concat(frames, ignore_index=True)
+    full["timestamp"] = pd.to_datetime(full["timestamp"])
+    full = full.sort_values("timestamp").assign(volume=0).reset_index(drop=True)
+    return resample_ohlc(
+        full[["timestamp", "open", "high", "low", "close", "volume"]], tf)
+
+
+@app.get("/api/spot_all")
+def spot_all(tf: str = "1d"):
+    """Full multi-year spot OHLC for the INDEX view in the chain-replay UI.
+    Defaults to 1d (smallest payload, ~1500 bars across 6 yrs)."""
+    bars = _full_spot_history(tf)
+    if bars.empty:
+        return JSONResponse({"bars": [], "n": 0})
+    t = to_unix(bars["timestamp"])
+    out = [{
+        "time" : int(t[i]),
+        "open" : float(bars["open"].iloc[i]),
+        "high" : float(bars["high"].iloc[i]),
+        "low"  : float(bars["low"].iloc[i]),
+        "close": float(bars["close"].iloc[i]),
+    } for i in range(len(bars))]
+    return JSONResponse({"bars": out, "n": len(out), "tf": tf})
+
+
 @app.get("/api/spot")
 def spot(date: str = Query(...), tf: str = "1m"):
     df = load_spot(date)
@@ -609,7 +672,7 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
 .pane.fullscreen .fs-btn { color: var(--green); border-color: var(--green); }
 
 /* When a pane is hidden by a layout preset */
-.pane.hidden, .col.hidden { display: none; }
+.pane.hidden, .col.hidden, .scrub.hidden { display: none; }
 .tf-grp button {
   padding: 5px 9px; font-size: 11px; font-weight: 700; letter-spacing: 0.4px;
   background: var(--panel-2); border: 1px solid var(--border); color: var(--muted-hi);
@@ -770,7 +833,7 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
   <span style="margin-left:auto; color:var(--muted); font-size:11px;" id="status">—</span>
 </div>
 
-<div class="scrub">
+<div class="scrub" id="scrub-bar">
   <button class="play" id="play" title="Auto-play minute by minute">▶</button>
   <div class="scrub-time" id="cursor-time">09:15</div>
   <input id="slider" class="scrub-slider" type="range" min="0" max="374" value="0">
@@ -908,8 +971,10 @@ const state = {
   ceStrike: null, peStrike: null, atm: null,
   ceChart: null, ceCandle: null, ceBars: [],
   peChart: null, peCandle: null, peBars: [],
-  // View mode: 'option' (CE+PE side-by-side, default) or 'index' (spot only)
-  idxChart: null, idxCandle: null, idxBars: [], viewMode: 'option',
+  // View mode: 'option' (CE+PE side-by-side, default) or 'index' (full 6-yr
+  // historical spot chart, navigable like TradingView)
+  idxChart: null, idxCandle: null, idxBars: [], idxFullBars: null,
+  viewMode: 'option',
   // Indicator line series (created in makeAllCharts)
   sOiCE: null, sIvCE: null, sRvCE: null,
   sOiPE: null, sIvPE: null, sRvPE: null,
@@ -958,9 +1023,27 @@ function makeAllCharts() {
   state.peChart  = mkChart($('opt-chart-pe'));
   state.peCandle = mkCandleSeries(state.peChart, 'PE');
 
-  // INDEX (NIFTY spot) chart — same candle series, slotted between CE and PE.
-  // Always created; data is only fetched while the INDEX checkbox is on.
+  // INDEX (NIFTY spot) chart — used standalone in INDEX view to show the full
+  // 6-yr 1d history. Uses a date-aware tick formatter (Jan '22 / Mar 2024)
+  // instead of the intraday HH:MM formatter the CE/PE charts use.
   state.idxChart  = mkChart($('opt-chart-idx'));
+  state.idxChart.applyOptions({
+    timeScale: {
+      timeVisible: false, secondsVisible: false,
+      tickMarkFormatter: (t) => {
+        const d = new Date(t * 1000);
+        const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        return `${d.getUTCDate()} ${m[d.getUTCMonth()]} '${String(d.getUTCFullYear()).slice(2)}`;
+      },
+    },
+    localization: {
+      timeFormatter: (t) => {
+        const d = new Date(t * 1000);
+        const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        return `${d.getUTCDate()} ${m[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+      },
+    },
+  });
   state.idxCandle = mkCandleSeries(state.idxChart, 'IDX');
 
   // EMA overlays — fast = orange, slow = blue. Hidden until user toggles on.
@@ -1002,8 +1085,9 @@ function makeAllCharts() {
     lastValueVisible: true,
   });
 
-  // Time-axis sync across all 5 charts (CE, PE, IDX, OI, Vol)
-  const allCharts = [state.ceChart, state.peChart, state.idxChart, state.oiChart, state.volChart];
+  // Time-axis sync across the intraday charts only (CE, PE, OI, Vol).
+  // idxChart shows multi-year 1d data — different time scale — kept separate.
+  const allCharts = [state.ceChart, state.peChart, state.oiChart, state.volChart];
   allCharts.forEach(c => {
     c.timeScale().subscribeVisibleLogicalRangeChange(range => {
       if (state.syncing || !range) return;
@@ -1150,22 +1234,70 @@ function refitAllCharts() {
   });
 }
 
-// ── INDEX (NIFTY spot) — full-width chart when View = INDEX ───────────────
+// ── INDEX view (full 6-yr spot, TradingView-style) ────────────────────────
+// Loaded ONCE per session, cached in state.idxFullBars. After that, picking
+// a different date just scrolls the chart — no refetch, no flicker.
 async function loadIndex() {
-  if (!state.date || state.viewMode !== 'index') {
-    if (state.idxCandle) state.idxCandle.setData([]);
-    state.idxBars = [];
+  if (state.viewMode !== 'index') return;
+
+  // Already loaded → just scroll to the current selected date
+  if (state.idxFullBars && state.idxFullBars.length) {
+    scrollIndexToDate();
     return;
   }
-  const qs = new URLSearchParams({ date: state.date, tf: state.tf });
+
+  // First-time fetch of the full history (1d resolution, ~1.5k bars)
+  $('opt-info').textContent = 'loading full history…';
   try {
-    const r = await fetch(`/api/spot?${qs}`);
-    if (!r.ok) { state.idxBars = []; state.idxCandle.setData([]); return; }
+    const r = await fetch('/api/spot_all?tf=1d');
+    if (!r.ok) {
+      state.idxFullBars = [];
+      return;
+    }
     const j = await r.json();
-    state.idxBars = j.bars || [];
+    state.idxFullBars = j.bars || [];
+    state.idxBars = state.idxFullBars;
     state.idxCandle.setData(state.idxBars);
+    // First-render: fit content so the whole 6-yr range is visible briefly,
+    // then zoom to the current selected date
     state.idxChart.timeScale().fitContent();
-  } catch (_) { state.idxBars = []; state.idxCandle.setData([]); }
+    requestAnimationFrame(() => scrollIndexToDate());
+  } catch (e) {
+    state.idxFullBars = [];
+    $('opt-info').textContent = `index load failed: ${e}`;
+  }
+}
+
+// Center the index chart on `state.date` with a ~120-day window. The gold
+// cursor line marks the date itself; user can pan/zoom freely from there.
+function scrollIndexToDate() {
+  if (!state.date || !state.idxBars || !state.idxBars.length || !state.idxChart) return;
+  // state.date is "YYYYMMDD". Compute the bar timestamp for that day's 09:15 IST
+  // (which we encoded as UTC seconds at the same wall-clock — see to_unix).
+  const y = parseInt(state.date.slice(0, 4), 10);
+  const m = parseInt(state.date.slice(4, 6), 10) - 1;
+  const d = parseInt(state.date.slice(6, 8), 10);
+  const targetT = Date.UTC(y, m, d, 9, 15) / 1000;
+
+  // Find the bar at-or-before targetT (the date might be a non-trading day)
+  let idx = -1;
+  for (let i = state.idxBars.length - 1; i >= 0; i--) {
+    if (state.idxBars[i].time <= targetT) { idx = i; break; }
+  }
+  if (idx < 0) idx = 0;
+
+  const half = 60;   // 60 trading days on each side → ~6-month window
+  const from = Math.max(0, idx - half);
+  const to   = Math.min(state.idxBars.length - 1, idx + half);
+  try {
+    state.idxChart.timeScale().setVisibleRange({
+      from: state.idxBars[from].time,
+      to:   state.idxBars[to].time,
+    });
+  } catch (_) { /* range may not be valid yet — fitContent handles it */ }
+  placeCursor($('cur-idx'), state.idxChart, state.idxBars, state.idxBars[idx].time);
+  $('opt-info').textContent =
+    `INDEX · 6yr · ${state.idxBars.length} bars · centered ${state.date}`;
 }
 
 // ── RV (spot realized vol) — drawn on the vol sub-pane ──────────────────
@@ -1190,16 +1322,26 @@ async function loadRV() {
 function syncPaneVisibility() {
   $('pane-oi').classList.toggle('hidden', !state.showOI);
   $('pane-vol').classList.toggle('hidden', !state.showIV && !state.showRV);
-  // View toggle: OPTION shows CE+PE, hides IDX. INDEX shows IDX only, hides CE+PE.
+  // View toggle: OPTION shows CE+PE + scrubber. INDEX shows IDX only, hides
+  // CE/PE *and* the minute scrubber (which is meaningless on a multi-yr chart).
   const indexMode = state.viewMode === 'index';
   document.querySelector('.opt-sub.ce').classList.toggle('hidden', indexMode);
   document.querySelector('.opt-sub.pe').classList.toggle('hidden', indexMode);
   $('opt-sub-idx').classList.toggle('hidden', !indexMode);
-  // After visibility changes, charts may need a re-measure
+  const scrub = $('scrub-bar'); if (scrub) scrub.classList.toggle('hidden', indexMode);
+  // After visibility changes, charts may need a re-measure + a clean fit so
+  // the canvas doesn't keep a stale visible range from the previous view.
   setTimeout(() => {
     if (state.oiChart)  state.oiChart.applyOptions({ autoSize: true });
     if (state.volChart) state.volChart.applyOptions({ autoSize: true });
-    if (state.idxChart) state.idxChart.applyOptions({ autoSize: true });
+    if (state.idxChart) {
+      state.idxChart.applyOptions({ autoSize: true });
+      if (indexMode) {
+        // Either fit the freshly-loaded history or re-center on the date
+        if (state.idxBars && state.idxBars.length) scrollIndexToDate();
+        else state.idxChart.timeScale().fitContent();
+      }
+    }
     refitAllCharts();
     updateCursors();
   }, 60);
@@ -1306,7 +1448,9 @@ async function selectDay(d) {
   await loadStrikes();
   setMinute(0);
   await loadOption();
-  if (state.viewMode === 'index') await loadIndex();   // re-fetch spot for new date
+  // In INDEX mode the full history is already loaded — just jump the
+  // chart to the picked date. No refetch.
+  if (state.viewMode === 'index') scrollIndexToDate();
   loadChain();
 }
 
@@ -1462,7 +1606,9 @@ function attach() {
       document.querySelectorAll('#tf-grp button').forEach(x => x.classList.remove('on'));
       b.classList.add('on');
       state.tf = b.dataset.tf;
-      await Promise.all([loadOption(), loadIndex()]);   // also re-pulls IDX at the new TF
+      // INDEX mode is locked to 1d full-history; TF buttons only affect
+      // CE/PE/OI/Vol when the user is in OPTION view.
+      await loadOption();
       updateCursors();
     });
   });
