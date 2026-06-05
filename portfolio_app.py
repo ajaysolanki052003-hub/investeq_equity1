@@ -90,9 +90,9 @@ STATS = {
 #   accent      — hex colour for the accent stripe + glow
 PROJECTS = [
     {
-        "id": "atlas",
-        "name": "Atlas",
-        "instrument": "Module · I",
+        "id": "volatility-desk",
+        "name": "Volatility Desk",
+        "instrument": "Options",
         "tag": "LIVE",
         "category": "OPTIONS",
         "thesis": "",
@@ -104,10 +104,10 @@ PROJECTS = [
         "accent": "#26a69a",
     },
     {
-        "id": "helios",
-        "name": "Helios",
-        "instrument": "Module · II",
-        "tag": "LIVE",
+        "id": "chain-replay",
+        "name": "Chain Replay",
+        "instrument": "Options",
+        "tag": "RESEARCH",
         "category": "OPTIONS",
         "thesis": "",
         "stack": [],
@@ -118,9 +118,9 @@ PROJECTS = [
         "accent": "#60a5fa",
     },
     {
-        "id": "argos",
-        "name": "Argos",
-        "instrument": "Module · III",
+        "id": "daily-scanner",
+        "name": "Daily Scanner",
+        "instrument": "Equities",
         "tag": "LIVE",
         "category": "EQUITIES",
         "thesis": "",
