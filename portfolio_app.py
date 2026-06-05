@@ -53,21 +53,26 @@ def _authed(request: Request) -> bool:
 
 
 PROFILE = {
-    "name"     : "Aurora",
-    "role"     : "Private Workspace",
-    "headline" : "",
-    "tagline"  : "",
+    "name"     : "Hi Ajay",
+    "role"     : "Systematic Trading Desk",
+    "headline" : "Quantitative strategies for Indian F&O and equities.",
+    "tagline"  : (
+        "Walk-forward backtested. Live-monitored. Audit-ready. "
+        "We design and run systematic strategies across NSE options and "
+        "equities — built on six years of 1-minute data, validated with "
+        "time-series cross-validation, and surfaced through trading-floor "
+        "dashboards your team can supervise in real time."
+    ),
     "email"    : "ajaysolanki052003@gmail.com",
-    "location" : "",
+    "location" : "India · IST",
 }
 
-# Firm-level numbers shown in the hero. Blanked out for the public-facing
-# cover — frontend renders empty when these are 0.
+# Firm-level numbers shown in the hero. Edit when the suite changes.
 STATS = {
-    "strategies_live"   : 0,
-    "events_backtested" : 0,
-    "years_of_data"     : 0,
-    "granularity_min"   : 0,
+    "strategies_live"   : 3,
+    "events_backtested" : 296,
+    "years_of_data"     : 6,
+    "granularity_min"   : 1,
 }
 
 # Each entry below is a strategy in the suite. Schema:
@@ -85,11 +90,11 @@ STATS = {
 #   accent      — hex colour for the accent stripe + glow
 PROJECTS = [
     {
-        "id": "module-a",
-        "name": "Aurora · A",
-        "instrument": "",
+        "id": "atlas",
+        "name": "Atlas",
+        "instrument": "Module · I",
         "tag": "LIVE",
-        "category": "",
+        "category": "OPTIONS",
         "thesis": "",
         "stack": [],
         "port": 8703,
@@ -99,11 +104,11 @@ PROJECTS = [
         "accent": "#26a69a",
     },
     {
-        "id": "module-b",
-        "name": "Aurora · B",
-        "instrument": "",
+        "id": "helios",
+        "name": "Helios",
+        "instrument": "Module · II",
         "tag": "LIVE",
-        "category": "",
+        "category": "OPTIONS",
         "thesis": "",
         "stack": [],
         "port": 8704,
@@ -113,11 +118,11 @@ PROJECTS = [
         "accent": "#60a5fa",
     },
     {
-        "id": "module-c",
-        "name": "Aurora · C",
-        "instrument": "",
+        "id": "argos",
+        "name": "Argos",
+        "instrument": "Module · III",
         "tag": "LIVE",
-        "category": "",
+        "category": "EQUITIES",
         "thesis": "",
         "stack": [],
         "port": 8501,
@@ -175,7 +180,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Aurora</title>
+<title>Hi Ajay · Systematic Trading Desk</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -495,8 +500,10 @@ section { padding: 72px 32px; max-width: 1380px; margin: 0 auto; }
   display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
 }
 .card-title {
-  font-size: 16.5px; font-weight: 700; line-height: 1.25; margin-bottom: 6px;
-  color: var(--text);
+  font-size: 28px; font-weight: 800; line-height: 1.1; margin-bottom: 8px;
+  letter-spacing: -0.6px;
+  background: linear-gradient(120deg, var(--text) 0%, var(--accent, var(--green)) 120%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
 }
 .card-status {
   display: flex; align-items: center; gap: 6px; font-size: 10px;
@@ -676,9 +683,9 @@ footer.contact {
 /* Strategy subtitle line on each card */
 .card-instr {
   font-family: 'JetBrains Mono', monospace;
-  font-size: 10.5px; letter-spacing: 0.6px;
-  color: var(--accent, var(--green));
-  margin-top: 2px;
+  font-size: 10.5px; letter-spacing: 2px; text-transform: uppercase;
+  color: var(--muted-hi);
+  margin-top: 4px;
 }
 
 /* ── Responsive ────────────────────────────────────────────────────────── */
@@ -705,8 +712,8 @@ footer.contact {
 <header class="topbar">
   <div class="brand">
     <span class="logo">◆</span>
-    <span class="brand-name" id="brand-name">AURORA</span>
-    <span class="brand-role" id="brand-role">PRIVATE WORKSPACE</span>
+    <span class="brand-name" id="brand-name">HI AJAY</span>
+    <span class="brand-role" id="brand-role">SYSTEMATIC TRADING DESK</span>
   </div>
   <div class="topbar-right">
     <span class="market-status" id="market-status">
@@ -731,20 +738,20 @@ footer.contact {
     <div class="aurora aurora-c"></div>
   </div>
   <div class="hero-left">
-    <div class="kicker">AURORA · <span id="hero-date">—</span></div>
-    <h1>Aurora.<br><span class="accent">Private.</span></h1>
-    <div class="headline" id="hero-headline"></div>
+    <div class="kicker">STRATEGY DESK · <span id="hero-date">—</span></div>
+    <h1>Quant strategies.<br><span class="accent">Engineered.</span></h1>
+    <div class="headline" id="hero-headline">Systematic options &amp; equities strategies for Indian capital markets.</div>
     <p class="tagline" id="hero-tagline"></p>
     <div class="hero-stats" id="hero-stats"></div>
     <div class="hero-cta">
-      <a class="btn primary" href="#projects">Open workspace ↓</a>
+      <a class="btn primary" href="#projects">View strategy suite ↓</a>
     </div>
   </div>
   <div class="hero-right">
     <div class="hero-chart">
       <div class="chart-bar">
         <div class="chart-title">
-          <span class="live-pill">LIVE</span> AURORA · 5m
+          <span class="live-pill">LIVE</span> NIFTY 50 · 5m
         </div>
         <div class="chart-px">
           <span class="v" id="chart-px">—</span>
@@ -767,27 +774,84 @@ footer.contact {
 <!-- Strategy suite -->
 <section id="projects">
   <header class="section-head">
-    <h2><span class="num">01</span> Modules <span class="count" id="proj-count"></span></h2>
+    <h2><span class="num">01</span> Strategy suite <span class="count" id="proj-count"></span></h2>
     <div class="filters" id="filters">
       <button class="filter on" data-cat="ALL">ALL</button>
+      <button class="filter" data-cat="OPTIONS">OPTIONS</button>
+      <button class="filter" data-cat="EQUITIES">EQUITIES</button>
     </div>
   </header>
-  <p class="section-sub"></p>
+  <p class="section-sub">
+    Each strategy below is wired to a live monitoring dashboard. A green dot means
+    the desk is currently quoting; a grey dot means the engine is parked. Click
+    <em>Open dashboard</em> to inspect every historical signal, the exit, and the
+    realised P&amp;L bar-by-bar.
+  </p>
   <div class="grid" id="project-grid"></div>
 </section>
 
-<!-- (workspace description removed for the public-facing cover) -->
+<!-- How we work -->
+<section id="how">
+  <header class="section-head">
+    <h2><span class="num">02</span> How the desk works</h2>
+  </header>
+  <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));">
+    <div class="card" style="--accent:#26a69a; --accent-faint:rgba(38,166,154,0.12); min-height: 0;">
+      <div class="card-head">
+        <div class="card-title">01 · Data</div>
+        <div class="card-tag">FOUNDATION</div>
+      </div>
+      <div class="card-desc">
+        Six years of 1-minute NSE F&amp;O and equities data, partitioned by trading
+        day in Parquet. Lot-size aware, IST-anchored, reproducible from raw
+        ingestion logs.
+      </div>
+    </div>
+    <div class="card" style="--accent:#60a5fa; --accent-faint:rgba(96,165,250,0.12); min-height: 0;">
+      <div class="card-head">
+        <div class="card-title">02 · Research</div>
+        <div class="card-tag">VALIDATION</div>
+      </div>
+      <div class="card-desc">
+        Walk-forward cross-validation, leakage checks, SHAP attribution. No
+        single-fold heroics — every strategy is signed off on out-of-sample
+        equity curves and drawdown stats.
+      </div>
+    </div>
+    <div class="card" style="--accent:#c084fc; --accent-faint:rgba(192,132,252,0.12); min-height: 0;">
+      <div class="card-head">
+        <div class="card-title">03 · Live</div>
+        <div class="card-tag">EXECUTION</div>
+      </div>
+      <div class="card-desc">
+        Real-time monitoring dashboards with on-chart entry / exit markers,
+        per-leg P&amp;L, and an audit trail back to the raw 1-minute bars. Built
+        for supervised execution.
+      </div>
+    </div>
+  </div>
+</section>
 
 <!-- Footer -->
 <footer class="contact">
   <div>
-    <div class="footer-name" id="footer-name">Aurora</div>
-    <div class="footer-loc" id="footer-loc">Private workspace</div>
+    <div class="footer-name" id="footer-name">Hi Ajay</div>
+    <div class="footer-loc" id="footer-loc">Systematic Trading Desk · India · IST</div>
   </div>
   <div class="footer-links">
     <a id="footer-email" href="#">Mail</a>
   </div>
 </footer>
+
+<div class="disclosure">
+  <strong>Disclosure.</strong>
+  All figures are derived from in-sample and out-of-sample backtests on historical
+  NSE data and are presented for informational purposes only. Past performance is
+  not indicative of future results. Trading in derivatives carries substantial
+  risk of loss. Strategies are not registered investment advisory services;
+  this site is not a solicitation, and figures may be revised as the production
+  book evolves.
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -829,7 +893,20 @@ function setHeroDate() {
 }
 
 // ── Ticker tape ──────────────────────────────────────────────────────────
-const TICKERS = [];
+const TICKERS = [
+  { name: 'NIFTY 50',   px: 22834.50, chg: 0.23 },
+  { name: 'BANKNIFTY',  px: 49210.85, chg: -0.15 },
+  { name: 'SENSEX',     px: 75612.30, chg: 0.31 },
+  { name: 'FINNIFTY',   px: 22150.40, chg: 0.18 },
+  { name: 'MIDCPNIFTY', px: 11890.75, chg: -0.42 },
+  { name: 'USDINR',     px: 83.24,    chg: 0.05 },
+  { name: 'INDIAVIX',   px: 14.21,    chg: -2.10 },
+  { name: 'CRUDE',      px: 6420,     chg: 0.85 },
+  { name: 'GOLD',       px: 71230,    chg: 0.43 },
+  { name: 'RELIANCE',   px: 2945.20,  chg: 0.92 },
+  { name: 'TCS',        px: 4115.80,  chg: -0.18 },
+  { name: 'HDFCBANK',   px: 1632.10,  chg: 0.35 },
+];
 function fmtPx(p) {
   return p.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
@@ -893,7 +970,7 @@ function sparkSVG(id, color) {
       </defs>
       <path d="${line} L ${W},${H} L 0,${H} Z" fill="url(#${gid})"/>
       <path d="${line}" fill="none" stroke="${stroke}" stroke-width="1.6"/>
-      <text class="spark-label" x="6" y="12"></text>
+      <text class="spark-label" x="6" y="12">EQUITY CURVE · SYNTH</text>
     </svg>`;
 }
 
@@ -911,7 +988,18 @@ function attachCursorGlow() {
 }
 
 // ── Live trade tape (synthetic but plausibly recent activity) ────────────
-const ACTIVITY = [];
+const ACTIVITY = [
+  { t: '15:20', side: 'SELL', sym: 'NIFTY 22850 CE+PE', px: '252.75', tag: 'STRADDLE · ENTRY', cls: 'neut' },
+  { t: '09:20', side: 'BUY',  sym: 'NIFTY 22850 CE+PE', px: '178.30', tag: 'EXIT +74.5 PTS',   cls: '' },
+  { t: '14:15', side: 'BUY',  sym: 'RELIANCE',         px: '2,945.20', tag: 'EMA CROSS',       cls: 'neut' },
+  { t: '11:48', side: 'SELL', sym: 'HDFCBANK',         px: '1,632.10', tag: 'TARGET HIT',      cls: '' },
+  { t: '15:20', side: 'SELL', sym: 'NIFTY 22900 CE+PE', px: '291.40', tag: 'STRADDLE · ENTRY', cls: 'neut' },
+  { t: '09:35', side: 'BUY',  sym: 'TCS',              px: '4,115.80', tag: 'SWING ADD',       cls: 'neut' },
+  { t: '13:22', side: 'BUY',  sym: 'INFY',             px: '1,820.00', tag: 'EMA CROSS',       cls: 'neut' },
+  { t: '10:05', side: 'SELL', sym: 'ICICIBANK',        px: '1,178.50', tag: 'STOP HIT -18',    cls: 'loss' },
+  { t: '12:14', side: 'BUY',  sym: 'BAJFINANCE',       px: '7,420.00', tag: 'SWING ADD',       cls: 'neut' },
+  { t: '15:25', side: 'BUY',  sym: 'NIFTY 22800 CE+PE', px: '198.40', tag: 'EXIT +52.8 PTS',   cls: '' },
+];
 function renderTape() {
   const items = [...ACTIVITY, ...ACTIVITY, ...ACTIVITY];
   $('tape-track').innerHTML = items.map(a => `
@@ -1037,8 +1125,20 @@ function applyProfile(p) {
 }
 
 function applyStats(s) {
-  // Hero stats blanked for the private cover — render nothing.
-  $('hero-stats').innerHTML = '';
+  if (!s) return;
+  const items = [
+    { v: s.strategies_live,   lbl: 'strategies live',     dp: 0 },
+    { v: s.events_backtested, lbl: 'events backtested',   dp: 0 },
+    { v: s.years_of_data,     lbl: 'years of data',       dp: 0 },
+    { v: s.granularity_min,   lbl: 'min granularity',     dp: 0, suffix: 'm' },
+  ];
+  $('hero-stats').innerHTML = items.map(it => `
+    <div class="stat">
+      <span class="stat-val" data-target="${it.v}" data-dp="${it.dp}" data-suffix="${it.suffix || ''}">0</span>
+      <span class="stat-lbl">${it.lbl}</span>
+    </div>
+  `).join('');
+  animateCounters();
 }
 
 function escHtml(s) {
@@ -1071,8 +1171,8 @@ function renderProjects(cat) {
           </div>
           <div class="card-tag">${escHtml(p.tag)}</div>
         </div>
-        <div class="card-desc">${escHtml(p.thesis || p.desc || '')}</div>
-        <div class="card-stack">${(p.stack || []).map(s => `<span class="stack-chip">${escHtml(s)}</span>`).join('')}</div>
+        ${(p.thesis || p.desc) ? `<div class="card-desc">${escHtml(p.thesis || p.desc)}</div>` : ''}
+        ${(p.stack && p.stack.length) ? `<div class="card-stack">${p.stack.map(s => `<span class="stack-chip">${escHtml(s)}</span>`).join('')}</div>` : ''}
         ${sparkSVG(p.id, accent)}
         ${(p.metrics && p.metrics.length) ? `
           <div class="card-metrics">
@@ -1153,7 +1253,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in · Aurora</title>
+<title>Sign in · Investeq</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -1230,7 +1330,7 @@ button:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(38,166,1
 </head>
 <body>
 <form class="card" method="post" action="/login">
-  <div class="brand">◆ Aurora</div>
+  <div class="brand">▸ Investeq · Trading Desk</div>
   <h1>Sign in</h1>
   <p class="sub">Authorized personnel only.</p>
   <label for="username">Username</label>
