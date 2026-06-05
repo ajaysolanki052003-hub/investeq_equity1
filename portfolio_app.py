@@ -53,26 +53,21 @@ def _authed(request: Request) -> bool:
 
 
 PROFILE = {
-    "name"     : "Hi Ajay",
-    "role"     : "Systematic Trading Desk",
-    "headline" : "Quantitative strategies for Indian F&O and equities.",
-    "tagline"  : (
-        "Walk-forward backtested. Live-monitored. Audit-ready. "
-        "We design and run systematic strategies across NSE options and "
-        "equities — built on six years of 1-minute data, validated with "
-        "time-series cross-validation, and surfaced through trading-floor "
-        "dashboards your team can supervise in real time."
-    ),
+    "name"     : "Aurora",
+    "role"     : "Private Workspace",
+    "headline" : "",
+    "tagline"  : "",
     "email"    : "ajaysolanki052003@gmail.com",
-    "location" : "India · IST",
+    "location" : "",
 }
 
-# Firm-level numbers shown in the hero. Edit when the suite changes.
+# Firm-level numbers shown in the hero. Blanked out for the public-facing
+# cover — frontend renders empty when these are 0.
 STATS = {
-    "strategies_live"   : 3,
-    "events_backtested" : 296,
-    "years_of_data"     : 6,
-    "granularity_min"   : 1,
+    "strategies_live"   : 0,
+    "events_backtested" : 0,
+    "years_of_data"     : 0,
+    "granularity_min"   : 0,
 }
 
 # Each entry below is a strategy in the suite. Schema:
@@ -90,74 +85,45 @@ STATS = {
 #   accent      — hex colour for the accent stripe + glow
 PROJECTS = [
     {
-        "id": "nifty-straddle-ml",
-        "name": "NIFTY Short Straddle · ML-Filtered",
-        "instrument": "NIFTY weekly options · delta-neutral",
+        "id": "module-a",
+        "name": "Aurora · A",
+        "instrument": "",
         "tag": "LIVE",
-        "category": "OPTIONS",
-        "thesis": (
-            "Sell the ATM straddle at 15:20 IST on the entry day, cover at 09:20 "
-            "the following session. Walk-forward LightGBM filter on premium-decay, "
-            "IV-RV spread and OI structure decides whether to take the trade. "
-            "Audit dashboard surfaces every historical signal and its outcome."
-        ),
-        "stack": ["LightGBM", "Black-Scholes", "walk-forward CV", "FastAPI"],
+        "category": "",
+        "thesis": "",
+        "stack": [],
         "port": 8703,
         "url": "/straddle/",
-        "path": "app_option_replay_tv.py",
-        "metrics": [
-            ["cum P&L", "+909.7 pts"],
-            ["win rate", "73.0%"],
-            ["events", "296"],
-        ],
+        "path": "",
+        "metrics": [],
         "accent": "#26a69a",
     },
     {
-        "id": "chain-replay-6yr",
-        "name": "Historical Option-Chain Replay",
-        "instrument": "NIFTY · 6 yrs · 1-minute",
-        "tag": "RESEARCH",
-        "category": "OPTIONS",
-        "thesis": (
-            "Pick any day from six years of NSE data, pick an expiry, and scrub "
-            "minute-by-minute through the session. Full ATM-banded chain table "
-            "(OI · ΔOI · Volume · IV · Δ · LTP for CE + PE), live ATM highlight, "
-            "PCR (OI & volume), Max-Pain, and a synced spot chart. Press play "
-            "to replay the day at 5× real-time."
-        ),
-        "stack": ["FastAPI", "lightweight-charts", "scipy.brentq", "pandas"],
+        "id": "module-b",
+        "name": "Aurora · B",
+        "instrument": "",
+        "tag": "LIVE",
+        "category": "",
+        "thesis": "",
+        "stack": [],
         "port": 8704,
         "url": "/chain/",
-        "path": "app_chain_replay.py",
-        "metrics": [
-            ["history", "6 yrs"],
-            ["granularity", "1 min"],
-            ["band", "ATM ± 20"],
-        ],
+        "path": "",
+        "metrics": [],
         "accent": "#60a5fa",
     },
     {
-        "id": "ema-swing-low-scanner",
-        "name": "EMA Swing-Low · Daily Scanner",
-        "instrument": "NSE equities · 1d + 1h · long & short",
+        "id": "module-c",
+        "name": "Aurora · C",
+        "instrument": "",
         "tag": "LIVE",
-        "category": "EQUITIES",
-        "thesis": (
-            "Scans 512 NSE single-stocks each evening for EMA21/50 swing-low touch "
-            "entries on a chosen day. Two timeframes ranked side-by-side (1d + 1h), "
-            "with a starred list of symbols firing on BOTH (highest-conviction "
-            "setups). Per-TF EMA settings, per-table Side / Symbol filters, click-"
-            "any-row to load the candle chart with the touch marker highlighted."
-        ),
-        "stack": ["Streamlit", "lightweight-charts", "pandas", "Groww API"],
+        "category": "",
+        "thesis": "",
+        "stack": [],
         "port": 8501,
         "url": "/scan/",
-        "path": "ema_cross_swing/scan_app.py",
-        "metrics": [
-            ["universe", "512 stocks"],
-            ["TFs", "1d + 1h"],
-            ["history", "6 yrs"],
-        ],
+        "path": "",
+        "metrics": [],
         "accent": "#facc15",
     },
 ]
@@ -209,7 +175,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hi Ajay · Systematic Trading Desk</title>
+<title>Aurora</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -739,8 +705,8 @@ footer.contact {
 <header class="topbar">
   <div class="brand">
     <span class="logo">◆</span>
-    <span class="brand-name" id="brand-name">HI AJAY</span>
-    <span class="brand-role" id="brand-role">SYSTEMATIC TRADING DESK</span>
+    <span class="brand-name" id="brand-name">AURORA</span>
+    <span class="brand-role" id="brand-role">PRIVATE WORKSPACE</span>
   </div>
   <div class="topbar-right">
     <span class="market-status" id="market-status">
@@ -765,20 +731,20 @@ footer.contact {
     <div class="aurora aurora-c"></div>
   </div>
   <div class="hero-left">
-    <div class="kicker">STRATEGY DESK · <span id="hero-date">—</span></div>
-    <h1>Quant strategies.<br><span class="accent">Engineered.</span></h1>
-    <div class="headline" id="hero-headline">Systematic options &amp; equities strategies for Indian capital markets.</div>
+    <div class="kicker">AURORA · <span id="hero-date">—</span></div>
+    <h1>Aurora.<br><span class="accent">Private.</span></h1>
+    <div class="headline" id="hero-headline"></div>
     <p class="tagline" id="hero-tagline"></p>
     <div class="hero-stats" id="hero-stats"></div>
     <div class="hero-cta">
-      <a class="btn primary" href="#projects">View strategy suite ↓</a>
+      <a class="btn primary" href="#projects">Open workspace ↓</a>
     </div>
   </div>
   <div class="hero-right">
     <div class="hero-chart">
       <div class="chart-bar">
         <div class="chart-title">
-          <span class="live-pill">LIVE</span> NIFTY 50 · 5m
+          <span class="live-pill">LIVE</span> AURORA · 5m
         </div>
         <div class="chart-px">
           <span class="v" id="chart-px">—</span>
@@ -801,84 +767,27 @@ footer.contact {
 <!-- Strategy suite -->
 <section id="projects">
   <header class="section-head">
-    <h2><span class="num">01</span> Strategy suite <span class="count" id="proj-count"></span></h2>
+    <h2><span class="num">01</span> Modules <span class="count" id="proj-count"></span></h2>
     <div class="filters" id="filters">
       <button class="filter on" data-cat="ALL">ALL</button>
-      <button class="filter" data-cat="OPTIONS">OPTIONS</button>
-      <button class="filter" data-cat="EQUITIES">EQUITIES</button>
     </div>
   </header>
-  <p class="section-sub">
-    Each strategy below is wired to a live monitoring dashboard. A green dot means
-    the desk is currently quoting; a grey dot means the engine is parked. Click
-    <em>Open dashboard</em> to inspect every historical signal, the exit, and the
-    realised P&amp;L bar-by-bar.
-  </p>
+  <p class="section-sub"></p>
   <div class="grid" id="project-grid"></div>
 </section>
 
-<!-- How we work -->
-<section id="how">
-  <header class="section-head">
-    <h2><span class="num">02</span> How the desk works</h2>
-  </header>
-  <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));">
-    <div class="card" style="--accent:#26a69a; --accent-faint:rgba(38,166,154,0.12); min-height: 0;">
-      <div class="card-head">
-        <div class="card-title">01 · Data</div>
-        <div class="card-tag">FOUNDATION</div>
-      </div>
-      <div class="card-desc">
-        Six years of 1-minute NSE F&amp;O and equities data, partitioned by trading
-        day in Parquet. Lot-size aware, IST-anchored, reproducible from raw
-        ingestion logs.
-      </div>
-    </div>
-    <div class="card" style="--accent:#60a5fa; --accent-faint:rgba(96,165,250,0.12); min-height: 0;">
-      <div class="card-head">
-        <div class="card-title">02 · Research</div>
-        <div class="card-tag">VALIDATION</div>
-      </div>
-      <div class="card-desc">
-        Walk-forward cross-validation, leakage checks, SHAP attribution. No
-        single-fold heroics — every strategy is signed off on out-of-sample
-        equity curves and drawdown stats.
-      </div>
-    </div>
-    <div class="card" style="--accent:#c084fc; --accent-faint:rgba(192,132,252,0.12); min-height: 0;">
-      <div class="card-head">
-        <div class="card-title">03 · Live</div>
-        <div class="card-tag">EXECUTION</div>
-      </div>
-      <div class="card-desc">
-        Real-time monitoring dashboards with on-chart entry / exit markers,
-        per-leg P&amp;L, and an audit trail back to the raw 1-minute bars. Built
-        for supervised execution.
-      </div>
-    </div>
-  </div>
-</section>
+<!-- (workspace description removed for the public-facing cover) -->
 
 <!-- Footer -->
 <footer class="contact">
   <div>
-    <div class="footer-name" id="footer-name">Hi Ajay</div>
-    <div class="footer-loc" id="footer-loc">Systematic Trading Desk · India · IST</div>
+    <div class="footer-name" id="footer-name">Aurora</div>
+    <div class="footer-loc" id="footer-loc">Private workspace</div>
   </div>
   <div class="footer-links">
     <a id="footer-email" href="#">Mail</a>
   </div>
 </footer>
-
-<div class="disclosure">
-  <strong>Disclosure.</strong>
-  All figures are derived from in-sample and out-of-sample backtests on historical
-  NSE data and are presented for informational purposes only. Past performance is
-  not indicative of future results. Trading in derivatives carries substantial
-  risk of loss. Strategies are not registered investment advisory services;
-  this site is not a solicitation, and figures may be revised as the production
-  book evolves.
-</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -920,20 +829,7 @@ function setHeroDate() {
 }
 
 // ── Ticker tape ──────────────────────────────────────────────────────────
-const TICKERS = [
-  { name: 'NIFTY 50',   px: 22834.50, chg: 0.23 },
-  { name: 'BANKNIFTY',  px: 49210.85, chg: -0.15 },
-  { name: 'SENSEX',     px: 75612.30, chg: 0.31 },
-  { name: 'FINNIFTY',   px: 22150.40, chg: 0.18 },
-  { name: 'MIDCPNIFTY', px: 11890.75, chg: -0.42 },
-  { name: 'USDINR',     px: 83.24,    chg: 0.05 },
-  { name: 'INDIAVIX',   px: 14.21,    chg: -2.10 },
-  { name: 'CRUDE',      px: 6420,     chg: 0.85 },
-  { name: 'GOLD',       px: 71230,    chg: 0.43 },
-  { name: 'RELIANCE',   px: 2945.20,  chg: 0.92 },
-  { name: 'TCS',        px: 4115.80,  chg: -0.18 },
-  { name: 'HDFCBANK',   px: 1632.10,  chg: 0.35 },
-];
+const TICKERS = [];
 function fmtPx(p) {
   return p.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
@@ -997,7 +893,7 @@ function sparkSVG(id, color) {
       </defs>
       <path d="${line} L ${W},${H} L 0,${H} Z" fill="url(#${gid})"/>
       <path d="${line}" fill="none" stroke="${stroke}" stroke-width="1.6"/>
-      <text class="spark-label" x="6" y="12">EQUITY CURVE · SYNTH</text>
+      <text class="spark-label" x="6" y="12"></text>
     </svg>`;
 }
 
@@ -1015,18 +911,7 @@ function attachCursorGlow() {
 }
 
 // ── Live trade tape (synthetic but plausibly recent activity) ────────────
-const ACTIVITY = [
-  { t: '15:20', side: 'SELL', sym: 'NIFTY 22850 CE+PE', px: '252.75', tag: 'STRADDLE · ENTRY', cls: 'neut' },
-  { t: '09:20', side: 'BUY',  sym: 'NIFTY 22850 CE+PE', px: '178.30', tag: 'EXIT +74.5 PTS',   cls: '' },
-  { t: '14:15', side: 'BUY',  sym: 'RELIANCE',         px: '2,945.20', tag: 'EMA CROSS',       cls: 'neut' },
-  { t: '11:48', side: 'SELL', sym: 'HDFCBANK',         px: '1,632.10', tag: 'TARGET HIT',      cls: '' },
-  { t: '15:20', side: 'SELL', sym: 'NIFTY 22900 CE+PE', px: '291.40', tag: 'STRADDLE · ENTRY', cls: 'neut' },
-  { t: '09:35', side: 'BUY',  sym: 'TCS',              px: '4,115.80', tag: 'SWING ADD',       cls: 'neut' },
-  { t: '13:22', side: 'BUY',  sym: 'INFY',             px: '1,820.00', tag: 'EMA CROSS',       cls: 'neut' },
-  { t: '10:05', side: 'SELL', sym: 'ICICIBANK',        px: '1,178.50', tag: 'STOP HIT -18',    cls: 'loss' },
-  { t: '12:14', side: 'BUY',  sym: 'BAJFINANCE',       px: '7,420.00', tag: 'SWING ADD',       cls: 'neut' },
-  { t: '15:25', side: 'BUY',  sym: 'NIFTY 22800 CE+PE', px: '198.40', tag: 'EXIT +52.8 PTS',   cls: '' },
-];
+const ACTIVITY = [];
 function renderTape() {
   const items = [...ACTIVITY, ...ACTIVITY, ...ACTIVITY];
   $('tape-track').innerHTML = items.map(a => `
@@ -1152,20 +1037,8 @@ function applyProfile(p) {
 }
 
 function applyStats(s) {
-  if (!s) return;
-  const items = [
-    { v: s.strategies_live,   lbl: 'strategies live',     dp: 0 },
-    { v: s.events_backtested, lbl: 'events backtested',   dp: 0 },
-    { v: s.years_of_data,     lbl: 'years of data',       dp: 0 },
-    { v: s.granularity_min,   lbl: 'min granularity',     dp: 0, suffix: 'm' },
-  ];
-  $('hero-stats').innerHTML = items.map(it => `
-    <div class="stat">
-      <span class="stat-val" data-target="${it.v}" data-dp="${it.dp}" data-suffix="${it.suffix || ''}">0</span>
-      <span class="stat-lbl">${it.lbl}</span>
-    </div>
-  `).join('');
-  animateCounters();
+  // Hero stats blanked for the private cover — render nothing.
+  $('hero-stats').innerHTML = '';
 }
 
 function escHtml(s) {
@@ -1280,7 +1153,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in · Investeq</title>
+<title>Sign in · Aurora</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -1357,7 +1230,7 @@ button:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(38,166,1
 </head>
 <body>
 <form class="card" method="post" action="/login">
-  <div class="brand">▸ Investeq · Trading Desk</div>
+  <div class="brand">◆ Aurora</div>
   <h1>Sign in</h1>
   <p class="sub">Authorized personnel only.</p>
   <label for="username">Username</label>
