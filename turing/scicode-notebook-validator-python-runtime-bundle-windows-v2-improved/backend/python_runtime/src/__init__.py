@@ -1,0 +1,2 @@
+"""SciCode source package."""
+

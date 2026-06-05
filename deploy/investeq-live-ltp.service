@@ -1,0 +1,18 @@
+[Unit]
+Description=Investeq live LTP poller (NSE hours only)
+After=network.target
+
+[Service]
+Type=simple
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs/ema_scanner
+EnvironmentFile=/etc/investeq.env
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python live_workers.py ltp
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

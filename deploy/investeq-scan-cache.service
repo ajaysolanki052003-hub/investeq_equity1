@@ -1,0 +1,13 @@
+[Unit]
+Description=Investeq EMA scan-cache builder — runs the universe scan and writes per-date parquet
+After=network.target
+
+[Service]
+Type=oneshot
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs/ema_cross_swing
+EnvironmentFile=/etc/investeq.env
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python /home/ajay/investeq_ajs/ema_cross_swing/scan_universe.py
+StandardOutput=journal
+StandardError=journal

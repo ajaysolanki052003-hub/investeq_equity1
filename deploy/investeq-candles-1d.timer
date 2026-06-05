@@ -1,0 +1,10 @@
+[Unit]
+Description=Investeq daily candle refresh — once after NSE close (Mon-Fri)
+
+[Timer]
+OnCalendar=Mon..Fri 15:35 Asia/Kolkata
+Persistent=false
+Unit=investeq-candles-1d.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,23 @@
+[Unit]
+Description=Investeq EMA swing-low scanner (Streamlit, mounted at /scan)
+After=network.target
+
+[Service]
+Type=simple
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/streamlit run ema_cross_swing/scan_app.py \
+  --server.address 127.0.0.1 \
+  --server.port 8501 \
+  --server.baseUrlPath /scan \
+  --server.headless true \
+  --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SciCode Notebook Validator</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>SciCode Notebook Validator</h1>
+      <label for="notebookUrl">Notebook URL</label>
+      <input id="notebookUrl" type="url" placeholder="https://colab.research.google.com/drive/..." />
+
+      <div class="row">
+        <input id="runTests" type="checkbox" checked />
+        <label for="runTests">Run Python test execution</label>
+      </div>
+
+      <button id="validateBtn">Validate Notebook</button>
+      <button id="validateCurrentBtn" class="secondary">Validate Current Tab</button>
+      <button id="downloadReportBtn" class="secondary" disabled>Download Validation Report</button>
+
+      <p id="status" class="status">Ready.</p>
+      <section id="kpiGrid" class="kpi-grid hidden">
+        <article class="kpi-card">
+          <p class="kpi-label">Overall</p>
+          <p id="kpiOverall" class="kpi-value">-</p>
+        </article>
+        <article class="kpi-card">
+          <p class="kpi-label">Issues</p>
+          <p id="kpiIssues" class="kpi-value">0</p>
+        </article>
+        <article class="kpi-card">
+          <p class="kpi-label">FAIL lines</p>
+          <p id="kpiFails" class="kpi-value fail">0</p>
+        </article>
+        <article class="kpi-card">
+          <p class="kpi-label">PASS lines</p>
+          <p id="kpiPasses" class="kpi-value pass">0</p>
+        </article>
+      </section>
+      <section id="summaryCard" class="summary hidden"></section>
+      <section id="issuesCard" class="panel hidden">
+        <h2>Issues</h2>
+        <ul id="issuesList" class="list"></ul>
+      </section>
+      <section id="resultsCard" class="panel hidden">
+        <h2>Execution Results</h2>
+        <ul id="resultsList" class="list"></ul>
+      </section>
+      <details class="raw-block">
+        <summary>Raw report</summary>
+        <pre id="output" class="output"></pre>
+      </details>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

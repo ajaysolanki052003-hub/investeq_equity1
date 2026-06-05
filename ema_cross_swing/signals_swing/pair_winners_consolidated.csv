@@ -1,0 +1,5 @@
+Timeframe,EMA Pair,Signals,Best Avg TP %,Best Avg PnL %,Best Total TP %,Best Total PnL %,Best Exp TP %,Best Expectancy %,Best PF TP %,Best Profit Factor,Best Calmar TP %,Best Calmar
+1d,EMA10/EMA20,229,1.5,-0.065,1.5,-14.94,1.5,-0.075,1.5,0.93,1.5,-0.3
+1d,EMA21/EMA50,141,4.5,0.37,4.5,51.74,4.5,0.37,1.0,1.67,1.0,2.75
+1h,EMA10/EMA20,128,1.0,-0.158,1.0,-20.18,1.0,-0.158,1.0,0.73,4.0,-0.8
+1h,EMA21/EMA50,61,1.0,0.081,1.0,4.97,1.0,0.064,1.0,1.17,1.0,0.66

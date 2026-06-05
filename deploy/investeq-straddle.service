@@ -1,0 +1,19 @@
+[Unit]
+Description=Investeq NIFTY short-straddle replay (mounted at /straddle)
+After=network.target
+
+[Service]
+Type=simple
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+Environment=APP_BASE=/straddle
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python -m uvicorn app_option_replay_tv:app --host 127.0.0.1 --port 8703
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

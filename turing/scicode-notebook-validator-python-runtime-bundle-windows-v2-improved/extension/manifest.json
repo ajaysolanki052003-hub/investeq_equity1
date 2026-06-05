@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "SciCode Notebook Validator",
+  "description": "Chrome extension that runs the Python notebook validator via local backend messaging.",
+  "version": "0.1.0",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "SciCode Notebook Validator",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "permissions": [
+    "tabs",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "https://colab.research.google.com/*",
+    "https://drive.google.com/*",
+    "https://docs.google.com/*",
+    "https://drive.usercontent.google.com/*",
+    "https://accounts.google.com/*"
+  ]
+}

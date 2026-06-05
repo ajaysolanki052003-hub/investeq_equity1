@@ -1,0 +1,17 @@
+{
+  "run_id": "straddle_lgbm_20260521_1752",
+  "n_events_total": 296,
+  "n_events_clean": 147,
+  "blind_total_pnl_points": 909.6999600529671,
+  "blind_win_rate": 0.7297297297297297,
+  "logistic_holdout_auc_v1": 0.45754716981132076,
+  "logistic_cv_mean_auc_v1": 0.49156101190476187,
+  "lgbm_cv_mean_auc_v2": 0.5206940553999377,
+  "lgbm_holdout_auc_v2": 0.47333333333333333,
+  "mlp_cv_mean_auc_v2": 0.3854069405539994,
+  "best_threshold": 0.84,
+  "filtered_total_pnl": 568.8000314235687,
+  "filtered_max_drawdown": -276.84998416900635,
+  "filtered_n_trades": 69,
+  "curves_identical": false
+}

@@ -1,0 +1,18 @@
+[Unit]
+Description=Investeq portfolio (login gate + project hub)
+After=network.target
+
+[Service]
+Type=simple
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python -m uvicorn portfolio_app:app --host 127.0.0.1 --port 8700
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

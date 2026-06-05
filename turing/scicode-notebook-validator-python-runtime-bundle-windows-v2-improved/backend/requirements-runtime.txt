@@ -1,0 +1,27 @@
+# ── Google API (notebook fetching) ────────────────────────────────────────
+google-api-python-client>=2.100.0
+google-auth>=2.22.0
+google-auth-httplib2>=0.2.0
+httplib2>=0.31.0
+
+# ── Core scientific computing ──────────────────────────────────────────────
+numpy>=2.0.0
+scipy>=1.10.0
+
+# ── Data analysis ─────────────────────────────────────────────────────────
+pandas>=2.0.0
+
+# ── Symbolic math ─────────────────────────────────────────────────────────
+sympy>=1.12
+
+# ── Plotting (import-only; display is suppressed during validation) ────────
+matplotlib>=3.7.0
+
+# ── Machine learning ──────────────────────────────────────────────────────
+scikit-learn>=1.3.0
+
+# ── Coverage reporting ────────────────────────────────────────────────────
+coverage>=7.0.0
+
+# ── Networking / HTTP ─────────────────────────────────────────────────────
+requests>=2.31.0

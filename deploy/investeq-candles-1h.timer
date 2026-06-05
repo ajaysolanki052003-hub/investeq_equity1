@@ -1,0 +1,20 @@
+[Unit]
+Description=Investeq hourly candle refresh — once a minute after each market hour closes (IST)
+
+[Timer]
+# NSE hourly candles close at :15 (09:15, 10:15, ... 15:15). Trigger one minute
+# after close to be safe (broker data slightly lagged). One OnCalendar per time
+# is the most portable systemd syntax.
+OnCalendar=Mon..Fri 09:16 Asia/Kolkata
+OnCalendar=Mon..Fri 10:16 Asia/Kolkata
+OnCalendar=Mon..Fri 11:16 Asia/Kolkata
+OnCalendar=Mon..Fri 12:16 Asia/Kolkata
+OnCalendar=Mon..Fri 13:16 Asia/Kolkata
+OnCalendar=Mon..Fri 14:16 Asia/Kolkata
+OnCalendar=Mon..Fri 15:16 Asia/Kolkata
+OnCalendar=Mon..Fri 15:31 Asia/Kolkata
+Persistent=false
+Unit=investeq-candles-1h.service
+
+[Install]
+WantedBy=timers.target

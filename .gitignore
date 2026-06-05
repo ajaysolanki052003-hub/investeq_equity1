@@ -1,0 +1,81 @@
+# ───────────────────────── Python ─────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# ─────────────────────── Editors / IDE ────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Claude Code local state
+.claude/
+
+# ─────────────────────── Logs / runtime ───────────────────
+*.log
+*.pid
+*.lock
+nohup.out
+streamlit_ema.log
+
+# ──────────────────────── Secrets ─────────────────────────
+# Real password lives in deploy/investeq.env on the VM; never commit.
+deploy/investeq.env
+*.env
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+auth_users.json
+token.json
+.totp_secret
+
+# ────────────────── Large data directories ────────────────
+# OHLC + options data — kept on the VM, never in source control.
+DATA/
+ema_scanner/data/
+ema_scanner/data_*/
+ema_scanner/scan_*.parquet
+ema_scanner/*.parquet
+daily_swing_scanner/data/
+
+# Scanner per-date cache
+**/scan_cache/
+**/ltp.parquet
+**/watchlist.txt
+
+# ─────────────── Third-party bundled tooling ──────────────
+# 250+ MB DLLs and 237 MB zip from the SciCode validator bundle.
+turing/SciCode-Colab-Validator-Windows/
+turing/SciCode-Colab-Validator-Windows.zip
+
+# ML/DL experiment outputs (notebooks fine, large checkpoints not)
+ML_DL/**/*.pt
+ML_DL/**/*.pth
+ML_DL/**/*.bin
+ML_DL/**/*.h5
+ML_DL/**/checkpoints/
+
+# Large notebooks with embedded outputs
+nifty_options_ml.ipynb
+
+# ─────────────────────── Misc / temp ──────────────────────
+*.bak
+*.tmp
+*.orig
+*~

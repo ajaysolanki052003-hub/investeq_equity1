@@ -1,0 +1,11 @@
+[Unit]
+Description=Run scan-cache builder Mon-Fri at 15:40 IST (10:10 UTC)
+# Fires 10 minutes after NSE 15:30 close + the 15:35 daily-candle refresh —
+# the 1d CSVs are guaranteed to have today's bar by then.
+
+[Timer]
+OnCalendar=Mon..Fri 10:10:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

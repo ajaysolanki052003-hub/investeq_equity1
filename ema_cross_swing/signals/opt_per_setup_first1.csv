@@ -1,0 +1,5 @@
+Timeframe,EMA Pair,SL %,Target %,R:R,Total,Target Hit,SL Hit,Win Rate %,Avg PnL %,Total PnL %
+1d,EMA10/EMA20,3.5,4.0,1.14,49,30,18,62.5,1.163,57.0
+1d,EMA21/EMA50,2.5,8.5,3.4,21,10,11,47.6,2.738,57.5
+1h,EMA10/EMA20,1.0,5.5,5.5,42,5,36,12.2,-0.161,-6.77
+1h,EMA21/EMA50,1.0,1.5,1.5,16,10,6,62.5,0.562,9.0
