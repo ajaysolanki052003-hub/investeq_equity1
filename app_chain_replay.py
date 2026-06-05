@@ -693,6 +693,8 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
 }
 .opt-sub.ce .opt-label { color: var(--green); background: rgba(38,166,154,0.12); }
 .opt-sub.pe .opt-label { color: var(--red);   background: rgba(239,83,80,0.12); }
+.opt-sub.idx .opt-label { color: var(--gold); background: rgba(250,204,21,0.14); }
+.opt-sub.hidden { display: none; }
 .opt-sub > .opt-chart { flex: 1; min-height: 0; width: 100%; }
 
 /* Live cursor line at the scrubber's minute (drawn over the chart panes) */
@@ -750,6 +752,11 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
     <button data-ind="iv" title="Implied vol % (BS-inverted) per leg">IV</button>
     <button data-ind="rv" title="Realized vol % of spot">RV</button>
   </span>
+
+  <label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin-left:6px;">
+    <input id="idx-on" type="checkbox" style="margin:0;">
+    <span style="font-size:11px; color:var(--gold); letter-spacing:1.2px;">INDEX</span>
+  </label>
   <input id="rv-lookback" type="number" min="3" max="200" value="30"
          title="RV lookback (bars)"
          style="width:58px; background:var(--panel-2); border:1px solid var(--border-hi); color:var(--text); border-radius:5px; padding:5px 7px; font:inherit; font-family:'JetBrains Mono', monospace;" />
@@ -826,6 +833,11 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
             <div class="opt-chart" id="opt-chart-ce"></div>
             <div class="cursor-line" id="cur-ce" style="left:-10px"></div>
           </div>
+          <div class="opt-sub idx hidden" id="opt-sub-idx">
+            <div class="opt-label">INDEX</div>
+            <div class="opt-chart" id="opt-chart-idx"></div>
+            <div class="cursor-line" id="cur-idx" style="left:-10px"></div>
+          </div>
           <div class="opt-sub pe">
             <div class="opt-label">PE</div>
             <div class="opt-chart" id="opt-chart-pe"></div>
@@ -895,6 +907,8 @@ const state = {
   ceStrike: null, peStrike: null, atm: null,
   ceChart: null, ceCandle: null, ceBars: [],
   peChart: null, peCandle: null, peBars: [],
+  // INDEX (NIFTY spot) sub-pane between CE and PE; hidden by default
+  idxChart: null, idxCandle: null, idxBars: [], showIdx: false,
   // Indicator line series (created in makeAllCharts)
   sOiCE: null, sIvCE: null, sRvCE: null,
   sOiPE: null, sIvPE: null, sRvPE: null,
@@ -943,6 +957,11 @@ function makeAllCharts() {
   state.peChart  = mkChart($('opt-chart-pe'));
   state.peCandle = mkCandleSeries(state.peChart, 'PE');
 
+  // INDEX (NIFTY spot) chart — same candle series, slotted between CE and PE.
+  // Always created; data is only fetched while the INDEX checkbox is on.
+  state.idxChart  = mkChart($('opt-chart-idx'));
+  state.idxCandle = mkCandleSeries(state.idxChart, 'IDX');
+
   // EMA overlays — fast = orange, slow = blue. Hidden until user toggles on.
   const emaFastOpts = { color: '#ff9800', lineWidth: 2, priceLineVisible: false,
                         lastValueVisible: false, crosshairMarkerVisible: false };
@@ -982,8 +1001,8 @@ function makeAllCharts() {
     lastValueVisible: true,
   });
 
-  // Time-axis sync across all 4 charts
-  const allCharts = [state.ceChart, state.peChart, state.oiChart, state.volChart];
+  // Time-axis sync across all 5 charts (CE, PE, IDX, OI, Vol)
+  const allCharts = [state.ceChart, state.peChart, state.idxChart, state.oiChart, state.volChart];
   allCharts.forEach(c => {
     c.timeScale().subscribeVisibleLogicalRangeChange(range => {
       if (state.syncing || !range) return;
@@ -1119,7 +1138,7 @@ function refreshEMAs() {
 // vertical range the user dragged it to — that's why new dates' candles can
 // land way above or below the visible area.
 function refitAllCharts() {
-  const charts = [state.ceChart, state.peChart, state.oiChart, state.volChart];
+  const charts = [state.ceChart, state.peChart, state.idxChart, state.oiChart, state.volChart];
   charts.forEach(c => {
     if (!c) return;
     try {
@@ -1128,6 +1147,24 @@ function refitAllCharts() {
       c.priceScale('right').applyOptions({ autoScale: true });
     } catch (e) { /* chart not ready yet — next refit will catch it */ }
   });
+}
+
+// ── INDEX (NIFTY spot) — drawn between CE and PE when the checkbox is on ─
+async function loadIndex() {
+  if (!state.date || !state.showIdx) {
+    if (state.idxCandle) state.idxCandle.setData([]);
+    state.idxBars = [];
+    return;
+  }
+  const qs = new URLSearchParams({ date: state.date, tf: state.tf });
+  try {
+    const r = await fetch(`/api/spot?${qs}`);
+    if (!r.ok) { state.idxBars = []; state.idxCandle.setData([]); return; }
+    const j = await r.json();
+    state.idxBars = j.bars || [];
+    state.idxCandle.setData(state.idxBars);
+    state.idxChart.timeScale().fitContent();
+  } catch (_) { state.idxBars = []; state.idxCandle.setData([]); }
 }
 
 // ── RV (spot realized vol) — drawn on the vol sub-pane ──────────────────
@@ -1152,10 +1189,14 @@ async function loadRV() {
 function syncPaneVisibility() {
   $('pane-oi').classList.toggle('hidden', !state.showOI);
   $('pane-vol').classList.toggle('hidden', !state.showIV && !state.showRV);
+  // INDEX sub-pane between CE and PE — flex auto-redistributes width when hidden
+  $('opt-sub-idx').classList.toggle('hidden', !state.showIdx);
   // After visibility changes, charts may need a re-measure
   setTimeout(() => {
     if (state.oiChart)  state.oiChart.applyOptions({ autoSize: true });
     if (state.volChart) state.volChart.applyOptions({ autoSize: true });
+    if (state.idxChart) state.idxChart.applyOptions({ autoSize: true });
+    refitAllCharts();
     updateCursors();
   }, 60);
 }
@@ -1165,6 +1206,7 @@ function updateCursors() {
   const t = minuteToUnix(state.date, state.minute);
   placeCursor($('cur-ce'),  state.ceChart,  state.ceBars, t);
   placeCursor($('cur-pe'),  state.peChart,  state.peBars, t);
+  if (state.showIdx)                placeCursor($('cur-idx'), state.idxChart, state.idxBars, t);
   // Indicator panes use any available bar series for x-coordinate lookup
   if (state.showOI)                 placeCursor($('cur-oi'),  state.oiChart,  state.ceOI.length ? state.ceOI : state.peOI, t);
   if (state.showIV || state.showRV) placeCursor($('cur-vol'), state.volChart, state.rvLine.length ? state.rvLine : (state.ceIV.length ? state.ceIV : state.peIV), t);
@@ -1257,6 +1299,7 @@ async function selectDay(d) {
   await loadStrikes();
   setMinute(0);
   await loadOption();
+  if (state.showIdx) await loadIndex();   // re-fetch spot for the new date
   loadChain();
 }
 
@@ -1412,7 +1455,7 @@ function attach() {
       document.querySelectorAll('#tf-grp button').forEach(x => x.classList.remove('on'));
       b.classList.add('on');
       state.tf = b.dataset.tf;
-      await loadOption();   // re-pulls IV / OI / RV at the new TF if they're on
+      await Promise.all([loadOption(), loadIndex()]);   // also re-pulls IDX at the new TF
       updateCursors();
     });
   });
@@ -1433,6 +1476,16 @@ function attach() {
       }
       syncPaneVisibility();
     });
+  });
+
+  // INDEX checkbox — toggle the spot chart between CE and PE.
+  // When checked: fetch /api/spot at the current TF, show the sub-pane.
+  // When unchecked: hide; CE and PE flex back to full width.
+  $('idx-on').addEventListener('change', async e => {
+    state.showIdx = !!e.target.checked;
+    if (state.showIdx) await loadIndex();
+    syncPaneVisibility();
+    updateCursors();
   });
 
   // RV lookback editor — only refetches RV when changed (cheap)

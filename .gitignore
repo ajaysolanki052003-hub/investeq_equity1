@@ -79,3 +79,17 @@ nifty_options_ml.ipynb
 *.tmp
 *.orig
 *~
+
+# ──────────────────── Internal docs (kept local) ──────────
+# Sub-folder READMEs + the operational SCANNER reference describe the
+# strategy in detail. Keep them on disk for ops, exclude from GitHub.
+README copy.md
+ema_cross_swing/README.md
+ema_cross_swing/SCANNER.md
+ema_scanner/README.md
+daily_swing_scanner/README.md
+deploy/README.md
+ML_DL/README.md
+ML_DL/README.txt
+DATA/README.md
+
