@@ -184,11 +184,18 @@ def strikes(date: str = Query(...), expiry: str = Query(...)):
     return {"strikes": ks, "atm": atm}
 
 
+_SPOT_HISTORY_CACHE = ROOT / "_spot_history_1d.parquet"
+
 @lru_cache(maxsize=2)
 def _full_spot_history(tf: str) -> pd.DataFrame:
     """Aggregate every spot/YYYYMMDD.parquet into a single OHLC series at the
-    requested TF. Cached for the lifetime of the process — the underlying
-    files don't change inside a run."""
+    requested TF. 1d is cached on disk (~40 KB parquet) so the chain-replay
+    service starts cold without paying the 6-second per-day-file read."""
+    if tf == "1d" and _SPOT_HISTORY_CACHE.exists():
+        try:
+            return pd.read_parquet(_SPOT_HISTORY_CACHE)
+        except Exception:
+            pass   # corrupted file → fall through and rebuild
     files = sorted(SPOT_DIR.glob("*.parquet"))
     if not files:
         return pd.DataFrame()
@@ -211,7 +218,12 @@ def _full_spot_history(tf: str) -> pd.DataFrame:
                 })
             except Exception:
                 continue
-        return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+        out = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+        try:
+            out.to_parquet(_SPOT_HISTORY_CACHE, index=False)
+        except Exception:
+            pass   # disk-write failure is non-fatal — in-process cache still works
+        return out
     # Other TFs: read all, concat, resample once
     frames = []
     for f in files:
@@ -777,6 +789,9 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
 .main-content > .pane.pane-opt { flex: 2; min-height: 0; }
 .main-content > .pane.pane-oi,
 .main-content > .pane.pane-vol { flex: 1; min-height: 120px; }
+/* ATM±1 OI sub-pane in INDEX mode — keep a fixed 220px so it's always
+   visible and doesn't collapse to a sliver next to the tall index chart. */
+.main-content > .pane.pane-idx-oi { flex: 0 0 220px; min-height: 200px; }
 .ind-chart { width: 100%; height: 100%; }
 
 /* Horizontal metric strip (above the CE/PE chart split) */
