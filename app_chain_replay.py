@@ -441,7 +441,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Option Chain · Replay · 6 Years</title>
+<title>Aurora</title>
 <script>
 // Reverse-proxy prefix shim. Empty in local dev, '/chain' on the VM.
 window.APP_BASE = "__APP_BASE__";
@@ -720,8 +720,8 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
 <div class="bar">
   <div class="brand">
     <span class="logo">◆</span>
-    <span class="title">CHAIN REPLAY</span>
-    <span class="sub">NIFTY · 6 YR HISTORICAL · 1-MIN</span>
+    <span class="title">AURORA</span>
+    <span class="sub">private workspace</span>
   </div>
 
   <label>Day</label>
