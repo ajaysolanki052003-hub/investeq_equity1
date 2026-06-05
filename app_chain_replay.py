@@ -229,6 +229,90 @@ def _full_spot_history(tf: str) -> pd.DataFrame:
         full[["timestamp", "open", "high", "low", "close", "volume"]], tf)
 
 
+_ATM_OI_CACHE = ROOT / "_atm_oi_history.parquet"
+
+@lru_cache(maxsize=1)
+def _full_atm_oi_history(strike_step: int = 50) -> pd.DataFrame:
+    """For every trading day, snapshot the end-of-day combined OI for the
+    three nearest strikes (ATM-1, ATM, ATM+1) on the nearest expiry, split
+    by CE and PE. Cached on disk + in-process.
+
+    Disk cache lives at DATA/_atm_oi_history.parquet — the underlying OI
+    files don't change once a day is closed, so the cache is permanent.
+    Delete the file to force a rebuild."""
+    if _ATM_OI_CACHE.exists():
+        try:
+            return pd.read_parquet(_ATM_OI_CACHE)
+        except Exception:
+            pass   # corrupted cache → rebuild
+    oi_files = sorted(OI_DIR.glob("*.parquet"))
+    rows = []
+    for f in oi_files:
+        date_str = f.stem
+        spot_p = SPOT_DIR / f"{date_str}.parquet"
+        if not spot_p.exists():
+            continue
+        try:
+            spot = pd.read_parquet(spot_p, columns=["close"])
+            if spot.empty:
+                continue
+            close_px = float(spot["close"].iloc[-1])
+            atm = round(close_px / strike_step) * strike_step
+            three = [atm - strike_step, atm, atm + strike_step]
+
+            oi = pd.read_parquet(f, columns=["timestamp", "expiry", "strike",
+                                              "option_type", "oi"])
+            if oi.empty:
+                continue
+            # Nearest expiry on/after the trading day. Multiple expiries may
+            # be present in the same file — pick the soonest still-trading one.
+            day_dt = pd.to_datetime(date_str, format="%Y%m%d").date()
+            oi["_exp_date"] = pd.to_datetime(oi["expiry"]).dt.date
+            forward = sorted({d for d in oi["_exp_date"] if d >= day_dt})
+            if not forward:
+                continue
+            nearest = forward[0]
+
+            sub = oi[(oi["_exp_date"] == nearest) & (oi["strike"].isin(three))]
+            if sub.empty:
+                continue
+            # End-of-day snapshot — last OI per (strike, type)
+            sub = (sub.sort_values("timestamp")
+                      .groupby(["strike", "option_type"])["oi"].last())
+            ce_total = float(sub.xs("CE", level="option_type").sum()) \
+                if "CE" in sub.index.get_level_values("option_type") else 0.0
+            pe_total = float(sub.xs("PE", level="option_type").sum()) \
+                if "PE" in sub.index.get_level_values("option_type") else 0.0
+
+            ts = (pd.to_datetime(date_str, format="%Y%m%d")
+                  + pd.Timedelta(hours=9, minutes=15))
+            rows.append({"timestamp": ts, "ce_oi": ce_total,
+                         "pe_oi": pe_total, "atm": int(atm)})
+        except Exception:
+            continue
+    df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+    try:
+        df.to_parquet(_ATM_OI_CACHE, index=False)
+    except Exception:
+        pass   # disk-write failure is non-fatal — in-process cache still works
+    return df
+
+
+@app.get("/api/index_oi")
+def index_oi():
+    """ATM±1 combined OI (CE & PE) for every day in the spot history.
+    Used by the INDEX view's OI indicator overlay."""
+    df = _full_atm_oi_history()
+    if df.empty:
+        return JSONResponse({"ce_oi": [], "pe_oi": [], "n": 0})
+    t = to_unix(df["timestamp"])
+    ce = [{"time": int(t[i]), "value": float(df["ce_oi"].iloc[i])}
+          for i in range(len(df))]
+    pe = [{"time": int(t[i]), "value": float(df["pe_oi"].iloc[i])}
+          for i in range(len(df))]
+    return JSONResponse({"ce_oi": ce, "pe_oi": pe, "n": len(df)})
+
+
 @app.get("/api/spot_all")
 def spot_all(tf: str = "1d"):
     """Full multi-year spot OHLC for the INDEX view in the chain-replay UI.
@@ -672,7 +756,8 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
 .pane.fullscreen .fs-btn { color: var(--green); border-color: var(--green); }
 
 /* When a pane is hidden by a layout preset */
-.pane.hidden, .col.hidden, .scrub.hidden { display: none; }
+.pane.hidden, .col.hidden, .scrub.hidden,
+.sidebar.hidden, .resizer.hidden { display: none; }
 .tf-grp button {
   padding: 5px 9px; font-size: 11px; font-weight: 700; letter-spacing: 0.4px;
   background: var(--panel-2); border: 1px solid var(--border); color: var(--muted-hi);
@@ -814,6 +899,7 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
     <button data-ind="oi" title="Open Interest line per leg">OI</button>
     <button data-ind="iv" title="Implied vol % (BS-inverted) per leg">IV</button>
     <button data-ind="rv" title="Realized vol % of spot">RV</button>
+    <button data-ind="atmoi" title="ATM ±1 combined OI (CE + PE) — INDEX view only">ATM·OI</button>
   </span>
 
   <label>View</label>
@@ -911,6 +997,18 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
       </div>
     </div>
 
+    <div class="pane pane-idx-oi hidden" id="pane-idx-oi">
+      <div class="pane-h">
+        <span>▸ ATM ±1 · combined OI · CE / PE</span>
+        <span class="right" style="color: var(--muted)">end-of-day · daily</span>
+        <button class="fs-btn" data-pane="pane-idx-oi" title="Toggle fullscreen (Esc)">⛶</button>
+      </div>
+      <div class="pane-body">
+        <div class="ind-chart" id="chart-idx-oi"></div>
+        <div class="cursor-line" id="cur-idx-oi" style="left:-10px"></div>
+      </div>
+    </div>
+
     <div class="pane pane-oi hidden" id="pane-oi">
       <div class="pane-h">
         <span>▸ OPEN INTEREST · CE / PE</span>
@@ -975,6 +1073,9 @@ const state = {
   // historical spot chart, navigable like TradingView)
   idxChart: null, idxCandle: null, idxBars: [], idxFullBars: null,
   viewMode: 'option',
+  // INDEX-mode ATM±1 combined-OI overlay (independent indicator)
+  idxOiChart: null, sIdxOiCE: null, sIdxOiPE: null,
+  idxOiCEBars: [], idxOiPEBars: [], showAtmOi: false,
   // Indicator line series (created in makeAllCharts)
   sOiCE: null, sIvCE: null, sRvCE: null,
   sOiPE: null, sIvPE: null, sRvPE: null,
@@ -1030,6 +1131,8 @@ function makeAllCharts() {
   state.idxChart.applyOptions({
     timeScale: {
       timeVisible: false, secondsVisible: false,
+      // Wider candles → each day visually distinct without zooming
+      barSpacing: 10, minBarSpacing: 2,
       tickMarkFormatter: (t) => {
         const d = new Date(t * 1000);
         const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -1043,8 +1146,48 @@ function makeAllCharts() {
         return `${d.getUTCDate()} ${m[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
       },
     },
+    // Brighter vertical gridlines so day boundaries are visible at a glance
+    grid: { vertLines: { color: '#262a38', visible: true },
+            horzLines: { color: '#1a1d27', visible: true } },
   });
   state.idxCandle = mkCandleSeries(state.idxChart, 'IDX');
+
+  // ATM ±1 combined-OI sub-chart for INDEX mode — same date axis as idxChart
+  state.idxOiChart = mkChart($('chart-idx-oi'));
+  state.idxOiChart.applyOptions({
+    timeScale: {
+      timeVisible: false, secondsVisible: false,
+      tickMarkFormatter: (t) => {
+        const d = new Date(t * 1000);
+        const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        return `${d.getUTCDate()} ${m[d.getUTCMonth()]} '${String(d.getUTCFullYear()).slice(2)}`;
+      },
+    },
+    localization: { timeFormatter: (t) => {
+      const d = new Date(t * 1000);
+      const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      return `${d.getUTCDate()} ${m[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+    }},
+  });
+  state.sIdxOiCE = state.idxOiChart.addLineSeries({
+    color: '#60a5fa', lineWidth: 2, title: 'CE OI (ATM±1)',
+    priceFormat: { type: 'volume' }, lastValueVisible: true,
+  });
+  state.sIdxOiPE = state.idxOiChart.addLineSeries({
+    color: '#c084fc', lineWidth: 2, title: 'PE OI (ATM±1)',
+    priceFormat: { type: 'volume' }, lastValueVisible: true,
+  });
+
+  // Two-way time-axis sync between idxChart (candles) and idxOiChart (OI lines)
+  const idxGroup = [state.idxChart, state.idxOiChart];
+  idxGroup.forEach(c => {
+    c.timeScale().subscribeVisibleLogicalRangeChange(range => {
+      if (state.syncing || !range) return;
+      state.syncing = true;
+      idxGroup.forEach(o => { if (o !== c) o.timeScale().setVisibleLogicalRange(range); });
+      state.syncing = false;
+    });
+  });
 
   // EMA overlays — fast = orange, slow = blue. Hidden until user toggles on.
   const emaFastOpts = { color: '#ff9800', lineWidth: 2, priceLineVisible: false,
@@ -1268,6 +1411,32 @@ async function loadIndex() {
   }
 }
 
+// Fetch the per-day ATM±1 combined OI series once per session; render into
+// the dedicated sub-pane (independent of the per-leg OI pane used in OPTION).
+async function loadIndexOi() {
+  if (!state.showAtmOi || state.viewMode !== 'index') {
+    if (state.sIdxOiCE) state.sIdxOiCE.setData([]);
+    if (state.sIdxOiPE) state.sIdxOiPE.setData([]);
+    return;
+  }
+  if (state.idxOiCEBars.length && state.idxOiPEBars.length) {
+    state.sIdxOiCE.setData(state.idxOiCEBars);
+    state.sIdxOiPE.setData(state.idxOiPEBars);
+    state.idxOiChart.timeScale().fitContent();
+    return;
+  }
+  try {
+    const r = await fetch('/api/index_oi');
+    if (!r.ok) return;
+    const j = await r.json();
+    state.idxOiCEBars = j.ce_oi || [];
+    state.idxOiPEBars = j.pe_oi || [];
+    state.sIdxOiCE.setData(state.idxOiCEBars);
+    state.sIdxOiPE.setData(state.idxOiPEBars);
+    state.idxOiChart.timeScale().fitContent();
+  } catch (_) {}
+}
+
 // Center the index chart on `state.date` with a ~120-day window. The gold
 // cursor line marks the date itself; user can pan/zoom freely from there.
 function scrollIndexToDate() {
@@ -1322,13 +1491,19 @@ async function loadRV() {
 function syncPaneVisibility() {
   $('pane-oi').classList.toggle('hidden', !state.showOI);
   $('pane-vol').classList.toggle('hidden', !state.showIV && !state.showRV);
-  // View toggle: OPTION shows CE+PE + scrubber. INDEX shows IDX only, hides
-  // CE/PE *and* the minute scrubber (which is meaningless on a multi-yr chart).
+  // View toggle: OPTION shows CE+PE + scrubber + day-list sidebar.
+  // INDEX shows IDX only (full-width), hides CE/PE, scrubber, sidebar.
   const indexMode = state.viewMode === 'index';
   document.querySelector('.opt-sub.ce').classList.toggle('hidden', indexMode);
   document.querySelector('.opt-sub.pe').classList.toggle('hidden', indexMode);
   $('opt-sub-idx').classList.toggle('hidden', !indexMode);
   const scrub = $('scrub-bar'); if (scrub) scrub.classList.toggle('hidden', indexMode);
+  // Left sidebar (day-list) is per-day intraday navigation — not useful for
+  // the 6-yr historical index view, so hide in INDEX mode.
+  const sidebar = $('sidebar'); if (sidebar) sidebar.classList.toggle('hidden', indexMode);
+  document.querySelectorAll('.resizer.v').forEach(r => r.classList.toggle('hidden', indexMode));
+  // ATM ±1 combined-OI sub-pane shows only in INDEX mode with the toggle on
+  $('pane-idx-oi').classList.toggle('hidden', !(indexMode && state.showAtmOi));
   // After visibility changes, charts may need a re-measure + a clean fit so
   // the canvas doesn't keep a stale visible range from the previous view.
   setTimeout(() => {
@@ -1342,6 +1517,7 @@ function syncPaneVisibility() {
         else state.idxChart.timeScale().fitContent();
       }
     }
+    if (state.idxOiChart) state.idxOiChart.applyOptions({ autoSize: true });
     refitAllCharts();
     updateCursors();
   }, 60);
@@ -1613,14 +1789,16 @@ function attach() {
     });
   });
 
-  // Indicator toggle buttons (OI / IV / RV)
+  // Indicator toggle buttons (OI / IV / RV / ATM·OI)
   document.querySelectorAll('#ind-grp button').forEach(b => {
     b.addEventListener('click', async () => {
       const k = b.dataset.ind;
-      const stateKey = ({oi:'showOI', iv:'showIV', rv:'showRV'})[k];
+      const stateKey = ({oi:'showOI', iv:'showIV', rv:'showRV', atmoi:'showAtmOi'})[k];
       state[stateKey] = !state[stateKey];
       b.classList.toggle('on', state[stateKey]);
-      if (k === 'rv') {
+      if (k === 'atmoi') {
+        await loadIndexOi();      // INDEX-only ATM±1 combined-OI overlay
+      } else if (k === 'rv') {
         if (state.showRV) await loadRV();
         else state.sRv_p.setData([]);
       } else {
