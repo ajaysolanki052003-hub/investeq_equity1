@@ -140,20 +140,23 @@ def fetch_one_day(d: date, token: str,
                 cands = fetch_candles(sym, s_str, e_str, token)
                 if not cands:
                     continue
-                # Groww's 1-min candles populate OI only every ~3 mins (their
-                # native OI tick cadence). To get one OI value per minute
-                # (matching the existing collector's format), forward-fill the
-                # last seen OI across the intervening 1-min bars.
-                last_oi = None
+                # Groww 1-min candles report OI only every ~3 mins (None on
+                # the other bars). We want one OI value per minute, so:
+                #   - forward-fill the last seen OI through intervening minutes
+                #   - BACKWARD-fill the leading minutes (before the first real
+                #     OI tick) with the first observed value, so we don't drop
+                #     09:15..09:17 when the first OI tick lands at 09:18.
+                first_real = next(
+                    (c[6] for c in cands if len(c) > 6 and c[6] is not None),
+                    None)
+                if first_real is None:
+                    continue  # no OI ever reported for this instrument — skip
+                last_oi = int(first_real)
                 for c in cands:
-                    # [ts, open, high, low, close, volume, oi]
                     ts = c[0] if len(c) > 0 else None
                     raw_oi = c[6] if len(c) > 6 else None
                     if raw_oi is not None:
                         last_oi = int(raw_oi)
-                    if last_oi is None:
-                        # Skip the leading minutes before the first OI tick
-                        continue
                     rows.append({
                         "timestamp":   ts,
                         "expiry":      exp.isoformat(),

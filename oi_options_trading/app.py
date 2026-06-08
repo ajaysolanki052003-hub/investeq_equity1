@@ -240,12 +240,20 @@ HTML = """<!doctype html>
     margin-left:auto; color:var(--muted); font-size:11px; display:flex; gap:14px;
   }
   .meta b { color:var(--text); font-weight:600; }
-  /* Two-pane layout when OI sub-pane is visible */
+  /* Two-pane layout when OI sub-pane is visible. The pane's flex-basis is
+     driven by JS (initial 35%, drag between 15% and 50%) — the divider
+     gives a draggable handle to resize. */
   .charts { display:flex; flex-direction:column; width:100%; height:calc(100vh - 56px); }
   #chart   { flex: 1 1 auto; min-height: 0; width:100%; position:relative; }
-  #oi-pane { flex: 0 0 200px; min-height: 160px; width:100%; position:relative;
-             border-top: 1px solid var(--border); }
-  #oi-pane.hidden, #oi-label.hidden { display: none !important; }
+  #pane-resizer {
+    flex: 0 0 6px; width: 100%; background: var(--border);
+    cursor: row-resize; transition: background 0.15s;
+    border-top: 1px solid var(--border-hi);
+    border-bottom: 1px solid var(--border-hi);
+  }
+  #pane-resizer:hover, #pane-resizer.dragging { background: var(--accent, #60a5fa); }
+  #oi-pane { flex: 0 0 35%; min-height: 0; width:100%; position:relative; }
+  #oi-pane.hidden, #pane-resizer.hidden, #oi-label.hidden { display: none !important; }
   #oi-label {
     position:absolute; left:14px; top:6px; z-index:5;
     color: var(--muted); font-size:11px; letter-spacing:0.6px;
@@ -297,8 +305,9 @@ HTML = """<!doctype html>
   </div>
 </div>
 
-<div class="charts">
+<div class="charts" id="charts-wrap">
   <div id="chart"></div>
+  <div id="pane-resizer" class="hidden" title="Drag to resize the OI pane (15% – 50%)"></div>
   <div id="oi-pane" class="hidden">
     <div id="oi-label" class="hidden">
       ATM±1 OI &nbsp;·&nbsp; <span class="ce">CE <b id="ce-val">—</b></span>
@@ -627,6 +636,7 @@ function syncOiToIndex() {
 function toggleOi() {
   state.showOi = !state.showOi;
   $("oi-pane").classList.toggle("hidden",  !state.showOi);
+  $("pane-resizer").classList.toggle("hidden", !state.showOi);
   $("oi-label").classList.toggle("hidden", !state.showOi);
   $("oi-toggle").classList.toggle("on", state.showOi);
   // Style the toggle for an active state similar to TF buttons
@@ -670,6 +680,41 @@ function init() {
   });
   $("oi-toggle").addEventListener("click", toggleOi);
   $("strat-toggle").addEventListener("click", toggleStrategy);
+
+  // ── OI pane drag-to-resize ───────────────────────────────────────
+  // The pane occupies 15%–50% of the .charts container; user drags the
+  // 6px handle to size between. Clamped both ways so neither pane can
+  // collapse and the OI pane can't exceed half the viewport.
+  (function attachResizer() {
+    const handle = $("pane-resizer");
+    const wrap   = $("charts-wrap");
+    const pane   = $("oi-pane");
+    const MIN_PCT = 15, MAX_PCT = 50;
+    let dragging = false;
+    handle.addEventListener("mousedown", (e) => {
+      dragging = true;
+      handle.classList.add("dragging");
+      document.body.style.cursor = "row-resize";
+      e.preventDefault();
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const rect = wrap.getBoundingClientRect();
+      const fromBottom = rect.bottom - e.clientY;
+      let pct = (fromBottom / rect.height) * 100;
+      pct = Math.max(MIN_PCT, Math.min(MAX_PCT, pct));
+      pane.style.flexBasis = pct.toFixed(2) + "%";
+      // Both charts need to re-measure when the pane resizes
+      if (state.chart)   state.chart.applyOptions({ autoSize: true });
+      if (state.oiChart) state.oiChart.applyOptions({ autoSize: true });
+    });
+    window.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      handle.classList.remove("dragging");
+      document.body.style.cursor = "";
+    });
+  })();
   loadTF("1d");
   loadMeta();
   window.addEventListener("resize", () => {

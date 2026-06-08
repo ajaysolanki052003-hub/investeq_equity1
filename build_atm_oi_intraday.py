@@ -77,6 +77,26 @@ def _process_day(p: Path, spot_ts: np.ndarray, spot_cl: np.ndarray) -> pd.DataFr
     if df.empty:
         return pd.DataFrame()
 
+    # ─── Fill per-instrument gaps before summing ──────────────────────
+    # Each (strike, option_type) instrument may be missing entries at some
+    # timestamps (Groww's 1-min candle carries OI only every ~3 mins; the
+    # fetcher drops leading None entries before the first real OI tick).
+    # When we groupby+sum, missing rows contribute 0 → false zero spikes
+    # in the CE/PE series at the start of the day.
+    #
+    # Reindex each instrument across the full timestamp grid and ffill
+    # (carry the last observed value forward) then bfill (back-fill any
+    # leading minutes before the first observation with the first one).
+    full_ts = sorted(df["timestamp"].unique())
+    pivot = (df.pivot_table(index="timestamp",
+                            columns=["strike", "option_type"],
+                            values="oi", aggfunc="first")
+               .reindex(full_ts)
+               .ffill().bfill())
+    df = (pivot.stack(level=["strike", "option_type"], future_stack=True)
+              .rename("oi").reset_index())
+    # ───────────────────────────────────────────────────────────────────
+
     # Resolve spot at each timestamp via searchsorted (as-of nearest preceding bar)
     tick_ts = df["timestamp"].view("int64").to_numpy()
     idx = np.searchsorted(spot_ts, tick_ts, side="right") - 1
