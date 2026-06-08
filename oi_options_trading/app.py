@@ -180,6 +180,7 @@ HTML = """<!doctype html>
   <label>Timeframe</label>
   <span class="tf-grp" id="tf-grp">
     <button data-tf="1m">1m</button>
+    <button data-tf="3m">3m</button>
     <button data-tf="5m">5m</button>
     <button data-tf="15m">15m</button>
     <button data-tf="1h">1h</button>
