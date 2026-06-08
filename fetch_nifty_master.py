@@ -47,6 +47,12 @@ SEGMENT  = "CASH"
 NSE_OPEN  = (9, 15)
 NSE_CLOSE = (15, 30)
 
+# Small chunk sizes keep individual requests lightweight and reduce the
+# blast-radius of any single 429 / timeout. With the retry logic in
+# groww_client the effective coverage is the same — just steadier.
+CHUNK_DAYS_1M = 7         # ~7 trading days = ~2,600 candles per request
+CHUNK_DELAY_S = 0.5       # pause between chunks (rate-limit cushion)
+
 
 def now_ist() -> datetime:
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -91,7 +97,8 @@ def fetch_range(start_dt: datetime, end_dt: datetime, token: str, verbose: bool 
     df = fetch_candles(
         SYMBOL, "1m", s, e, token,
         exchange=EXCHANGE, segment=SEGMENT,
-        delay_s=0.2, verbose=verbose,
+        delay_s=CHUNK_DELAY_S, verbose=verbose,
+        chunk_days_override=CHUNK_DAYS_1M,
     )
     if df.empty:
         return df
