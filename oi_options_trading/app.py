@@ -362,12 +362,34 @@ function setupChart() {
                  visible: false },
     rightPriceScale: { borderColor: "#2b3142" },
   }));
+  // Compact OI formatter: 12,299,040 -> "12.3M", 850000 -> "850K".
+  // Without this the OI right-axis labels are 8-10 chars wide vs. ~6 for
+  // the candle prices, so the two charts' plot areas don't end at the
+  // same X coordinate and time positions visually drift.
+  const oiFmt = {
+    type: 'custom',
+    formatter: (v) => {
+      if (v >= 1e7) return (v/1e7).toFixed(1) + 'Cr';
+      if (v >= 1e5) return (v/1e5).toFixed(1) + 'L';
+      if (v >= 1e3) return (v/1e3).toFixed(0) + 'K';
+      return String(v|0);
+    },
+  };
   state.ceLine = state.oiChart.addLineSeries({
-    color: "#26a69a", lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+    color: "#26a69a", lineWidth: 2,
+    priceLineVisible: false, lastValueVisible: false,
+    priceFormat: oiFmt,
   });
   state.peLine = state.oiChart.addLineSeries({
-    color: "#ef5350", lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+    color: "#ef5350", lineWidth: 2,
+    priceLineVisible: false, lastValueVisible: false,
+    priceFormat: oiFmt,
   });
+  // Lock both charts to the same right-gutter width so a given time t
+  // lands at exactly the same X coordinate on both panes.
+  const GUTTER = 64;
+  state.chart.priceScale('right').applyOptions({ minimumWidth: GUTTER });
+  state.oiChart.priceScale('right').applyOptions({ minimumWidth: GUTTER });
   // Two-way TIME-axis sync. We can't use logical range because the two
   // series carry different bar counts (1591 daily candles vs 1569 daily OI
   // points across 2020-2026). subscribeVisibleTimeRangeChange + setVisibleRange
