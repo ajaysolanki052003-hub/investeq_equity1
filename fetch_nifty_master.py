@@ -108,12 +108,70 @@ def fetch_range(start_dt: datetime, end_dt: datetime, token: str, verbose: bool 
     return df.sort_values("timestamp").drop_duplicates("timestamp", keep="first").reset_index(drop=True)
 
 
+def _fill_gaps(min_gap_days: int, verbose: bool) -> int:
+    """Detect day-level gaps in the master and refetch those windows.
+    A 'gap' here is a span >= min_gap_days calendar days between two
+    consecutive present days (so normal weekends — 3-day gap Fri->Mon —
+    pass with the default min_gap_days=3 actually do NOT, set 4 to skip)."""
+    df = _load_master()
+    if df.empty:
+        print("[fill] no master file — run a normal fetch first.", flush=True)
+        return 1
+    days = sorted(df["timestamp"].dt.normalize().unique())
+    gaps = []
+    for i in range(1, len(days)):
+        delta = (days[i] - days[i-1]).days
+        if delta >= min_gap_days:
+            gaps.append((days[i-1].to_pydatetime() + timedelta(days=1, hours=9, minutes=15),
+                         days[i].to_pydatetime() + timedelta(hours=15, minutes=30) - timedelta(days=1)))
+    if not gaps:
+        print(f"[fill] no gaps >= {min_gap_days} days found.", flush=True)
+        return 0
+    print(f"[fill] found {len(gaps)} gap windows >= {min_gap_days} days. Refetching...", flush=True)
+
+    print("[auth] requesting Groww access token...", flush=True)
+    token = get_access_token(
+        os.environ["GROWW_TOTP_JWT"],
+        os.environ["GROWW_TOTP_SECRET"],
+    )
+    print("[auth] OK", flush=True)
+
+    all_new = []
+    for i, (s, e) in enumerate(gaps, start=1):
+        print(f"  [{i}/{len(gaps)}] {s} -> {e}", flush=True)
+        try:
+            sub = fetch_range(s, e, token, verbose=verbose)
+            if not sub.empty:
+                all_new.append(sub)
+                print(f"     +{len(sub):,} bars", flush=True)
+            else:
+                print(f"     (no bars returned)", flush=True)
+        except Exception as ex:
+            print(f"     FAILED: {ex}", flush=True)
+        time.sleep(0.3)
+
+    if not all_new:
+        print("[fill] no new bars across all gaps.", flush=True)
+        return 0
+    new = pd.concat(all_new, ignore_index=True)
+    merged = pd.concat([df, new], ignore_index=True)
+    n_before = len(df)
+    _save_master(merged)
+    final = _load_master()
+    print(f"[save] rows={len(final):,} (+{len(final) - n_before:,})", flush=True)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--years",   type=int, default=5,
                     help="Backfill horizon when master file is missing (default 5)")
     ap.add_argument("--rebuild", action="store_true",
                     help="Delete master file and refetch from scratch")
+    ap.add_argument("--fill-gaps", action="store_true",
+                    help="Detect missing windows in the master and refetch them only")
+    ap.add_argument("--gap-days", type=int, default=3,
+                    help="Treat any gap >= this many calendar days as missing (default 3)")
     ap.add_argument("--quiet",   action="store_true")
     args = ap.parse_args()
     verbose = not args.quiet
@@ -121,6 +179,9 @@ def main() -> int:
     if args.rebuild and MASTER.exists():
         print(f"[init] rebuild requested — removing {MASTER}", flush=True)
         MASTER.unlink()
+
+    if args.fill_gaps:
+        return _fill_gaps(args.gap_days, verbose)
 
     end_dt = session_end_for(now_ist())
 

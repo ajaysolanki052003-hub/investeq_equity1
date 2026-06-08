@@ -121,9 +121,25 @@ def _fetch_window(
         'end_time':        end_str,
         'candle_interval': candle_int,
     }
-    r = requests.get(GROWW_CANDLES_URL, headers=headers, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json().get('payload', {}).get('candles') or []
+    # Retry on 429 / 5xx with exponential backoff. Groww throttles bursts even
+    # under the documented rate caps, so swallowing a 429 silently (as the old
+    # code did) leaves multi-day holes in the master series.
+    last_exc = None
+    for attempt in range(5):
+        try:
+            r = requests.get(GROWW_CANDLES_URL, headers=headers,
+                             params=params, timeout=timeout)
+            if r.status_code in (429, 500, 502, 503, 504):
+                wait = 1.0 * (2 ** attempt)
+                time.sleep(wait)
+                last_exc = RuntimeError(f'{r.status_code} after attempt {attempt+1}')
+                continue
+            r.raise_for_status()
+            return r.json().get('payload', {}).get('candles') or []
+        except requests.RequestException as e:
+            last_exc = e
+            time.sleep(1.0 * (2 ** attempt))
+    raise RuntimeError(f'_fetch_window: exhausted retries: {last_exc}')
 
 
 def fetch_candles(
