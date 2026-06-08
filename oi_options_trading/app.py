@@ -495,16 +495,23 @@ function setupChart() {
 // Convert one of the signal objects into a lightweight-charts marker, anchored
 // to the candle time appropriate for the active TF (day-open at 1d, exact
 // signal minute on intraday TFs).
+//
+// Display:
+//   BULLISH  →  green ▲ below bar  · text "BUY <spot>"
+//   BEARISH  →  red   ▼ above bar  · text "SELL <spot>"
+// `size: 2` ~doubles the arrow + text vs default; lightweight-charts renders
+// the text in a heavier weight at that size so it reads bold.
 function signalToMarker(s) {
   const isDaily = state.tf === '1d';
   const isoStr = isDaily ? s.day_open_time : s.signal_time;
   const t = Math.floor(new Date(isoStr + (isoStr.endsWith('Z') ? '' : 'Z')).getTime() / 1000);
+  const spot = Math.round(s.signal_spot).toLocaleString();
   if (s.signal === 'BULLISH') {
-    return { time: t, position: 'belowBar', color: '#26a69a',
-             shape: 'arrowUp', text: 'B', size: 1 };
+    return { time: t, position: 'belowBar', color: '#22c55e',
+             shape: 'arrowUp',  text: 'BUY ' + spot, size: 2 };
   }
-  return   { time: t, position: 'aboveBar', color: '#ef5350',
-             shape: 'arrowDown', text: 'S', size: 1 };
+  return   { time: t, position: 'aboveBar', color: '#ef4444',
+             shape: 'arrowDown', text: 'SELL ' + spot, size: 2 };
 }
 
 function applyStrategyMarkers() {
