@@ -811,6 +811,35 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
 .tf-grp button.on { background: var(--green); border-color: var(--green); color: #052b27; }
 .tf-grp button:hover:not(.on) { color: var(--text); border-color: var(--border-hi); }
 
+/* OPTION ⇄ INDEX view toggle — a distinct segmented control so the active
+   view is immediately obvious. Cyan accent + glow + larger padding to set
+   it apart from the smaller TF / indicator pills. */
+#view-grp {
+  display: inline-flex; gap: 0; padding: 3px;
+  background: var(--panel); border: 1px solid var(--border-hi); border-radius: 8px;
+}
+#view-grp button {
+  padding: 7px 18px; font-size: 12px; font-weight: 700; letter-spacing: 0.8px;
+  background: transparent; border: none; color: var(--muted-hi);
+  border-radius: 6px; cursor: pointer; transition: all 0.15s ease;
+}
+#view-grp button:hover:not(.on) { background: var(--panel-2); color: var(--text); }
+#view-grp button.on {
+  background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 100%);
+  color: #0a0c10; box-shadow: 0 0 12px rgba(96,165,250,0.45);
+}
+/* Index-mode date jumper — a styled native date input that matches the bar */
+#idx-date {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-hi); border-radius: 6px;
+  padding: 6px 10px; font: inherit; font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; color-scheme: dark; cursor: pointer;
+}
+#idx-date:hover { border-color: var(--accent, #60a5fa); }
+#idx-date::-webkit-calendar-picker-indicator {
+  filter: invert(0.8); cursor: pointer;
+}
+
 /* Layout: sidebar | resizer | main-content (metric strip + option pane). */
 .main {
   flex: 1; display: flex; gap: 0;
@@ -952,12 +981,14 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
   </span>
 
   <label>View</label>
-  <span class="tf-grp" id="view-grp">
+  <span id="view-grp">
     <button data-view="option" class="on" title="CE and PE charts side-by-side">OPTION</button>
     <button data-view="index" title="NIFTY spot chart only">INDEX</button>
   </span>
-  <button id="idx-fit" class="tf-grp" title="Fit full 5-year history into view"
-          style="display:none; padding:5px 12px; background:var(--panel-2); color:var(--text); border:1px solid var(--border-hi); border-radius:5px; cursor:pointer; font:inherit; font-family:'JetBrains Mono', monospace;">FIT ALL</button>
+  <label>Jump to</label>
+  <input type="date" id="idx-date" title="Jump the chart to a specific date" />
+  <button id="idx-fit" title="Fit full 5-year history into view"
+          style="display:none; padding:6px 14px; background:var(--panel-2); color:var(--text); border:1px solid var(--border-hi); border-radius:6px; cursor:pointer; font:inherit; font-family:'JetBrains Mono', monospace; font-weight:600; letter-spacing:0.4px;">FIT ALL</button>
   <input id="rv-lookback" type="number" min="3" max="200" value="30"
          title="RV lookback (bars)"
          style="width:58px; background:var(--panel-2); border:1px solid var(--border-hi); color:var(--text); border-radius:5px; padding:5px 7px; font:inherit; font-family:'JetBrains Mono', monospace;" />
@@ -1651,6 +1682,14 @@ async function loadDays() {
   // Default to most-recent day
   state.date = _allDays[_allDays.length - 1];
   $('day-readout').textContent = fmtDay(state.date);
+  // Configure the date jumper: bounds match the available range, default = latest
+  const di = $('idx-date');
+  if (di && _allDays.length) {
+    const toIso = (d) => `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
+    di.min = toIso(_allDays[0]);
+    di.max = toIso(_allDays[_allDays.length - 1]);
+    di.value = toIso(state.date);
+  }
   highlightActiveDay();
 }
 
@@ -1691,6 +1730,9 @@ function highlightActiveDay() {
 async function selectDay(d) {
   state.date = d;
   $('day-readout').textContent = fmtDay(d);
+  // Keep the date jumper in sync (YYYYMMDD → YYYY-MM-DD)
+  const iso = `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
+  const di = $('idx-date'); if (di) di.value = iso;
   state.ceStrike = null; state.peStrike = null;
   highlightActiveDay();
   await loadExpiries();
@@ -1904,6 +1946,28 @@ function attach() {
   $('idx-fit').addEventListener('click', () => {
     if (state.idxChart) state.idxChart.timeScale().fitContent();
     if (state.idxOiChart) state.idxOiChart.timeScale().fitContent();
+  });
+
+  // Date jumper — works in BOTH views. In OPTION mode it loads the chosen
+  // trading day (chain table + scrubber + CE/PE charts). In INDEX mode it
+  // centers the spot chart on that date.
+  $('idx-date').addEventListener('change', async (e) => {
+    const v = e.target.value;     // "YYYY-MM-DD" from the native picker
+    if (!v) return;
+    const d = v.replace(/-/g, '');  // → "YYYYMMDD"
+    // Snap to the nearest available trading day (in case user picks a weekend
+    // or holiday). _allDays is sorted ascending.
+    let target = d;
+    if (_allDays && _allDays.length) {
+      // Find the largest available day <= d, else the first day >= d
+      let snap = null;
+      for (let i = _allDays.length - 1; i >= 0; i--) {
+        if (_allDays[i] <= d) { snap = _allDays[i]; break; }
+      }
+      if (!snap) snap = _allDays[0];
+      target = snap;
+    }
+    await selectDay(target);
   });
 
   // RV lookback editor — only refetches RV when changed (cheap)
