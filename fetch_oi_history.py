@@ -33,10 +33,19 @@ ROOT = Path(os.environ.get(
     if os.name == "nt" else "/home/ajay/investeq_ajs/DATA"))
 OI_DIR = ROOT / "oi"
 
-BHAV_URL = (
+BHAV_URL_NEW = (
     "https://nsearchives.nseindia.com/content/fo/"
     "BhavCopy_NSE_FO_0_0_0_{ymd}_F_0000.csv.zip"
 )
+# NSE renamed and reformatted the F&O bhavcopy in early 2024. For older dates
+# the file lives under /historical/DERIVATIVES/<YYYY>/<MON>/fo<DD><MON><YYYY>bhav.csv.zip
+# with the legacy column layout (INSTRUMENT/SYMBOL/EXPIRY_DT/STRIKE_PR/...).
+BHAV_URL_OLD = (
+    "https://nsearchives.nseindia.com/content/historical/DERIVATIVES/"
+    "{Y}/{MON}/fo{D:02d}{MON}{Y}bhav.csv.zip"
+)
+MON3 = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 
 # NSE archive subdomain rejects requests without a UA + Accept header.
 HEADERS = {
@@ -59,45 +68,72 @@ def _existing_days() -> set[str]:
     return {p.stem for p in OI_DIR.glob("*.parquet")}
 
 
-def _download_bhav(d: date, session: requests.Session) -> pd.DataFrame:
-    """Return a parsed bhavcopy CSV as a DataFrame. Empty if no bhavcopy for
-    that date (holiday, future date, etc.)."""
-    url = BHAV_URL.format(ymd=_ymd(d))
+def _download_bhav(d: date, session: requests.Session) -> tuple[pd.DataFrame, str]:
+    """Return (parsed bhavcopy DataFrame, schema-tag).
+    Tries the NEW URL first (post-2024 format), falls back to the OLD URL
+    (pre-2024). schema-tag is 'new', 'old', or '' if nothing worked."""
+    # NEW format
+    url = BHAV_URL_NEW.format(ymd=_ymd(d))
     r = session.get(url, headers=HEADERS, timeout=25)
-    if r.status_code != 200 or len(r.content) < 200:
-        return pd.DataFrame()
-    try:
-        z = zipfile.ZipFile(io.BytesIO(r.content))
-        inner = z.namelist()[0]
-        df = pd.read_csv(z.open(inner))
-    except Exception:
-        return pd.DataFrame()
-    return df
+    if r.status_code == 200 and len(r.content) > 200:
+        try:
+            z = zipfile.ZipFile(io.BytesIO(r.content))
+            inner = z.namelist()[0]
+            df = pd.read_csv(z.open(inner))
+            if not df.empty:
+                return df, "new"
+        except Exception:
+            pass
+    # OLD format
+    url = BHAV_URL_OLD.format(Y=d.year, MON=MON3[d.month - 1], D=d.day)
+    r = session.get(url, headers=HEADERS, timeout=25)
+    if r.status_code == 200 and len(r.content) > 200:
+        try:
+            z = zipfile.ZipFile(io.BytesIO(r.content))
+            inner = z.namelist()[0]
+            df = pd.read_csv(z.open(inner))
+            if not df.empty:
+                return df, "old"
+        except Exception:
+            pass
+    return pd.DataFrame(), ""
 
 
-def _to_oi_parquet(df: pd.DataFrame, d: date) -> pd.DataFrame | None:
+def _to_oi_parquet(df: pd.DataFrame, d: date, schema: str) -> pd.DataFrame | None:
     """Filter the bhavcopy to NIFTY options and reshape into the existing
-    DATA/oi/ schema."""
+    DATA/oi/ schema. Handles both NEW (UDIFF) and OLD legacy column layouts."""
     if df.empty:
         return None
-    # Filter: NIFTY options only (rows that have a strike + option type).
-    # Bhavcopy uses TckrSymb="NIFTY" for both futures and options; we want
-    # CE/PE rows only.
-    sub = df[(df["TckrSymb"] == "NIFTY") &
-             (df["OptnTp"].isin(["CE", "PE"]))].copy()
-    if sub.empty:
-        return None
-    # Build the canonical schema. EOD timestamp = 15:30 IST.
     ts = pd.Timestamp(year=d.year, month=d.month, day=d.day,
                       hour=15, minute=30).isoformat()
-    out = pd.DataFrame({
-        "timestamp":   ts,
-        "expiry":      pd.to_datetime(sub["XpryDt"]).dt.strftime("%Y-%m-%d"),
-        "strike":      sub["StrkPric"].astype("int32"),
-        "option_type": sub["OptnTp"].astype(str),
-        "oi":          sub["OpnIntrst"].fillna(0).astype("int64"),
-    })
-    # Sometimes bhavcopy emits dupes across sessions — keep first.
+    if schema == "new":
+        sub = df[(df["TckrSymb"] == "NIFTY") &
+                 (df["OptnTp"].isin(["CE", "PE"]))].copy()
+        if sub.empty:
+            return None
+        out = pd.DataFrame({
+            "timestamp":   ts,
+            "expiry":      pd.to_datetime(sub["XpryDt"]).dt.strftime("%Y-%m-%d"),
+            "strike":      sub["StrkPric"].astype("int32"),
+            "option_type": sub["OptnTp"].astype(str),
+            "oi":          sub["OpnIntrst"].fillna(0).astype("int64"),
+        })
+    elif schema == "old":
+        # Legacy format: INSTRUMENT='OPTIDX', SYMBOL='NIFTY', EXPIRY_DT='28-Dec-2023'
+        sub = df[(df["INSTRUMENT"] == "OPTIDX") &
+                 (df["SYMBOL"] == "NIFTY") &
+                 (df["OPTION_TYP"].isin(["CE", "PE"]))].copy()
+        if sub.empty:
+            return None
+        out = pd.DataFrame({
+            "timestamp":   ts,
+            "expiry":      pd.to_datetime(sub["EXPIRY_DT"], format="%d-%b-%Y").dt.strftime("%Y-%m-%d"),
+            "strike":      sub["STRIKE_PR"].astype("float").astype("int32"),
+            "option_type": sub["OPTION_TYP"].astype(str),
+            "oi":          sub["OPEN_INT"].fillna(0).astype("int64"),
+        })
+    else:
+        return None
     out = (out.drop_duplicates(subset=["expiry", "strike", "option_type"], keep="first")
               .reset_index(drop=True))
     return out
@@ -110,16 +146,16 @@ def fetch_one(d: date, session: requests.Session, *, overwrite: bool) -> str:
     path = OI_DIR / f"{_ymd(d)}.parquet"
     if path.exists() and not overwrite:
         return "exists"
-    raw = _download_bhav(d, session)
+    raw, schema = _download_bhav(d, session)
     if raw.empty:
         return "no_bhav"
-    out = _to_oi_parquet(raw, d)
+    out = _to_oi_parquet(raw, d, schema)
     if out is None or out.empty:
         return "no_nifty"
     tmp = path.with_suffix(".parquet.tmp")
     out.to_parquet(tmp, index=False)
     tmp.replace(path)
-    return f"ok({len(out):,})"
+    return f"ok-{schema}({len(out):,})"
 
 
 def _date_range(start: date, end: date):
