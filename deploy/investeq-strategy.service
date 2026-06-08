@@ -1,0 +1,20 @@
+[Unit]
+Description=Investeq strategy suite — OI options trading (mounted at /strategy)
+After=network.target
+
+[Service]
+Type=simple
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+Environment=APP_BASE=/strategy
+Environment=INVESTEQ_DATA=/home/ajay/investeq_ajs/DATA
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python -m uvicorn oi_options_trading.app:app --host 127.0.0.1 --port 8705
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

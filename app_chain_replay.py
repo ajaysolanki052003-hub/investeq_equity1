@@ -1181,12 +1181,21 @@ function makeAllCharts() {
   state.idxChart  = mkChart($('opt-chart-idx'));
   state.idxChart.applyOptions({
     timeScale: {
-      timeVisible: false, secondsVisible: false,
-      // Wider candles → each day visually distinct without zooming
+      // Show time when an intraday TF is active so 1m / 5m / 15m / 1h bars
+      // carry their HH:MM. 1d / 1w stays date-only.
+      timeVisible: true, secondsVisible: false,
+      // Wider candles → each bar visually distinct without zooming
       barSpacing: 10, minBarSpacing: 2,
       tickMarkFormatter: (t) => {
         const d = new Date(t * 1000);
         const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        const intraday = state.idxTf && state.idxTf !== '1d';
+        if (intraday) {
+          // "5 Jan 14:30" — month-day-time for intraday TFs
+          const hh = String(d.getUTCHours()).padStart(2, '0');
+          const mm = String(d.getUTCMinutes()).padStart(2, '0');
+          return `${d.getUTCDate()} ${m[d.getUTCMonth()]} ${hh}:${mm}`;
+        }
         return `${d.getUTCDate()} ${m[d.getUTCMonth()]} '${String(d.getUTCFullYear()).slice(2)}`;
       },
     },
@@ -1194,6 +1203,12 @@ function makeAllCharts() {
       timeFormatter: (t) => {
         const d = new Date(t * 1000);
         const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        const intraday = state.idxTf && state.idxTf !== '1d';
+        if (intraday) {
+          const hh = String(d.getUTCHours()).padStart(2, '0');
+          const mm = String(d.getUTCMinutes()).padStart(2, '0');
+          return `${d.getUTCDate()} ${m[d.getUTCMonth()]} ${d.getUTCFullYear()} ${hh}:${mm}`;
+        }
         return `${d.getUTCDate()} ${m[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
       },
     },
@@ -1428,36 +1443,41 @@ function refitAllCharts() {
   });
 }
 
-// ── INDEX view (full 6-yr spot, TradingView-style) ────────────────────────
-// Loaded ONCE per session, cached in state.idxFullBars. After that, picking
-// a different date just scrolls the chart — no refetch, no flicker.
-async function loadIndex() {
+// ── INDEX view (full multi-yr spot, TradingView-style) ───────────────────
+// Bars per TF are cached in state.idxBarsByTf so switching TFs after first
+// load is instant. Intraday TFs serve a lot of bars (1m × 5 yr ≈ 460k) —
+// lightweight-charts handles it, but the first fetch can take a few seconds.
+async function loadIndex(tf) {
   if (state.viewMode !== 'index') return;
+  const useTf = tf || state.idxTf || '1d';
+  state.idxTf = useTf;
 
-  // Already loaded → just scroll to the current selected date
-  if (state.idxFullBars && state.idxFullBars.length) {
-    scrollIndexToDate();
+  if (!state.idxBarsByTf) state.idxBarsByTf = {};
+
+  // Cached → render instantly
+  if (state.idxBarsByTf[useTf] && state.idxBarsByTf[useTf].length) {
+    state.idxBars = state.idxBarsByTf[useTf];
+    state.idxCandle.setData(state.idxBars);
+    state.idxChart.timeScale().fitContent();
+    $('opt-info').textContent = `${state.idxBars.length.toLocaleString()} bars · ${useTf}`;
     return;
   }
 
-  // First-time fetch of the full history (1d resolution, ~1.5k bars)
-  $('opt-info').textContent = 'loading full history…';
+  $('opt-info').textContent = `loading ${useTf} history…`;
   try {
-    const r = await fetch('/api/spot_all?tf=1d');
+    const r = await fetch(`/api/spot_all?tf=${useTf}`);
     if (!r.ok) {
-      state.idxFullBars = [];
+      state.idxBarsByTf[useTf] = [];
       return;
     }
     const j = await r.json();
-    state.idxFullBars = j.bars || [];
-    state.idxBars = state.idxFullBars;
+    state.idxBarsByTf[useTf] = j.bars || [];
+    state.idxBars = state.idxBarsByTf[useTf];
     state.idxCandle.setData(state.idxBars);
-    // First-render: show the full 5-year range. User can scroll, zoom, or
-    // pick a different day; date changes will re-center via scrollIndexToDate().
     state.idxChart.timeScale().fitContent();
-    $('opt-info').textContent = `${state.idxBars.length} bars · ${state.idxBars.length} days`;
+    $('opt-info').textContent = `${state.idxBars.length.toLocaleString()} bars · ${useTf}`;
   } catch (e) {
-    state.idxFullBars = [];
+    state.idxBarsByTf[useTf] = [];
     $('opt-info').textContent = `index load failed: ${e}`;
   }
 }
@@ -1829,15 +1849,18 @@ function attach() {
   $('slider').addEventListener('input', e => setMinute(+e.target.value));
   $('play').addEventListener('click', togglePlay);
 
-  // TF buttons → reload CE/PE option charts at new resolution
+  // TF buttons → in OPTION view, reload CE/PE option charts at new resolution.
+  // In INDEX view, switch the full-history NIFTY chart between 1m / 5m / 15m / 1h / 1d.
   document.querySelectorAll('#tf-grp button').forEach(b => {
     b.addEventListener('click', async () => {
       document.querySelectorAll('#tf-grp button').forEach(x => x.classList.remove('on'));
       b.classList.add('on');
       state.tf = b.dataset.tf;
-      // INDEX mode is locked to 1d full-history; TF buttons only affect
-      // CE/PE/OI/Vol when the user is in OPTION view.
-      await loadOption();
+      if (state.viewMode === 'index') {
+        await loadIndex(state.tf);
+      } else {
+        await loadOption();
+      }
       updateCursors();
     });
   });
@@ -1871,7 +1894,7 @@ function attach() {
       document.querySelectorAll('#view-grp button').forEach(x => x.classList.remove('on'));
       b.classList.add('on');
       state.viewMode = v;
-      if (v === 'index') await loadIndex();
+      if (v === 'index') await loadIndex(state.tf);
       syncPaneVisibility();
       updateCursors();
     });

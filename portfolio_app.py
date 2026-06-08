@@ -131,6 +131,20 @@ PROJECTS = [
         "metrics": [],
         "accent": "#facc15",
     },
+    {
+        "id": "strategy-suite",
+        "name": "Strategy Suite",
+        "instrument": "Options",
+        "tag": "BUILD",
+        "category": "OPTIONS",
+        "thesis": "",
+        "stack": [],
+        "port": 8705,
+        "url": "/strategy/",
+        "path": "",
+        "metrics": [],
+        "accent": "#a78bfa",
+    },
 ]
 
 
