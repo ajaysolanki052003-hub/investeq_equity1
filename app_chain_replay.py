@@ -956,6 +956,8 @@ body.resizing iframe, body.resizing canvas { pointer-events: none; }
     <button data-view="option" class="on" title="CE and PE charts side-by-side">OPTION</button>
     <button data-view="index" title="NIFTY spot chart only">INDEX</button>
   </span>
+  <button id="idx-fit" class="tf-grp" title="Fit full 5-year history into view"
+          style="display:none; padding:5px 12px; background:var(--panel-2); color:var(--text); border:1px solid var(--border-hi); border-radius:5px; cursor:pointer; font:inherit; font-family:'JetBrains Mono', monospace;">FIT ALL</button>
   <input id="rv-lookback" type="number" min="3" max="200" value="30"
          title="RV lookback (bars)"
          style="width:58px; background:var(--panel-2); border:1px solid var(--border-hi); color:var(--text); border-radius:5px; padding:5px 7px; font:inherit; font-family:'JetBrains Mono', monospace;" />
@@ -1450,10 +1452,10 @@ async function loadIndex() {
     state.idxFullBars = j.bars || [];
     state.idxBars = state.idxFullBars;
     state.idxCandle.setData(state.idxBars);
-    // First-render: fit content so the whole 6-yr range is visible briefly,
-    // then zoom to the current selected date
+    // First-render: show the full 5-year range. User can scroll, zoom, or
+    // pick a different day; date changes will re-center via scrollIndexToDate().
     state.idxChart.timeScale().fitContent();
-    requestAnimationFrame(() => scrollIndexToDate());
+    $('opt-info').textContent = `${state.idxBars.length} bars · ${state.idxBars.length} days`;
   } catch (e) {
     state.idxFullBars = [];
     $('opt-info').textContent = `index load failed: ${e}`;
@@ -1553,6 +1555,8 @@ function syncPaneVisibility() {
   document.querySelectorAll('.resizer.v').forEach(r => r.classList.toggle('hidden', indexMode));
   // ATM ±1 combined-OI sub-pane shows only in INDEX mode with the toggle on
   $('pane-idx-oi').classList.toggle('hidden', !(indexMode && state.showAtmOi));
+  // FIT-ALL button is INDEX-mode only
+  const fitBtn = $('idx-fit'); if (fitBtn) fitBtn.style.display = indexMode ? 'inline-block' : 'none';
   // After visibility changes, charts may need a re-measure + a clean fit so
   // the canvas doesn't keep a stale visible range from the previous view.
   setTimeout(() => {
@@ -1560,10 +1564,10 @@ function syncPaneVisibility() {
     if (state.volChart) state.volChart.applyOptions({ autoSize: true });
     if (state.idxChart) {
       state.idxChart.applyOptions({ autoSize: true });
-      if (indexMode) {
-        // Either fit the freshly-loaded history or re-center on the date
-        if (state.idxBars && state.idxBars.length) scrollIndexToDate();
-        else state.idxChart.timeScale().fitContent();
+      // On entering INDEX, always fit the full 5-yr range. User scrolls/zooms freely
+      // from there; the FIT ALL button restores this view at any time.
+      if (indexMode && state.idxBars && state.idxBars.length) {
+        state.idxChart.timeScale().fitContent();
       }
     }
     if (state.idxOiChart) state.idxOiChart.applyOptions({ autoSize: true });
@@ -1871,6 +1875,12 @@ function attach() {
       syncPaneVisibility();
       updateCursors();
     });
+  });
+
+  // FIT ALL — restore full 5-yr view at any zoom level
+  $('idx-fit').addEventListener('click', () => {
+    if (state.idxChart) state.idxChart.timeScale().fitContent();
+    if (state.idxOiChart) state.idxOiChart.timeScale().fitContent();
   });
 
   // RV lookback editor — only refetches RV when changed (cheap)
