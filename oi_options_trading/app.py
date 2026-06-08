@@ -159,6 +159,24 @@ def nifty_oi(tf: str = Query("1d")):
     return JSONResponse({"ce_oi": ce, "pe_oi": pe, "n": len(df), "tf": tf})
 
 
+@lru_cache(maxsize=1)
+def _strategy_signals_cached():
+    """Run Steps 1+2 once per process; OI aggregate changes only when the
+    daily 5 PM cron rebuilds it, so a process-level cache is fine."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent))
+    from strategies.multi_strike_oi_crossover import compute_signals
+    return compute_signals()
+
+
+@app.get("/api/strategy/multi_strike_oi_crossover")
+def strategy_signals():
+    """All days that fired a Step-2 crossover signal — BULLISH / BEARISH +
+    surrounding OI snapshot, ready to overlay as chart markers."""
+    sigs, stats = _strategy_signals_cached()
+    return JSONResponse({"signals": sigs, "stats": stats, "n": len(sigs)})
+
+
 @app.get("/api/range")
 def date_range():
     df = _load_master_1m()
@@ -260,6 +278,12 @@ HTML = """<!doctype html>
 
   <button class="btn" id="fit-all">FIT ALL</button>
   <button class="btn" id="oi-toggle" title="Show/hide the ATM±1 combined OI sub-pane">ATM·OI</button>
+  <button class="btn" id="strat-toggle" title="Show Step-2 crossover signals (BULLISH ▲ / BEARISH ▼) on the candle chart">STRATEGY</button>
+  <span id="strat-stat" style="color:var(--muted); font-size:11px; display:none;">
+    <b id="ss-bull" style="color:#26a69a;">—</b> bullish ·
+    <b id="ss-bear" style="color:#ef5350;">—</b> bearish ·
+    <b id="ss-no">—</b> no-cross
+  </span>
 
   <div class="spot">
     <span class="l">LAST</span>
@@ -300,6 +324,9 @@ const state = {
   showOi: false,
   // Per-tf cache so toggling/switching is instant after first load
   oiByTf: {},
+  // Strategy markers
+  showStrategy: false,
+  signals: [],     // list of {day, signal, signal_time, day_open_time, ...}
 };
 
 const $ = (id) => document.getElementById(id);
@@ -456,6 +483,67 @@ function setupChart() {
   });
 }
 
+// Convert one of the signal objects into a lightweight-charts marker, anchored
+// to the candle time appropriate for the active TF (day-open at 1d, exact
+// signal minute on intraday TFs).
+function signalToMarker(s) {
+  const isDaily = state.tf === '1d';
+  const isoStr = isDaily ? s.day_open_time : s.signal_time;
+  const t = Math.floor(new Date(isoStr + (isoStr.endsWith('Z') ? '' : 'Z')).getTime() / 1000);
+  if (s.signal === 'BULLISH') {
+    return { time: t, position: 'belowBar', color: '#26a69a',
+             shape: 'arrowUp', text: 'B', size: 1 };
+  }
+  return   { time: t, position: 'aboveBar', color: '#ef5350',
+             shape: 'arrowDown', text: 'S', size: 1 };
+}
+
+function applyStrategyMarkers() {
+  if (!state.candle) return;
+  if (!state.showStrategy || !state.signals.length) {
+    state.candle.setMarkers([]);
+    return;
+  }
+  // Markers must match a bar time exactly. setMarkers expects sorted ascending.
+  const ms = state.signals.map(signalToMarker)
+                          .sort((a, b) => a.time - b.time);
+  state.candle.setMarkers(ms);
+}
+
+async function loadStrategySignals() {
+  if (state.signals.length) {
+    applyStrategyMarkers();
+    return;
+  }
+  try {
+    const r = await fetch(apiUrl('/api/strategy/multi_strike_oi_crossover'));
+    const j = await r.json();
+    state.signals = j.signals || [];
+    const st = j.stats || {};
+    $('ss-bull').textContent = (st.bull || 0).toLocaleString();
+    $('ss-bear').textContent = (st.bear || 0).toLocaleString();
+    $('ss-no').textContent   = (st.no_signal || 0).toLocaleString();
+    applyStrategyMarkers();
+  } catch (_) {}
+}
+
+function toggleStrategy() {
+  state.showStrategy = !state.showStrategy;
+  $('strat-stat').style.display = state.showStrategy ? 'inline' : 'none';
+  const btn = $('strat-toggle');
+  if (state.showStrategy) {
+    btn.style.background = 'linear-gradient(135deg, #a78bfa 0%, #7c5fd6 100%)';
+    btn.style.color = '#0a0c10';
+    btn.style.borderColor = 'transparent';
+    btn.style.fontWeight = '700';
+    loadStrategySignals();
+  } else {
+    btn.style.background = ''; btn.style.color = '';
+    btn.style.borderColor = ''; btn.style.fontWeight = '';
+    state.candle.setMarkers([]);
+  }
+}
+
 // Binary search for the bar at-or-before `time` in a sorted-by-time array.
 function findAtTime(bars, time) {
   if (!bars || !bars.length) return null;
@@ -488,6 +576,8 @@ async function loadTF(tf) {
   state.chart.timeScale().fitContent();
   // Re-load OI at this TF if the sub-pane is open
   if (state.showOi) await loadOI(tf);
+  // Re-anchor strategy markers (timestamps differ by TF)
+  if (state.showStrategy) applyStrategyMarkers();
 }
 
 async function loadOI(tf) {
@@ -579,6 +669,7 @@ function init() {
     if (state.oiChart) state.oiChart.timeScale().fitContent();
   });
   $("oi-toggle").addEventListener("click", toggleOi);
+  $("strat-toggle").addEventListener("click", toggleStrategy);
   loadTF("1d");
   loadMeta();
   window.addEventListener("resize", () => {
