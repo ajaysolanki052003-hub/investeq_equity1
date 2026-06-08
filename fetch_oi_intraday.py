@@ -69,17 +69,21 @@ def _atms_touched(spot: pd.DataFrame, padding: int = 1) -> list[int]:
     return list(range(atm_lo, atm_hi + 1, STRIKE_STEP))
 
 
+_RULE_CHANGE = date(2025, 9, 1)   # NSE moved NIFTY weekly Thu → Tue at start of 2025-09
+
 def _next_weekly_expiries(d: date, n: int = 2) -> list[date]:
-    """The next N weekly NIFTY expiries on/after d.
+    """Next N weekly NIFTY expiries on/after d.
 
     NIFTY weekly expiry day:
-      < 2025-Sep: Thursday (weekday=3)
-      >= 2025-Sep: Tuesday (weekday=1) — NSE rule change.
-    For our backfill window (Apr-Jun 2026) it's Tuesday. We always pick
-    Tuesday; on the rare moved-expiry day Groww returns empty and we skip."""
-    # Tuesday = weekday() 1
+      < 2025-09-01: Thursday (weekday=3)
+      >= 2025-09-01: Tuesday (weekday=1)
+
+    If both expiries straddle the rule-change boundary, we always pick
+    the rule-relevant day. Groww returns empty for any mis-targeted
+    expiry and we skip silently."""
+    target_wd = 1 if d >= _RULE_CHANGE else 3
     base = d
-    while base.weekday() != 1:
+    while base.weekday() != target_wd:
         base += timedelta(days=1)
     return [base + timedelta(days=7*i) for i in range(n)]
 
@@ -90,7 +94,7 @@ def _gsym(expiry: date, strike: int, opt_type: str) -> str:
 
 
 def fetch_candles(sym: str, start: str, end: str, token: str,
-                  interval: str = "15minute", retries: int = 3) -> list:
+                  interval: str = "1minute", retries: int = 3) -> list:
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json",
                "X-API-VERSION": "1.0"}
     for attempt in range(retries):
@@ -136,20 +140,26 @@ def fetch_one_day(d: date, token: str,
                 cands = fetch_candles(sym, s_str, e_str, token)
                 if not cands:
                     continue
+                # Groww's 1-min candles populate OI only every ~3 mins (their
+                # native OI tick cadence). To get one OI value per minute
+                # (matching the existing collector's format), forward-fill the
+                # last seen OI across the intervening 1-min bars.
+                last_oi = None
                 for c in cands:
                     # [ts, open, high, low, close, volume, oi]
                     ts = c[0] if len(c) > 0 else None
-                    oi = c[6] if len(c) > 6 and c[6] is not None else None
-                    # Skip rows where OI wasn't reported — keeps the aggregate
-                    # clean (we'd otherwise spike to 0 between real readings).
-                    if oi is None:
+                    raw_oi = c[6] if len(c) > 6 else None
+                    if raw_oi is not None:
+                        last_oi = int(raw_oi)
+                    if last_oi is None:
+                        # Skip the leading minutes before the first OI tick
                         continue
                     rows.append({
                         "timestamp":   ts,
                         "expiry":      exp.isoformat(),
                         "strike":      int(k),
                         "option_type": typ,
-                        "oi":          int(oi),
+                        "oi":          last_oi,
                     })
                 if delay > 0:
                     time.sleep(delay)
@@ -186,11 +196,16 @@ def main() -> int:
     print("[auth] OK", flush=True)
 
     if args.flat_days:
-        # Discover flat days from the aggregate
+        # Discover flat days (≤5 ticks/day in the aggregate). Includes only
+        # weekdays with spot data — skips weekends and holidays automatically.
         agg = pd.read_parquet(ROOT / "_atm_oi_intraday.parquet")
         agg["timestamp"] = pd.to_datetime(agg["timestamp"])
         counts = agg.groupby(agg["timestamp"].dt.date).size()
-        days = sorted(counts[counts <= 5].index)
+        spot_days = set()
+        sp = pd.read_parquet(SPOT_MASTER, columns=["timestamp"])
+        sp["timestamp"] = pd.to_datetime(sp["timestamp"])
+        spot_days = set(sp["timestamp"].dt.date.unique())
+        days = [d for d in sorted(counts[counts <= 5].index) if d in spot_days]
     elif args.date:
         days = [datetime.strptime(args.date, "%Y-%m-%d").date()]
     elif args.start and args.end:
