@@ -353,6 +353,7 @@ function fmtDateUnix(t) {
 
 function setupChart() {
   const baseOpts = {
+    autoSize: true,   // chart owns a ResizeObserver — no more manual applyOptions on every mousemove
     layout: { background: { color: "#0b0d11" }, textColor: "#e7eaf1" },
     grid: {
       vertLines: { color: "#1a1f2b", visible: true },
@@ -442,6 +443,18 @@ function setupChart() {
   sync(state.chart,   state.oiChart);
   sync(state.oiChart, state.chart);
 
+  // Re-render strategy markers when the visible range changes, throttled
+  // via rAF so it runs at most once per frame even if the user pans fast.
+  let markerPending = false;
+  state.chart.timeScale().subscribeVisibleTimeRangeChange(() => {
+    if (!state.showStrategy || markerPending) return;
+    markerPending = true;
+    requestAnimationFrame(() => {
+      markerPending = false;
+      applyStrategyMarkers();
+    });
+  });
+
   // ── Crosshair sync ─────────────────────────────────────────────
   // Hovering EITHER pane draws the dashed crosshair on BOTH at the same
   // time-cursor. The horizontal line on the "other" chart sits at the
@@ -514,15 +527,35 @@ function signalToMarker(s) {
              shape: 'arrowDown', text: 'SELL ' + spot, size: 2 };
 }
 
+// Drawing 1,455 markers at once stresses the chart on every pan/zoom — the
+// browser repaints all of them even when only a few are visible. We render
+// only signals inside the current visible time range (plus a small buffer)
+// and re-render whenever the user pans/zooms. Net: ~50-300 markers on
+// screen, even at the full 5-year zoom.
 function applyStrategyMarkers() {
   if (!state.candle) return;
   if (!state.showStrategy || !state.signals.length) {
     state.candle.setMarkers([]);
     return;
   }
-  // Markers must match a bar time exactly. setMarkers expects sorted ascending.
-  const ms = state.signals.map(signalToMarker)
-                          .sort((a, b) => a.time - b.time);
+  let from = null, to = null;
+  try {
+    const r = state.chart.timeScale().getVisibleRange();
+    if (r && r.from != null && r.to != null) { from = r.from; to = r.to; }
+  } catch (_) {}
+
+  let pool = state.signals;
+  if (from != null) {
+    const isDaily = state.tf === '1d';
+    const buf = Math.max((to - from) * 0.05, 86400);   // 5% time buffer or 1 day
+    const lo = from - buf, hi = to + buf;
+    pool = pool.filter(s => {
+      const iso = isDaily ? s.day_open_time : s.signal_time;
+      const t = Math.floor(new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).getTime() / 1000);
+      return t >= lo && t <= hi;
+    });
+  }
+  const ms = pool.map(signalToMarker).sort((a, b) => a.time - b.time);
   state.candle.setMarkers(ms);
 }
 
@@ -659,13 +692,9 @@ function toggleOi() {
     btn.style.borderColor = "";
     btn.style.fontWeight = "";
   }
-  if (state.showOi) {
-    loadOI(state.tf);
-    setTimeout(() => {
-      state.oiChart.applyOptions({ autoSize: true });
-      state.chart.applyOptions({ autoSize: true });
-    }, 30);
-  }
+  if (state.showOi) loadOI(state.tf);
+  // autoSize is set on each chart at creation, so the ResizeObserver picks
+  // up the new flex layout automatically — no manual applyOptions needed.
 }
 
 async function loadMeta() {
@@ -704,16 +733,25 @@ function init() {
       document.body.style.cursor = "row-resize";
       e.preventDefault();
     });
+    // rAF-throttle the drag — without this we were running flex-basis
+    // updates on every mousemove (60+ Hz) which made the drag feel laggy
+    // because each style mutation forced a synchronous layout on both
+    // charts. With autoSize: true the chart's own ResizeObserver picks up
+    // the new container height, so no per-tick applyOptions is needed.
+    let lastY = 0, pending = false;
     window.addEventListener("mousemove", (e) => {
       if (!dragging) return;
-      const rect = wrap.getBoundingClientRect();
-      const fromBottom = rect.bottom - e.clientY;
-      let pct = (fromBottom / rect.height) * 100;
-      pct = Math.max(MIN_PCT, Math.min(MAX_PCT, pct));
-      pane.style.flexBasis = pct.toFixed(2) + "%";
-      // Both charts need to re-measure when the pane resizes
-      if (state.chart)   state.chart.applyOptions({ autoSize: true });
-      if (state.oiChart) state.oiChart.applyOptions({ autoSize: true });
+      lastY = e.clientY;
+      if (pending) return;
+      pending = true;
+      requestAnimationFrame(() => {
+        pending = false;
+        const rect = wrap.getBoundingClientRect();
+        const fromBottom = rect.bottom - lastY;
+        let pct = (fromBottom / rect.height) * 100;
+        pct = Math.max(MIN_PCT, Math.min(MAX_PCT, pct));
+        pane.style.flexBasis = pct.toFixed(2) + "%";
+      });
     });
     window.addEventListener("mouseup", () => {
       if (!dragging) return;
@@ -724,10 +762,8 @@ function init() {
   })();
   loadTF("1d");
   loadMeta();
-  window.addEventListener("resize", () => {
-    state.chart.applyOptions({ autoSize: true });
-    if (state.oiChart) state.oiChart.applyOptions({ autoSize: true });
-  });
+  // autoSize: true at chart creation already wires a ResizeObserver, so we
+  // don't need a window resize handler at all.
 }
 
 document.addEventListener("DOMContentLoaded", init);
