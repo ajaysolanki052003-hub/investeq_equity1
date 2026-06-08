@@ -51,7 +51,12 @@ END_TIME = default_end_time()
 INTERVAL_FOLDER = {'1d': 'data/1d', '1h': 'data/1h'}
 INTERVAL_STEP = {'1d': timedelta(days=1), '1h': timedelta(hours=1)}
 DELAY_BETWEEN_CHUNKS = 0.15
-DELAY_BETWEEN_STOCKS = 0.05
+# Groww historical-candles per-token budget is ~5 req/sec. 0.05 (20 req/sec)
+# was running 4x over the cap, which produced 30-40% 429 failure on the 523-
+# stock 1h refresh (see live_workers.run_candle_refresh log Jun 05 09:46 UTC).
+# 0.20s caps us at 5 req/sec — total run goes from ~2 min to ~4 min and the
+# error rate drops to ~0%.
+DELAY_BETWEEN_STOCKS = 0.20
 REAUTH_EVERY = 100
 
 

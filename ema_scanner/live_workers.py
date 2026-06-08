@@ -275,6 +275,7 @@ def run_candle_refresh(interval: str) -> None:
 
     token = get_access_token(jwt, secret)
     ok = up = err = added = 0
+    errored: list[tuple[str, Path]] = []   # collected for the second pass
     t0 = time.time()
     for i, path in enumerate(files, start=1):
         if i > 1 and (i - 1) % REAUTH_EVERY == 0:
@@ -288,13 +289,41 @@ def run_candle_refresh(interval: str) -> None:
             print(f"  [{i:4d}] {symbol}: ERROR {e}", flush=True)
         if   status == "ok":           ok += 1; added += n
         elif status == "up_to_date":   up += 1
-        else:                          err += 1
+        else:                          err += 1; errored.append((symbol, path))
         if i % 50 == 0 or i == len(files):
             el = time.time() - t0
             print(f"  [{i:4d}/{len(files)}] ok={ok} up_to_date={up} err={err}  added={added}  ({el:.0f}s)", flush=True)
         if DELAY_BETWEEN_STOCKS > 0:
             time.sleep(DELAY_BETWEEN_STOCKS)
-    print(f"[candles {interval}] done in {(time.time()-t0)/60:.1f} min — ok={ok} up_to_date={up} err={err}  rows_added={added}", flush=True)
+
+    # ── Second pass: retry every symbol that errored on the first sweep ──
+    # Most errors are 429 (rate-limit). By the time we get here the token
+    # bucket has had time to refill; we also use a longer per-stock delay
+    # (0.5s = 2 req/sec) so we don't re-blow the budget.
+    if errored:
+        print(f"[candles {interval}] second pass — retrying {len(errored)} errored "
+              f"symbols at 0.5s pacing", flush=True)
+        # Mint a fresh token so we're not racing the same throttled session.
+        try:    token = get_access_token(jwt, secret)
+        except Exception as e:  print(f"  [retry] re-auth FAILED: {e}", flush=True)
+        recovered = 0
+        for j, (symbol, path) in enumerate(errored, start=1):
+            try:
+                status, n = update_one(str(path), symbol, interval, token, end_dt)
+            except Exception as e:
+                status, n = "error", 0
+            if status == "ok":
+                recovered += 1; added += n; ok += 1; err -= 1
+            elif status == "up_to_date":
+                up += 1; err -= 1   # was an error on pass 1, now fine
+            if j % 25 == 0 or j == len(errored):
+                el = time.time() - t0
+                print(f"    [retry {j:4d}/{len(errored)}] recovered={recovered} "
+                      f"still_err={err}  ({el:.0f}s)", flush=True)
+            time.sleep(0.5)
+
+    print(f"[candles {interval}] done in {(time.time()-t0)/60:.1f} min "
+          f"— ok={ok} up_to_date={up} err={err}  rows_added={added}", flush=True)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
