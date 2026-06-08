@@ -1,0 +1,20 @@
+[Unit]
+Description=Investeq NIFTY 1m master refresh — every hour during NSE session + once after close (IST)
+
+[Timer]
+# Pull the latest 1-min NIFTY bars into the master parquet. Once per hour while
+# the market is open (09:16, 10:16, ..., 14:16) and one final pull at 15:31 to
+# capture the closing bar. Outside of market hours nothing changes anyway.
+OnCalendar=Mon..Fri 09:16 Asia/Kolkata
+OnCalendar=Mon..Fri 10:16 Asia/Kolkata
+OnCalendar=Mon..Fri 11:16 Asia/Kolkata
+OnCalendar=Mon..Fri 12:16 Asia/Kolkata
+OnCalendar=Mon..Fri 13:16 Asia/Kolkata
+OnCalendar=Mon..Fri 14:16 Asia/Kolkata
+OnCalendar=Mon..Fri 15:16 Asia/Kolkata
+OnCalendar=Mon..Fri 15:31 Asia/Kolkata
+Persistent=false
+Unit=investeq-candles-nifty.service
+
+[Install]
+WantedBy=timers.target

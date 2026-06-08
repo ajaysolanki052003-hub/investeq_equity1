@@ -185,12 +185,46 @@ def strikes(date: str = Query(...), expiry: str = Query(...)):
 
 
 _SPOT_HISTORY_CACHE = ROOT / "_spot_history_1d.parquet"
+# Continuous 1-min NIFTY master parquet, maintained by fetch_nifty_master.py.
+# When present, INDEX-view chart and all resampled TFs come from this file
+# (gap-free, single source of truth). The per-day SPOT_DIR/*.parquet files
+# remain the source for everything else (chain replay session scrubbing).
+_NIFTY_MASTER = ROOT / "nifty_1m_master.parquet"
+
+
+def _master_to_tf(tf: str) -> pd.DataFrame:
+    """Read the continuous master 1-min parquet and resample to `tf`."""
+    df = pd.read_parquet(_NIFTY_MASTER)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    if "volume" not in df.columns:
+        df["volume"] = 0
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    if tf == "1m":
+        return df[["timestamp", "open", "high", "low", "close", "volume"]]
+    if tf == "1d":
+        d = df.copy()
+        d["day"] = d["timestamp"].dt.normalize() + pd.Timedelta(hours=9, minutes=15)
+        out = (d.groupby("day", as_index=False)
+                 .agg(open=("open", "first"), high=("high", "max"),
+                      low=("low", "min"),     close=("close", "last")))
+        out = out.rename(columns={"day": "timestamp"})
+        return out.sort_values("timestamp").reset_index(drop=True)
+    return resample_ohlc(df[["timestamp", "open", "high", "low", "close", "volume"]], tf)
+
 
 @lru_cache(maxsize=2)
 def _full_spot_history(tf: str) -> pd.DataFrame:
-    """Aggregate every spot/YYYYMMDD.parquet into a single OHLC series at the
-    requested TF. 1d is cached on disk (~40 KB parquet) so the chain-replay
-    service starts cold without paying the 6-second per-day-file read."""
+    """Continuous spot OHLC series at the requested TF.
+    Preference order:
+        1) DATA/nifty_1m_master.parquet — single continuous 1-min file
+           (built by fetch_nifty_master.py; updated by the candles-nifty timer)
+        2) On-disk 1d aggregate cache (DATA/_spot_history_1d.parquet)
+        3) Per-day SPOT_DIR/*.parquet aggregation (legacy fallback)"""
+    if _NIFTY_MASTER.exists():
+        try:
+            return _master_to_tf(tf)
+        except Exception:
+            pass   # corrupted master → fall through to legacy path
     if tf == "1d" and _SPOT_HISTORY_CACHE.exists():
         try:
             return pd.read_parquet(_SPOT_HISTORY_CACHE)

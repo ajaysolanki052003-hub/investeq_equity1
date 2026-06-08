@@ -1,0 +1,13 @@
+[Unit]
+Description=Investeq NIFTY 1m master backfill/refresh (one-shot, triggered by .timer)
+
+[Service]
+Type=oneshot
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+Environment=INVESTEQ_DATA=/home/ajay/investeq_ajs/DATA
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python fetch_nifty_master.py --quiet
+StandardOutput=journal
+StandardError=journal
