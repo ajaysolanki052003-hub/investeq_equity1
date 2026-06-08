@@ -345,7 +345,7 @@ function setupChart() {
         return `${mo} ${day} ${hh}:${mm}`;
       },
     },
-  });
+  }));
   state.candle = state.chart.addCandlestickSeries({
     upColor: "#26a69a", downColor: "#ef5350",
     borderUpColor: "#26a69a", borderDownColor: "#ef5350",
