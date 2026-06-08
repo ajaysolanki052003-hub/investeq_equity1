@@ -122,7 +122,10 @@ def _oi_resampled(tf: str) -> pd.DataFrame:
         return df
     if tf == "1d":
         d = df.copy()
-        d["day"] = d["timestamp"].dt.normalize() + pd.Timedelta(hours=15, minutes=30)
+        # Pin the daily timestamp to 09:15 IST so the OI 1d series shares
+        # an x-axis bucket with the candle 1d series (which also uses 09:15).
+        # The aggregation still picks each day's LAST tick (EOD value).
+        d["day"] = d["timestamp"].dt.normalize() + pd.Timedelta(hours=9, minutes=15)
         out = (d.groupby("day", as_index=False)
                  .agg(ce_oi=("ce_oi", "last"),
                       pe_oi=("pe_oi", "last"),
@@ -351,12 +354,6 @@ function setupChart() {
     borderUpColor: "#26a69a", borderDownColor: "#ef5350",
     wickUpColor: "#26a69a", wickDownColor: "#ef5350",
   });
-  // Show "last bar" value in the top bar as user scrubs the crosshair
-  state.chart.subscribeCrosshairMove((p) => {
-    if (!p || !p.seriesData) return;
-    const v = p.seriesData.get(state.candle);
-    if (v && v.close != null) $("last-val").textContent = fmtPrice(v.close);
-  });
 
   // OI sub-pane chart — two line series (CE teal / PE red), x-axis hidden
   // (synced with the main chart's axis via subscribeVisibleLogicalRangeChange)
@@ -386,17 +383,67 @@ function setupChart() {
   };
   sync(state.chart,   state.oiChart);
   sync(state.oiChart, state.chart);
-  // Update the OI readout label from the OI chart's crosshair
-  state.oiChart.subscribeCrosshairMove((p) => {
-    if (!p || !p.seriesData) return;
-    const ce = p.seriesData.get(state.ceLine);
-    const pe = p.seriesData.get(state.peLine);
-    if (ce) $("ce-val").textContent = (ce.value/1e5).toFixed(2) + " L";
-    if (pe) $("pe-val").textContent = (pe.value/1e5).toFixed(2) + " L";
-    // Also try to populate from the candle chart's data if hovered there
-    const c = p.seriesData.get(state.candle);
-    if (c && c.close != null) $("last-val").textContent = fmtPrice(c.close);
+
+  // ── Crosshair sync ─────────────────────────────────────────────
+  // Hovering EITHER pane draws the dashed crosshair on BOTH at the same
+  // time-cursor. The horizontal line on the "other" chart sits at the
+  // value of that other chart's series at the hovered time, so each pane
+  // shows its own scale-appropriate reading.
+  let xhSyncing = false;
+  state.chart.subscribeCrosshairMove((p) => {
+    // Update top-bar readout
+    if (p && p.seriesData) {
+      const c = p.seriesData.get(state.candle);
+      if (c && c.close != null) $("last-val").textContent = fmtPrice(c.close);
+    }
+    if (xhSyncing || !state.oiChart || !state.ceLine) return;
+    xhSyncing = true;
+    try {
+      if (!p || p.time == null) {
+        state.oiChart.clearCrosshairPosition();
+      } else {
+        const ce = findAtTime(state.ceBars, p.time);
+        if (ce != null) {
+          state.oiChart.setCrosshairPosition(ce.value, p.time, state.ceLine);
+        }
+      }
+    } catch (_) {}
+    xhSyncing = false;
   });
+  state.oiChart.subscribeCrosshairMove((p) => {
+    // OI readouts in the sub-pane label
+    if (p && p.seriesData) {
+      const ce = p.seriesData.get(state.ceLine);
+      const pe = p.seriesData.get(state.peLine);
+      if (ce) $("ce-val").textContent = (ce.value/1e5).toFixed(2) + " L";
+      if (pe) $("pe-val").textContent = (pe.value/1e5).toFixed(2) + " L";
+    }
+    if (xhSyncing || !state.chart || !state.candle) return;
+    xhSyncing = true;
+    try {
+      if (!p || p.time == null) {
+        state.chart.clearCrosshairPosition();
+      } else {
+        const c = findAtTime(state.bars, p.time);
+        if (c != null) {
+          state.chart.setCrosshairPosition(c.close, p.time, state.candle);
+        }
+      }
+    } catch (_) {}
+    xhSyncing = false;
+  });
+}
+
+// Binary search for the bar at-or-before `time` in a sorted-by-time array.
+function findAtTime(bars, time) {
+  if (!bars || !bars.length) return null;
+  let lo = 0, hi = bars.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (bars[mid].time <= time) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return hi >= 0 ? bars[hi] : null;
 }
 
 async function loadTF(tf) {
