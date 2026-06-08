@@ -371,13 +371,16 @@ function setupChart() {
   state.peLine = state.oiChart.addLineSeries({
     color: "#ef5350", lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
   });
-  // Two-way time-axis sync so panning/zooming either chart moves both
+  // Two-way TIME-axis sync. We can't use logical range because the two
+  // series carry different bar counts (1591 daily candles vs 1569 daily OI
+  // points across 2020-2026). subscribeVisibleTimeRangeChange + setVisibleRange
+  // keeps both panes locked to the same wall-clock window regardless.
   let syncing = false;
   const sync = (src, dst) => {
-    src.timeScale().subscribeVisibleLogicalRangeChange((r) => {
-      if (syncing || !r) return;
+    src.timeScale().subscribeVisibleTimeRangeChange((r) => {
+      if (syncing || !r || r.from == null || r.to == null) return;
       syncing = true;
-      try { dst.timeScale().setVisibleLogicalRange(r); } catch (_) {}
+      try { dst.timeScale().setVisibleRange({ from: r.from, to: r.to }); } catch (_) {}
       syncing = false;
     });
   };
@@ -424,6 +427,7 @@ async function loadOI(tf) {
     state.peBars = state.oiByTf[tf].pe;
     state.ceLine.setData(state.ceBars);
     state.peLine.setData(state.peBars);
+    syncOiToIndex();
     return;
   }
   try {
@@ -442,9 +446,23 @@ async function loadOI(tf) {
       const last = state.peBars[state.peBars.length - 1];
       $("pe-val").textContent = (last.value/1e5).toFixed(2) + " L";
     }
+    syncOiToIndex();
   } catch (e) {
     state.ceBars = []; state.peBars = [];
   }
+}
+
+// Force the OI pane to match the index chart's current visible time range.
+// Called after setData (when the OI chart auto-fits to its own data, which
+// is wider than the index range and breaks the visual lockstep).
+function syncOiToIndex() {
+  if (!state.chart || !state.oiChart) return;
+  try {
+    const r = state.chart.timeScale().getVisibleRange();
+    if (r && r.from != null && r.to != null) {
+      state.oiChart.timeScale().setVisibleRange({ from: r.from, to: r.to });
+    }
+  } catch (_) {}
 }
 
 function toggleOi() {
