@@ -1,10 +1,17 @@
 [Unit]
-Description=Investeq daily NIFTY options OI fetch — Mon–Fri at 17:00 IST (post-close)
+Description=Investeq daily NIFTY options OI fetch — Tue–Sat at 09:00 IST (settles yesterday)
 
 [Timer]
-# NSE bhavcopy is published shortly after the closing session. 17:00 IST is
-# safely after final settlement file release.
-OnCalendar=Mon..Fri 17:00 Asia/Kolkata
+# Groww settles intraday OI overnight in their historical archive. Probing
+# shows OI=None for "today" candles until the next morning; by 09:00 IST
+# the prior session's OI is reliably populated. We fire Tue–Sat so each
+# run lands on (last_trading_day + 1 morning):
+#   Tue 09:00  → captures Monday's session
+#   Wed 09:00  → captures Tuesday's session
+#   ...
+#   Sat 09:00  → captures Friday's session
+# Saturday catches Friday so we don't wait until Tuesday morning for it.
+OnCalendar=Tue..Sat 09:00 Asia/Kolkata
 Persistent=true
 Unit=investeq-oi-daily.service
 

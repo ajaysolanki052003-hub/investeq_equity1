@@ -185,10 +185,14 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date",  type=str, default=None,
                     help="Backfill one day (YYYY-MM-DD)")
+    ap.add_argument("--today", action="store_true",
+                    help="Fetch today's IST date (or last weekday if today is Sat/Sun)")
     ap.add_argument("--start", type=str, default=None)
     ap.add_argument("--end",   type=str, default=None)
     ap.add_argument("--flat-days", action="store_true",
                     help="Backfill all known-flat days (1-tick days in the aggregate)")
+    ap.add_argument("--catchup", action="store_true",
+                    help="Fetch every weekday from the last OI file's date to today")
     ap.add_argument("--pad",   type=int, default=1,
                     help="Padding strikes added on each side of ATM range (default 1)")
     ap.add_argument("--delay", type=float, default=0.4)
@@ -198,7 +202,32 @@ def main() -> int:
                              os.environ["GROWW_TOTP_SECRET"])
     print("[auth] OK", flush=True)
 
-    if args.flat_days:
+    def _today_ist() -> date:
+        import datetime as _dt
+        return (_dt.datetime.utcnow() + timedelta(hours=5, minutes=30)).date()
+
+    if args.today:
+        d = _today_ist()
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        days = [d]
+    elif args.catchup:
+        existing = sorted(OI_DIR.glob("*.parquet"))
+        if not existing:
+            print("[fatal] no existing OI files — use --date or --start/--end first.")
+            return 1
+        last_have = datetime.strptime(existing[-1].stem, "%Y%m%d").date()
+        today = _today_ist()
+        days = []
+        cur = last_have + timedelta(days=1)
+        while cur <= today:
+            if cur.weekday() < 5:
+                days.append(cur)
+            cur += timedelta(days=1)
+        if not days:
+            print(f"[catchup] already current (last OI file = {last_have}).")
+            return 0
+    elif args.flat_days:
         # Discover flat days (≤5 ticks/day in the aggregate). Includes only
         # weekdays with spot data — skips weekends and holidays automatically.
         agg = pd.read_parquet(ROOT / "_atm_oi_intraday.parquet")

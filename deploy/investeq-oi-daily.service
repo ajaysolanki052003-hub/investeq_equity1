@@ -8,8 +8,10 @@ Group=ajay
 WorkingDirectory=/home/ajay/investeq_ajs
 EnvironmentFile=/etc/investeq.env
 Environment=INVESTEQ_DATA=/home/ajay/investeq_ajs/DATA
-# Fetch today's NSE F&O bhavcopy + rebuild the ATM±1 aggregate.
-ExecStart=/home/ajay/investeq_ajs/.venv/bin/python fetch_oi_history.py --today
+# Fetch every missing day's INTRADAY OI from Groww historical-candles
+# (correct symbol format NSE-NIFTY-DDMmmYY-strike-CE/PE) + rebuild the
+# ATM±1 aggregate. --catchup picks up from the last existing OI file.
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python fetch_oi_intraday.py --catchup --pad 2 --delay 0.25
 ExecStartPost=/home/ajay/investeq_ajs/.venv/bin/python build_atm_oi_intraday.py
 StandardOutput=journal
 StandardError=journal
