@@ -28,8 +28,9 @@ ROOT = Path(os.environ.get(
     "INVESTEQ_DATA",
     r"C:\Users\User\Desktop\investeq_ajs\DATA"
     if os.name == "nt" else "/home/ajay/investeq_ajs/DATA"))
-MASTER = ROOT / "nifty_1m_master.parquet"
-APP_BASE = os.environ.get("APP_BASE", "").rstrip("/")
+MASTER     = ROOT / "nifty_1m_master.parquet"
+OI_INTRA   = ROOT / "_atm_oi_intraday.parquet"
+APP_BASE   = os.environ.get("APP_BASE", "").rstrip("/")
 
 
 TF_RULE = {
@@ -102,6 +103,59 @@ def nifty(tf: str = Query("1d")):
                          "first": out[0]["time"], "last": out[-1]["time"]})
 
 
+@lru_cache(maxsize=1)
+def _load_oi_intraday() -> pd.DataFrame:
+    if not OI_INTRA.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(OI_INTRA)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+
+@lru_cache(maxsize=8)
+def _oi_resampled(tf: str) -> pd.DataFrame:
+    """Resample the per-tick ATM±1 OI series to the requested TF using 'last'
+    aggregation. For TFs coarser than the native ~3-min cadence the line is
+    smooth; for 1m the line steps (same value held for 3 consecutive 1m bars)."""
+    df = _load_oi_intraday()
+    if df.empty:
+        return df
+    if tf == "1d":
+        d = df.copy()
+        d["day"] = d["timestamp"].dt.normalize() + pd.Timedelta(hours=15, minutes=30)
+        out = (d.groupby("day", as_index=False)
+                 .agg(ce_oi=("ce_oi", "last"),
+                      pe_oi=("pe_oi", "last"),
+                      atm=("atm", "last"),
+                      spot=("spot", "last")))
+        return out.rename(columns={"day": "timestamp"})
+    rule = TF_RULE.get(tf)
+    if rule is None:
+        raise HTTPException(400, f"unknown tf: {tf}")
+    out = (df.set_index("timestamp")
+             .resample(rule, closed="left", label="left")
+             .agg({"ce_oi": "last", "pe_oi": "last",
+                   "atm":   "last", "spot":  "last"})
+             .dropna(subset=["ce_oi", "pe_oi"])
+             .reset_index())
+    return out
+
+
+@app.get("/api/nifty_oi")
+def nifty_oi(tf: str = Query("1d")):
+    """ATM±1 combined OI series (CE + PE) at the requested TF.
+    Returns two time-series ready for lightweight-charts line series."""
+    df = _oi_resampled(tf)
+    if df.empty:
+        return JSONResponse({"ce_oi": [], "pe_oi": [], "n": 0, "tf": tf})
+    t = to_unix(df["timestamp"])
+    ce = [{"time": int(t[i]), "value": float(df["ce_oi"].iloc[i])}
+          for i in range(len(df))]
+    pe = [{"time": int(t[i]), "value": float(df["pe_oi"].iloc[i])}
+          for i in range(len(df))]
+    return JSONResponse({"ce_oi": ce, "pe_oi": pe, "n": len(df), "tf": tf})
+
+
 @app.get("/api/range")
 def date_range():
     df = _load_master_1m()
@@ -165,7 +219,21 @@ HTML = """<!doctype html>
     margin-left:auto; color:var(--muted); font-size:11px; display:flex; gap:14px;
   }
   .meta b { color:var(--text); font-weight:600; }
-  #chart { width:100%; height:calc(100vh - 56px); position:relative; }
+  /* Two-pane layout when OI sub-pane is visible */
+  .charts { display:flex; flex-direction:column; width:100%; height:calc(100vh - 56px); }
+  #chart   { flex: 1 1 auto; min-height: 0; width:100%; position:relative; }
+  #oi-pane { flex: 0 0 200px; min-height: 160px; width:100%; position:relative;
+             border-top: 1px solid var(--border); }
+  #oi-pane.hidden, #oi-label.hidden { display: none !important; }
+  #oi-label {
+    position:absolute; left:14px; top:6px; z-index:5;
+    color: var(--muted); font-size:11px; letter-spacing:0.6px;
+    background: rgba(11,13,17,0.85); padding:3px 8px; border-radius:4px;
+    border: 1px solid var(--border-hi); pointer-events:none;
+  }
+  #oi-label b { color: var(--text); font-weight:600; }
+  #oi-label .ce { color: #26a69a; }
+  #oi-label .pe { color: #ef5350; }
 </style>
 </head>
 <body>
@@ -188,6 +256,7 @@ HTML = """<!doctype html>
   </span>
 
   <button class="btn" id="fit-all">FIT ALL</button>
+  <button class="btn" id="oi-toggle" title="Show/hide the ATM±1 combined OI sub-pane">ATM·OI</button>
 
   <div class="spot">
     <span class="l">LAST</span>
@@ -201,7 +270,16 @@ HTML = """<!doctype html>
   </div>
 </div>
 
-<div id="chart"></div>
+<div class="charts">
+  <div id="chart"></div>
+  <div id="oi-pane" class="hidden">
+    <div id="oi-label" class="hidden">
+      ATM±1 OI &nbsp;·&nbsp; <span class="ce">CE <b id="ce-val">—</b></span>
+      &nbsp;·&nbsp; <span class="pe">PE <b id="pe-val">—</b></span>
+      &nbsp;·&nbsp; ATM <b id="atm-val">—</b>
+    </div>
+  </div>
+</div>
 
 <script>
 const APP_BASE = "__APP_BASE__";
@@ -212,6 +290,13 @@ const state = {
   chart: null,
   candle: null,
   bars: [],
+  // OI sub-pane
+  oiChart: null,
+  ceLine: null, peLine: null,
+  ceBars: [], peBars: [],
+  showOi: false,
+  // Per-tf cache so toggling/switching is instant after first load
+  oiByTf: {},
 };
 
 const $ = (id) => document.getElementById(id);
@@ -228,7 +313,7 @@ function fmtDateUnix(t) {
 }
 
 function setupChart() {
-  state.chart = LightweightCharts.createChart($("chart"), {
+  const baseOpts = {
     layout: { background: { color: "#0b0d11" }, textColor: "#e7eaf1" },
     grid: {
       vertLines: { color: "#1a1f2b", visible: true },
@@ -236,6 +321,8 @@ function setupChart() {
     },
     crosshair: { mode: 0 },
     rightPriceScale: { borderColor: "#2b3142" },
+  };
+  state.chart = LightweightCharts.createChart($("chart"), Object.assign({}, baseOpts, {
     timeScale: {
       borderColor: "#2b3142",
       timeVisible: true,
@@ -270,6 +357,43 @@ function setupChart() {
     const v = p.seriesData.get(state.candle);
     if (v && v.close != null) $("last-val").textContent = fmtPrice(v.close);
   });
+
+  // OI sub-pane chart — two line series (CE teal / PE red), x-axis hidden
+  // (synced with the main chart's axis via subscribeVisibleLogicalRangeChange)
+  state.oiChart = LightweightCharts.createChart($("oi-pane"), Object.assign({}, baseOpts, {
+    timeScale: { borderColor: "#2b3142", timeVisible: false, secondsVisible: false,
+                 visible: false },
+    rightPriceScale: { borderColor: "#2b3142" },
+  }));
+  state.ceLine = state.oiChart.addLineSeries({
+    color: "#26a69a", lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+  });
+  state.peLine = state.oiChart.addLineSeries({
+    color: "#ef5350", lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+  });
+  // Two-way time-axis sync so panning/zooming either chart moves both
+  let syncing = false;
+  const sync = (src, dst) => {
+    src.timeScale().subscribeVisibleLogicalRangeChange((r) => {
+      if (syncing || !r) return;
+      syncing = true;
+      try { dst.timeScale().setVisibleLogicalRange(r); } catch (_) {}
+      syncing = false;
+    });
+  };
+  sync(state.chart,   state.oiChart);
+  sync(state.oiChart, state.chart);
+  // Update the OI readout label from the OI chart's crosshair
+  state.oiChart.subscribeCrosshairMove((p) => {
+    if (!p || !p.seriesData) return;
+    const ce = p.seriesData.get(state.ceLine);
+    const pe = p.seriesData.get(state.peLine);
+    if (ce) $("ce-val").textContent = (ce.value/1e5).toFixed(2) + " L";
+    if (pe) $("pe-val").textContent = (pe.value/1e5).toFixed(2) + " L";
+    // Also try to populate from the candle chart's data if hovered there
+    const c = p.seriesData.get(state.candle);
+    if (c && c.close != null) $("last-val").textContent = fmtPrice(c.close);
+  });
 }
 
 async function loadTF(tf) {
@@ -290,6 +414,64 @@ async function loadTF(tf) {
     $("range").textContent = `${first} → ${last}`;
   }
   state.chart.timeScale().fitContent();
+  // Re-load OI at this TF if the sub-pane is open
+  if (state.showOi) await loadOI(tf);
+}
+
+async function loadOI(tf) {
+  if (state.oiByTf[tf]) {
+    state.ceBars = state.oiByTf[tf].ce;
+    state.peBars = state.oiByTf[tf].pe;
+    state.ceLine.setData(state.ceBars);
+    state.peLine.setData(state.peBars);
+    return;
+  }
+  try {
+    const r = await fetch(apiUrl(`/api/nifty_oi?tf=${tf}`));
+    const j = await r.json();
+    state.ceBars = j.ce_oi || [];
+    state.peBars = j.pe_oi || [];
+    state.oiByTf[tf] = { ce: state.ceBars, pe: state.peBars };
+    state.ceLine.setData(state.ceBars);
+    state.peLine.setData(state.peBars);
+    if (state.ceBars.length) {
+      const last = state.ceBars[state.ceBars.length - 1];
+      $("ce-val").textContent = (last.value/1e5).toFixed(2) + " L";
+    }
+    if (state.peBars.length) {
+      const last = state.peBars[state.peBars.length - 1];
+      $("pe-val").textContent = (last.value/1e5).toFixed(2) + " L";
+    }
+  } catch (e) {
+    state.ceBars = []; state.peBars = [];
+  }
+}
+
+function toggleOi() {
+  state.showOi = !state.showOi;
+  $("oi-pane").classList.toggle("hidden",  !state.showOi);
+  $("oi-label").classList.toggle("hidden", !state.showOi);
+  $("oi-toggle").classList.toggle("on", state.showOi);
+  // Style the toggle for an active state similar to TF buttons
+  const btn = $("oi-toggle");
+  if (state.showOi) {
+    btn.style.background = "linear-gradient(135deg, #26a69a 0%, #1d8a80 100%)";
+    btn.style.color = "#0a0c10";
+    btn.style.borderColor = "transparent";
+    btn.style.fontWeight = "700";
+  } else {
+    btn.style.background = "";
+    btn.style.color = "";
+    btn.style.borderColor = "";
+    btn.style.fontWeight = "";
+  }
+  if (state.showOi) {
+    loadOI(state.tf);
+    setTimeout(() => {
+      state.oiChart.applyOptions({ autoSize: true });
+      state.chart.applyOptions({ autoSize: true });
+    }, 30);
+  }
 }
 
 async function loadMeta() {
@@ -305,11 +487,16 @@ function init() {
   $("tf-grp").querySelectorAll("button").forEach(b => {
     b.addEventListener("click", () => loadTF(b.dataset.tf));
   });
-  $("fit-all").addEventListener("click", () => state.chart.timeScale().fitContent());
+  $("fit-all").addEventListener("click", () => {
+    state.chart.timeScale().fitContent();
+    if (state.oiChart) state.oiChart.timeScale().fitContent();
+  });
+  $("oi-toggle").addEventListener("click", toggleOi);
   loadTF("1d");
   loadMeta();
   window.addEventListener("resize", () => {
     state.chart.applyOptions({ autoSize: true });
+    if (state.oiChart) state.oiChart.applyOptions({ autoSize: true });
   });
 }
 

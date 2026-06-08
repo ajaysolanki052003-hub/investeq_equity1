@@ -1,0 +1,12 @@
+[Unit]
+Description=Investeq daily NIFTY options OI fetch — Mon–Fri at 17:00 IST (post-close)
+
+[Timer]
+# NSE bhavcopy is published shortly after the closing session. 17:00 IST is
+# safely after final settlement file release.
+OnCalendar=Mon..Fri 17:00 Asia/Kolkata
+Persistent=true
+Unit=investeq-oi-daily.service
+
+[Install]
+WantedBy=timers.target
