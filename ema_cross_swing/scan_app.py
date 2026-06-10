@@ -1483,11 +1483,13 @@ c1, c2, c3 = st.columns([3, 1, 1])
 symbol = c1.selectbox("Symbol", view_syms, key="sel_symbol")
 chart_tf = c2.selectbox("Timeframe", TIMEFRAMES, key="sel_tf")
 # Live mode: when off the page renders once at scan-time values (fast).
-# When on, autorefresh + LTP overlay + table live-refresh all run.
+# When on, the chart for the currently-selected symbol re-fetches every
+# 1 minute. Tables stay at scan-time values (no per-symbol LTP polling).
 live_mode = c3.checkbox(
     "🔴 Live", value=False, key="live_mode",
-    help="When on, chart and table tick every 5s using the LTP feed. "
-         "Leave off for a fast static view of the latest scan.",
+    help="When on, the chart auto-refreshes every 1 minute and the LTP "
+         "worker fetches fresh 1m bars only for the symbol shown above. "
+         "Tables stay static — leave off for a pure historical view.",
 )
 
 if st.session_state.get("jumped_to") == symbol:
@@ -1813,16 +1815,19 @@ if vol_data:
 
 _chart_v = st.session_state.get("_chart_v", 0)
 
-# Live LTP overlay: during market hours, rewrite the last bar from the latest
-# tick and rerun the page every 2s so the candle "ticks". Watchlist file lets
-# the LTP worker know which symbol(s) the UI cares about.
+# Live mode: during market hours, focus the LTP worker exclusively on the
+# chart symbol and refresh the page once a minute so a freshly-fetched 1m
+# bar is picked up as soon as the worker writes it. _overlay_live_ltp also
+# rebuilds the forming bar from the in-flight 1m slice + latest LTP so the
+# rightmost candle reflects right-now even between worker fetches.
 if live_mode and _market_open_ist():
     _register_watch([symbol])
     candles = _overlay_live_ltp(candles, symbol, chart_tf)
     if st_autorefresh is not None:
-        # 5s tick is plenty for a forming candle and keeps the Streamlit
-        # process from pegging CPU (which slows down every new page load).
-        st_autorefresh(interval=5000, key=f"ltp_tick_{symbol}_{chart_tf}")
+        # 60s = the natural 1m bar cadence. The worker fetches a new 1m
+        # bar for `symbol` every ONE_MIN_INTERVAL_SEC (=60s) and the UI
+        # picks it up on its next rerun.
+        st_autorefresh(interval=60_000, key=f"chart_tick_{symbol}_{chart_tf}")
 
 renderLightweightCharts(
     [{"chart": chart_options, "series": series}],
@@ -2012,11 +2017,12 @@ def _live_refresh_metrics(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or not st.session_state.get("live_mode") or not _market_open_ist():
         return df
 
-    # Cap watchlist write to the first 100 symbols — anything beyond that
-    # bloats the LTP cycle (concurrent=8 → already 13s for 100 symbols).
-    syms_all = df["Symbol"].astype(str).tolist()
-    _register_watch(syms_all[:100])
-
+    # NOTE: we deliberately do NOT register table symbols with the LTP worker
+    # any more — the chart symbol alone is registered (see the chart-render
+    # block above). Tables show whatever the LTP feed happens to have from a
+    # prior watchlist; missing rows keep their scan-time values. This keeps
+    # the worker's per-minute 1m fetch budget focused on the one symbol the
+    # user is actually charting.
     ltp_df = _read_ltp_df()
     if ltp_df.empty:
         return df
@@ -2239,8 +2245,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Flush the accumulated watchlist (chart symbol + the top N symbols in the
-# active table view) so the LTP worker knows what to poll. The chart's own
-# st_autorefresh at 2s drives the rerun cadence — no extra timer needed for
+# Flush the accumulated watchlist (just the chart symbol now — tables no
+# longer contribute) so the LTP worker knows what single symbol to poll
+# LTPs for and fetch fresh 1m bars for every 60s. The chart's own
+# st_autorefresh at 60s drives the rerun cadence — no extra timer needed.
 # the table.
 _flush_watchlist()

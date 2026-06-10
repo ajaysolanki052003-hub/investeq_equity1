@@ -80,3 +80,8 @@ nifty_options_ml.ipynb
 *.orig
 *~
 
+# ──────────── Generated analysis outputs ──────────────────
+oi_options_trading/notebooks/oi_strategy_grid_results.csv
+trail_variants_results.csv
+.tmp/
+
