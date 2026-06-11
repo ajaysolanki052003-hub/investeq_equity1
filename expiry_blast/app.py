@@ -258,16 +258,12 @@ tr.detail td { text-align:left; background:#0d1118; color:var(--muted);
 
 <div class="layout">
   <div class="side">
-    <div class="panel" style="flex:1.2; display:flex; flex-direction:column; overflow:hidden;">
-      <h2>Trades <span id="ntrades"></span></h2>
+    <div class="panel" style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+      <h2>Result trades <span id="ntrades"></span></h2>
       <div id="tradelist" style="overflow-y:auto; flex:1;"></div>
     </div>
-    <div class="panel" style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
-      <h2>Expiry days <span id="ndays"></span></h2>
-      <div id="daylist"></div>
-    </div>
     <div class="panel">
-      <h2>Config</h2>
+      <h2 id="cfg-title">Config</h2>
       <div id="cfg"></div>
     </div>
   </div>
@@ -458,15 +454,17 @@ let dayPick = null;
 async function loadPreset() {
   const preset = curPreset();
   const cfg = await api("/api/config?preset=" + preset);
+  document.getElementById("cfg-title").textContent =
+    "Config — " + preset.toUpperCase();
   document.getElementById("cfg").innerHTML = [
     ["instrument", cfg.instrument],
     ["window", cfg.window_start + " – " + cfg.window_end + " IST"],
-    ["proximity", cfg.spot_proximity_pct + " %"],
-    ["CE unwind ≥", cfg.call_oi_unwind_pct + " %"],
-    ["PE buildup ≥", cfg.put_oi_buildup_pct + " % ("
+    ["A · proximity", cfg.spot_proximity_pct + " %"],
+    ["B · CE unwind ≥", cfg.call_oi_unwind_pct + " %"],
+    ["C · PE buildup ≥", cfg.put_oi_buildup_pct + " % ("
        + cfg.put_strikes_required + " of 2)"],
-    ["OI lookback", cfg.oi_lookback_min + " min"],
-    ["candle TF", cfg.candle_tf_min + " min"],
+    ["B/C · OI lookback", cfg.oi_lookback_min + " min"],
+    ["D · candle TF", cfg.candle_tf_min + " min"],
     ["max entries/day", cfg.max_signals_per_day],
   ].map(([k, v]) => `${k} <b style="float:right">${v}</b>`).join("<br>");
 
@@ -474,22 +472,14 @@ async function loadPreset() {
     api("/api/days?preset=" + preset),
     api("/api/signals?preset=" + preset)]);
 
-  // Day list + selector
-  document.getElementById("ndays").textContent = "(" + days.length + ")";
-  const list = document.getElementById("daylist");
+  // Header day selector (any expiry day can still be replayed from here)
   const sel = document.getElementById("day-sel");
-  list.innerHTML = ""; sel.innerHTML = "";
+  sel.innerHTML = "";
   for (const d of [...days].reverse()) {
-    const row = document.createElement("div");
-    row.className = "d"; row.dataset.day = d.day;
-    row.innerHTML = `<span>${d.day}</span>` +
-      (d.signal ? `<span class="dot">●</span>` : "");
-    row.onclick = () => dayPick(d.day);
-    list.appendChild(row);
     sel.add(new Option(d.day + (d.signal ? " ●" : ""), d.day));
   }
 
-  // Trade list — newest first, click = open that day + premium chart
+  // Result-trades list — newest first; click = day replay + premium chart
   const tl = document.getElementById("tradelist");
   document.getElementById("ntrades").textContent = "(" + signals.length + ")";
   tl.innerHTML = "";
@@ -499,14 +489,19 @@ async function loadPreset() {
     const ret = (e && eod != null) ? ((eod / e - 1) * 100) : null;
     const col = ret == null ? "var(--muted)"
               : ret >= 0 ? "var(--green)" : "var(--red)";
+    const br = s.bracket || "·";
+    const brCol = br === "TP" ? "var(--green)"
+                : br === "SL" ? "var(--red)" : "var(--muted)";
     const row = document.createElement("div");
     row.className = "d";
     row.innerHTML =
       `<span>${day} <span style="color:var(--muted)">${s.timestamp.slice(11,16)}</span>`
       + ` ${s.entry_strike}CE @ ${e ? e.toFixed(1) : "?"}</span>`
-      + `<span style="color:${col}">${ret == null ? "·" : (ret>=0?"+":"") + ret.toFixed(0) + "%"}</span>`;
+      + `<span><b style="color:${brCol}">${br}</b> `
+      + `<span style="color:${col}">${ret == null ? "·" : (ret>=0?"+":"") + ret.toFixed(0) + "%"}</span></span>`;
     row.title = `wall ${s.max_call_oi_strike} · CE ${s.call_oi_pct_change}% · `
-      + `peak ${peak ? peak.toFixed(1) : "?"} · EOD ${eod != null ? eod.toFixed(2) : "?"}`;
+      + `peak ${peak ? peak.toFixed(1) : "?"} · EOD ${eod != null ? eod.toFixed(2) : "?"}`
+      + ` · bracket(${br}) = TP+80%/SL-40%`;
     row.onclick = () => { dayPick(day); showTradeChart(s); };
     tl.appendChild(row);
   }
@@ -514,13 +509,17 @@ async function loadPreset() {
   sel.onchange = () => dayPick(sel.value);
   dayPick = (day) => {
     sel.value = day;
-    for (const r of list.children)
-      r.classList.toggle("sel", r.dataset.day === day);
     loadDay(day).catch(err => {
       document.getElementById("stat").textContent = "error: " + err.message; });
   };
-  if (curDay && days.some(d => d.day === curDay)) dayPick(curDay);
-  else if (days.length) dayPick(days[days.length - 1].day);
+  // Land on the most recent trade so the page opens with a result on screen.
+  if (signals.length) {
+    const last = signals[signals.length - 1];
+    dayPick(last.timestamp.slice(0, 10));
+    showTradeChart(last);
+  } else if (days.length) {
+    dayPick(days[days.length - 1].day);
+  }
 }
 
 async function boot() {
