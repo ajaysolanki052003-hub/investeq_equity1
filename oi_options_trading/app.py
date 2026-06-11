@@ -673,13 +673,15 @@ def api_backtest(strategy: str = Query("C", description="A=multi-strike, B=Σ-N 
 def _build_px(px_df: pd.DataFrame) -> dict:
     if px_df.empty:
         return {}
-    px_df = px_df[["timestamp", "close"]].copy()
+    px_df = px_df[["timestamp", "close", "high", "low"]].copy()
     px_df["date_key"] = px_df["timestamp"].dt.date.astype(str)
     out = {}
     for d, g in px_df.groupby("date_key", sort=True):
         g = g.sort_values("timestamp")
         out[d] = (g["timestamp"].values.astype("datetime64[ns]"),
-                  g["close"].values.astype("float64"))
+                  g["close"].values.astype("float64"),
+                  g["high"].values.astype("float64"),
+                  g["low"].values.astype("float64"))
     return out
 
 
@@ -770,13 +772,15 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
         day_arrs = px_by_day.get(str(e["day"]))
         if day_arrs is None:
             continue
-        ts_arr, cl_arr = day_arrs
+        ts_arr, cl_arr, hi_arr, lo_arr = day_arrs
         ent = np.datetime64(e["entry_time"])
         idx = int(np.searchsorted(ts_arr, ent, side="left"))
         if idx >= len(ts_arr):
             continue
         seg_ts = ts_arr[idx:]
         seg_cl = cl_arr[idx:]
+        seg_hi = hi_arr[idx:]
+        seg_lo = lo_arr[idx:]
         spot = float(e["entry_spot"])
         side = e["side"]
         sl_distance    = spot * sl_frac       # initial SL distance in pts
@@ -789,40 +793,46 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
             sl_initial   = spot + sl_distance
             tgt_px       = spot * (1 - tgt_frac)
             trail_trigger= spot - trail_distance
-        # Bar-by-bar walk with MULTI-STEP (staircase) trail: every time the
-        # close pushes deeper into profit, the SL ratchets up to keep an
-        # `sl_distance`-point trail behind the close. SL never moves
-        # against the trade. First trigger lands the SL at breakeven; every
-        # subsequent advance locks in more profit.
+        # Bar-by-bar walk with MULTI-STEP (staircase) trail.
+        #
+        # TOUCH-BASED fills: SL and TGT trigger on the bar's HIGH/LOW — a
+        # resting stop/limit order fills when price touches the level, not
+        # when a close confirms it (close-only walking let wicks sail
+        # through the stop, e.g. 2026-06-10 11:00 SHORT: six 1-min highs
+        # crossed the SL but no close did). When both levels print inside
+        # the same bar the path is unknown — the STOP is assumed to fill
+        # first (conservative). The trail still RATCHETS on closes (a wick
+        # into profit doesn't move the stop), but the trailed level itself
+        # fills on touch like any stop.
         sl_current   = sl_initial
         trail_active = False
         exit_t = exit_p = reason = None
         for i in range(len(seg_cl)):
-            c = seg_cl[i]
+            c, h, l = seg_cl[i], seg_hi[i], seg_lo[i]
             if side == "LONG":
-                if c >= tgt_px:
+                if l <= sl_current:
+                    exit_t = seg_ts[i]
+                    exit_p = float(sl_current)
+                    reason = "TRAIL" if trail_active else "SL"
+                    break
+                if h >= tgt_px:
                     exit_t, exit_p, reason = seg_ts[i], float(tgt_px), "TGT"; break
                 if trail and c >= trail_trigger:
                     if not trail_active: trail_active = True
                     candidate = c - trail_distance
                     if candidate > sl_current: sl_current = candidate
-                if c <= sl_current:
+            else:
+                if h >= sl_current:
                     exit_t = seg_ts[i]
                     exit_p = float(sl_current)
                     reason = "TRAIL" if trail_active else "SL"
                     break
-            else:
-                if c <= tgt_px:
+                if l <= tgt_px:
                     exit_t, exit_p, reason = seg_ts[i], float(tgt_px), "TGT"; break
                 if trail and c <= trail_trigger:
                     if not trail_active: trail_active = True
                     candidate = c + trail_distance
                     if candidate < sl_current: sl_current = candidate
-                if c >= sl_current:
-                    exit_t = seg_ts[i]
-                    exit_p = float(sl_current)
-                    reason = "TRAIL" if trail_active else "SL"
-                    break
         if exit_t is None:
             exit_t = seg_ts[-1]; exit_p = float(seg_cl[-1]); reason = "EOD"
         pnl_pts = (exit_p - spot) if side == "LONG" else (spot - exit_p)
