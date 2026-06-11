@@ -115,6 +115,7 @@ def _resample_frame(df: pd.DataFrame, tf: str) -> pd.DataFrame:
 
 
 _RESAMPLED_HIST_CACHE: dict = {}
+_DERIVED_LOCK = __import__("threading").Lock()
 
 
 def _resampled(tf: str) -> pd.DataFrame:
@@ -125,9 +126,11 @@ def _resampled(tf: str) -> pd.DataFrame:
         return df
     key = (tf,) + fp
     if key not in _RESAMPLED_HIST_CACHE:
-        if len(_RESAMPLED_HIST_CACHE) > 24:
-            _RESAMPLED_HIST_CACHE.clear()
-        _RESAMPLED_HIST_CACHE[key] = _resample_frame(hist, tf)
+        with _DERIVED_LOCK:
+            if key not in _RESAMPLED_HIST_CACHE:
+                if len(_RESAMPLED_HIST_CACHE) > 24:
+                    _RESAMPLED_HIST_CACHE.clear()
+                _RESAMPLED_HIST_CACHE[key] = _resample_frame(hist, tf)
     base = _RESAMPLED_HIST_CACHE[key]
     if live.empty:
         return base
@@ -365,12 +368,38 @@ def strategy_signals():
     return JSONResponse({"signals": sigs, "stats": stats, "n": len(sigs)})
 
 
-# Live split: entry computation over the full history takes ~10-40s, far too
-# slow to redo every time the live worker appends a row. Both strategies
-# reset per-day, so entries for past days can never change once the day is
-# over — compute them once per historical-data version and only re-run
-# today's (tiny) slice on every request.
+# Live split: entry computation over the full history takes minutes on the
+# 2-vCPU VM, far too slow to redo every time the live worker appends a row.
+# Both strategies reset per-day, so entries for past days can never change
+# once the day is over — compute them once per historical-data version and
+# only re-run today's (tiny) slice on every request. The historical result
+# is also persisted to disk so a service restart never recomputes it, and
+# a single-flight lock stops concurrent first-requests from stampeding the
+# same minutes-long compute.
 _HIST_ENTRIES_CACHE: dict[tuple, tuple] = {}
+_ENTRIES_LOCK = __import__("threading").Lock()
+_ENTRIES_DISK = ROOT / "_strategy_entries_cache.json"
+
+
+def _disk_entries_load() -> dict:
+    try:
+        return json.loads(_ENTRIES_DISK.read_text())
+    except Exception:
+        return {}
+
+
+def _disk_entries_save(d: dict) -> None:
+    try:
+        # Keep the file bounded: the fingerprint changes once per day, so a
+        # handful of keys is plenty.
+        if len(d) > 12:
+            for k in list(d)[:-12]:
+                d.pop(k, None)
+        tmp = _ENTRIES_DISK.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(d))
+        tmp.replace(_ENTRIES_DISK)
+    except OSError:
+        pass
 
 
 def _entries_live(kind: str, tf: str = "1m", window: int = 10,
@@ -402,13 +431,23 @@ def _entries_live(kind: str, tf: str = "1m", window: int = 10,
     fp = (kind, tf, window, min_gap, len(hist),
           str(hist["timestamp"].iloc[-1]) if len(hist) else "")
     if fp not in _HIST_ENTRIES_CACHE:
-        if len(_HIST_ENTRIES_CACHE) > 32:
-            _HIST_ENTRIES_CACHE.clear()
-        _HIST_ENTRIES_CACHE[fp] = _compute(hist)
+        with _ENTRIES_LOCK:
+            if fp not in _HIST_ENTRIES_CACHE:     # double-checked
+                key = "|".join(map(str, fp))
+                disk = _disk_entries_load()
+                if key in disk:
+                    res = tuple(disk[key])
+                else:
+                    res = _compute(hist)
+                    disk[key] = res
+                    _disk_entries_save(disk)
+                if len(_HIST_ENTRIES_CACHE) > 32:
+                    _HIST_ENTRIES_CACHE.clear()
+                _HIST_ENTRIES_CACHE[fp] = res
     hist_entries, stats = _HIST_ENTRIES_CACHE[fp]
 
     live_entries = _compute(live)[0] if len(live) else []
-    return hist_entries + live_entries, stats
+    return list(hist_entries) + live_entries, stats
 
 
 def _sigma5_entries_cached(tf: str):
@@ -655,8 +694,11 @@ def _px_by_day() -> dict:
     if df.empty:
         return {}
     if fp not in _PX_HIST_CACHE:
-        _PX_HIST_CACHE.clear()
-        _PX_HIST_CACHE[fp] = _build_px(hist)
+        with _DERIVED_LOCK:
+            if fp not in _PX_HIST_CACHE:
+                base = _build_px(hist)
+                _PX_HIST_CACHE.clear()
+                _PX_HIST_CACHE[fp] = base
     out = dict(_PX_HIST_CACHE[fp])
     out.update(_build_px(live))
     return out
