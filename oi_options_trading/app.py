@@ -75,16 +75,29 @@ def _load_master_1m() -> pd.DataFrame:
     return _load_master_1m_v(_mt(MASTER))
 
 
-@lru_cache(maxsize=16)
-def _resampled_v(tf: str, v: int) -> pd.DataFrame:
+@lru_cache(maxsize=2)
+def _master_split_v(v: int):
+    """(full, hist, today, hist_fingerprint) for the current master version.
+    The live worker rewrites the file every minute, but only TODAY's rows
+    ever change — the fingerprint keys caches of anything derived from the
+    historical part so it survives the per-minute mtime churn."""
     df = _load_master_1m_v(v)
     if df.empty:
-        return df
-    if tf == "1m":
-        return df
+        return df, df, df, (0, "")
+    today = _now_ist().date()
+    dts = df["timestamp"].dt.date
+    hist = df[dts < today]
+    live = df[dts >= today]
+    fp = (len(hist), str(hist["timestamp"].iloc[-1]) if len(hist) else "")
+    return df, hist, live, fp
+
+
+def _resample_frame(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     rule = TF_RULE.get(tf)
     if rule is None:
         raise HTTPException(400, f"unknown tf: {tf}")
+    if df.empty:
+        return df
     if tf == "1d":
         d = df.copy()
         d["day"] = d["timestamp"].dt.normalize() + pd.Timedelta(hours=9, minutes=15)
@@ -93,17 +106,32 @@ def _resampled_v(tf: str, v: int) -> pd.DataFrame:
                       low=("low", "min"),     close=("close", "last"),
                       volume=("volume", "sum")))
         return out.rename(columns={"day": "timestamp"}).sort_values("timestamp").reset_index(drop=True)
-    out = (df.set_index("timestamp")
-             .resample(rule, closed="left", label="left")
-             .agg({"open": "first", "high": "max", "low": "min",
-                   "close": "last", "volume": "sum"})
-             .dropna(subset=["open", "close"])
-             .reset_index())
-    return out
+    return (df.set_index("timestamp")
+              .resample(rule, closed="left", label="left")
+              .agg({"open": "first", "high": "max", "low": "min",
+                    "close": "last", "volume": "sum"})
+              .dropna(subset=["open", "close"])
+              .reset_index())
+
+
+_RESAMPLED_HIST_CACHE: dict = {}
 
 
 def _resampled(tf: str) -> pd.DataFrame:
-    return _resampled_v(tf, _mt(MASTER))
+    """Resampled candles: historical days cached per (tf, hist-fingerprint);
+    only today's ~375 rows are resampled per request."""
+    df, hist, live, fp = _master_split_v(_mt(MASTER))
+    if df.empty or tf == "1m":
+        return df
+    key = (tf,) + fp
+    if key not in _RESAMPLED_HIST_CACHE:
+        if len(_RESAMPLED_HIST_CACHE) > 24:
+            _RESAMPLED_HIST_CACHE.clear()
+        _RESAMPLED_HIST_CACHE[key] = _resample_frame(hist, tf)
+    base = _RESAMPLED_HIST_CACHE[key]
+    if live.empty:
+        return base
+    return pd.concat([base, _resample_frame(live, tf)], ignore_index=True)
 
 
 def to_unix(ts: pd.Series) -> np.ndarray:
@@ -121,7 +149,8 @@ def _prewarm():
 
     def warm():
         try:
-            _px_by_day_v(_mt(MASTER))
+            _px_by_day()
+            _resampled("3m")
             _sigma_n_cached("3m", 10)
             _sigma_total_entries_cached(7)
         except Exception:
@@ -131,18 +160,29 @@ def _prewarm():
 
 
 @app.get("/api/nifty")
-def nifty(tf: str = Query("1d")):
+def nifty(tf: str = Query("1d"),
+          since: int | None = Query(None,
+              description="Unix time — return only bars at/after this. The "
+                          "UI's live refresh uses it to pull just today's "
+                          "bars instead of the full multi-year series.")):
     bars = _resampled(tf)
     if bars.empty:
         return JSONResponse({"bars": [], "n": 0, "tf": tf})
     t = to_unix(bars["timestamp"])
-    out = [{
-        "time" : int(t[i]),
-        "open" : float(bars["open"].iloc[i]),
-        "high" : float(bars["high"].iloc[i]),
-        "low"  : float(bars["low"].iloc[i]),
-        "close": float(bars["close"].iloc[i]),
-    } for i in range(len(bars))]
+    if since is not None:
+        i0 = int(np.searchsorted(t, since))
+        bars, t = bars.iloc[i0:], t[i0:]
+        if bars.empty:
+            return JSONResponse({"bars": [], "n": 0, "tf": tf})
+    # Vectorized row build — per-row .iloc over 200k bars costs ~20s of CPU
+    # on the VM; zipping plain python lists is ~50x cheaper.
+    o = bars["open"].astype(float).tolist()
+    h = bars["high"].astype(float).tolist()
+    l = bars["low"].astype(float).tolist()
+    c = bars["close"].astype(float).tolist()
+    tl = t.tolist()
+    out = [{"time": ti, "open": oi, "high": hi, "low": li, "close": ci}
+           for ti, oi, hi, li, ci in zip(tl, o, h, l, c)]
     return JSONResponse({"bars": out, "n": len(out), "tf": tf,
                          "first": out[0]["time"], "last": out[-1]["time"]})
 
@@ -591,12 +631,7 @@ def api_backtest(strategy: str = Query("C", description="A=multi-strike, B=Σ-N 
     })
 
 
-@lru_cache(maxsize=2)
-def _px_by_day_v(v: int) -> dict:
-    """{date_str: (ts_array, close_array)} from the 1-min master — the
-    walk-forward exit's working set. Keyed on master mtime so the live
-    worker's per-minute append busts it."""
-    px_df = _load_master_1m_v(v)
+def _build_px(px_df: pd.DataFrame) -> dict:
     if px_df.empty:
         return {}
     px_df = px_df[["timestamp", "close"]].copy()
@@ -606,6 +641,24 @@ def _px_by_day_v(v: int) -> dict:
         g = g.sort_values("timestamp")
         out[d] = (g["timestamp"].values.astype("datetime64[ns]"),
                   g["close"].values.astype("float64"))
+    return out
+
+
+_PX_HIST_CACHE: dict = {}
+
+
+def _px_by_day() -> dict:
+    """{date_str: (ts_array, close_array)} for the walk-forward exit.
+    Historical days cached by fingerprint (the live worker's per-minute
+    rewrite only changes today); today's arrays rebuilt per request."""
+    df, hist, live, fp = _master_split_v(_mt(MASTER))
+    if df.empty:
+        return {}
+    if fp not in _PX_HIST_CACHE:
+        _PX_HIST_CACHE.clear()
+        _PX_HIST_CACHE[fp] = _build_px(hist)
+    out = dict(_PX_HIST_CACHE[fp])
+    out.update(_build_px(live))
     return out
 
 
@@ -665,7 +718,7 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
         raise HTTPException(400, f"unknown mode: {mode}")
 
     # 2. Walk-forward exit on 1-min NIFTY index
-    px_by_day = _px_by_day_v(_mt(MASTER))
+    px_by_day = _px_by_day()
     if not px_by_day:
         return JSONResponse({"error": "1-min NIFTY master not available"}, status_code=503)
 
@@ -2386,8 +2439,28 @@ function init() {
   const _liveTick = async () => {
     if (!liveOn || !_isMktHours()) return;
     try {
-      await loadTF(state.tf);     // fresh candles first ...
-      await loadTrades();         // ... then markers/stats on top
+      // Incremental candle pull: only bars from the last known bucket on.
+      // The full multi-year series is fetched once per page load / TF
+      // switch (loadTF); shipping it every minute melted the server.
+      const lastT = state.bars.length
+        ? state.bars[state.bars.length - 1].time : 0;
+      const r = await fetch(apiUrl(`/api/nifty?tf=${state.tf}&since=${lastT}`));
+      const j = await r.json();
+      for (const b of (j.bars || [])) {
+        const lb = state.bars[state.bars.length - 1];
+        if (lb && lb.time === b.time) {
+          state.bars[state.bars.length - 1] = b;     // amend forming bucket
+        } else if (!lb || b.time > lb.time) {
+          state.bars.push(b);
+        }
+        try { state.candle.update(b); } catch (_) {}
+      }
+      if (state.bars.length) {
+        $("bar-count").textContent = state.bars.length.toLocaleString();
+        $("range").textContent = fmtDateUnix(state.bars[0].time) + " → "
+          + fmtDateUnix(state.bars[state.bars.length - 1].time);
+      }
+      await loadTrades();         // markers/stats on top
     } catch (_) {}
   };
   _markLiveBtn();
