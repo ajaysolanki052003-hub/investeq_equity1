@@ -93,6 +93,8 @@ All write to journalctl; all `Restart=on-failure RestartSec=3..5`.
 | `investeq-straddle.service` | `uvicorn app_option_replay_tv:app` (with `APP_BASE=/straddle`) | 127.0.0.1:8703 |
 | `investeq-chain.service` | `uvicorn app_chain_replay:app` (with `APP_BASE=/chain`) | 127.0.0.1:8704 |
 | `investeq-scan.service` | `streamlit run ema_cross_swing/scan_app.py --server.baseUrlPath /scan` | 127.0.0.1:8501 |
+| `investeq-strategy.service` | `uvicorn oi_options_trading.app:app` (with `APP_BASE=/strategy`) | 127.0.0.1:8705 |
+| `investeq-blast.service` | `uvicorn expiry_blast.app:app` (with `APP_BASE=/blast`) | 127.0.0.1:8706 |
 | `investeq-live-ltp.service` | `python ema_scanner/live_workers.py ltp` — polls Groww `/v1/live-data/ltp` every `LTP_POLL_SECONDS` during NSE hours; sleeps off-hours; piggybacks a 1-minute candle refresh every minute | — writes `data/live/ltp.parquet` and appends to `data/1m/*_historical.csv` |
 
 ### systemd — timers

@@ -145,6 +145,22 @@ PROJECTS = [
         "metrics": [],
         "accent": "#a78bfa",
     },
+    {
+        "id": "expiry-blast",
+        "name": "Expiry Blast",
+        "instrument": "NIFTY · weekly options",
+        "tag": "RESEARCH",
+        "category": "OPTIONS",
+        "thesis": "Expiry-day short covering: when spot presses the max-Call-OI "
+                  "wall while call writers unwind and put writers step in below, "
+                  "buy the ATM call into the blast.",
+        "stack": [],
+        "port": 8706,
+        "url": "/blast/",
+        "path": "",
+        "metrics": [],
+        "accent": "#fb7185",
+    },
 ]
 
 
