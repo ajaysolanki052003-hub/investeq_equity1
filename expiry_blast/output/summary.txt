@@ -1,5 +1,7 @@
-run at        : 2026-06-11T12:36:43
-config        : {"instrument": "NIFTY", "strike_step": 50, "lot_size": 75, "window_start": "10:30", "window_end": "14:45", "spot_proximity_pct": 0.15, "call_oi_unwind_pct": 10.0, "put_oi_buildup_pct": 20.0, "oi_lookback_min": 15, "candle_tf_min": 5, "max_signals_per_day": 1, "stale_oi_max_min": 7.0}
+run at        : 2026-06-11T16:50:46
+config        : {"instrument": "NIFTY", "strike_step": 50, "lot_size": 75, "window_start": "10:30", "window_end": "14:45", "spot_proximity_pct": 0.15, "call_oi_unwind_pct": 10.0, "put_oi_buildup_pct": 10.0, "put_strikes_required": 1, "oi_lookback_min": 15, "candle_tf_min": 5, "max_signals_per_day": 1, "stale_oi_max_min": 7.0}
 range         : 2020-01-02 .. 2026-04-21
 expiry days   : 299  (skipped 0: missing data)
-entry signals : 0
+entry signals : 14
+premium higher at EOD : 50% of signals (no-exit context)
+median max-premium-after / entry : 1.89x

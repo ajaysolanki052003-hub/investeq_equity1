@@ -34,8 +34,9 @@ OUT_DEFAULT = Path(__file__).parent / "output"
 
 
 def _post_entry_context(feed: HistoricalFeed, sig: dict) -> dict:
-    """Premium of the bought strike at EOD and its post-entry max — context
-    for judging entry quality while exits don't exist yet."""
+    """Premium of the bought strike after entry — EOD close, post-entry max
+    (best case) and post-entry min (worst drawdown) — context for judging
+    entry quality while exits don't exist yet."""
     df = feed._options()
     if df.empty:
         return {}
@@ -45,7 +46,8 @@ def _post_entry_context(feed: HistoricalFeed, sig: dict) -> dict:
     if leg.empty:
         return {}
     return {"premium_eod": float(leg["close"].iloc[-1]),
-            "premium_max_after": float(leg["high"].max())}
+            "premium_max_after": float(leg["high"].max()),
+            "premium_min_after": float(leg["low"].min())}
 
 
 def run(cfg: BlastConfig, start: date | None, end: date | None,
@@ -122,7 +124,10 @@ def main():
     ap.add_argument("--buildup", type=float, default=None,
                     help="PUT_OI_BUILDUP_PCT")
     ap.add_argument("--put-strikes", type=int, default=None,
-                    help="how many of the 2 below-wall strikes must pass C (1 or 2)")
+                    help="how many of the 2 below-wall strikes must pass C "
+                         "(0 disables condition C entirely)")
+    ap.add_argument("--max-signals", type=int, default=None,
+                    help="max entries per day (default 1)")
     ap.add_argument("--lookback", type=int, default=None,
                     help="OI_LOOKBACK_MIN")
     ap.add_argument("--window", default=None,
@@ -148,6 +153,8 @@ def main():
         over["put_oi_buildup_pct"] = args.buildup
     if args.put_strikes is not None:
         over["put_strikes_required"] = args.put_strikes
+    if args.max_signals is not None:
+        over["max_signals_per_day"] = args.max_signals
     if args.lookback is not None:
         over["oi_lookback_min"] = args.lookback
     if args.window:

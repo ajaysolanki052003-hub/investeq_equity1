@@ -88,3 +88,4 @@ trail_variants_results.csv
 
 # Expiry Blast — keep canonical output/, ignore parameter-sweep scratch dirs
 expiry_blast/output_*/
+expiry_blast/sweep/

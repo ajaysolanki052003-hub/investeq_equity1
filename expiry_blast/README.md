@@ -59,20 +59,42 @@ condition check), `summary.txt`.
 * The engine's plumbing is verified: walls are stable intraday, conditions
   fire individually at sane rates (A ~22 % of evals, B ~2.6 %, C ~6 %,
   D ~0.8 % in 2025–26).
-* **Spec defaults produce 0 entries in 6 years.** The binding constraint is
-  condition C's strict form: the 2nd strike below the wall lags the 1st by
-  several minutes, so "both ≥ 20 % in the same 15-min window" never coincides
-  with the breakout (A·B·D aligned 115 times in 2025–26; C was never
-  simultaneously true on both strikes).
-* Genuine short-covering moments do show the pattern on the *nearest* strike
-  (e.g. 2026-04-07 13:35: spot through the 23000 wall, CE −10 %+, first PE
-  below +22→30 %). `put_strikes_required: 1` (CLI `--put-strikes 1`) is the
-  honest relaxation to study.
-* With `--put-strikes 1` (every other threshold at spec): **7 entries in
-  299 expiry days** (2022-01-27, 2023-03-29, 2024-02-22, 2024-03-07,
-  2024-06-27, 2025-03-06, 2026-04-07). Entry-quality context: 71 % had the
-  bought premium higher at EOD; median post-entry max premium = 1.95× entry.
-  Small sample — context, not P&L.
+* **The original spec values produce 0 entries in 6 years.** The binding
+  constraint is condition C's strict form: the 2nd strike below the wall
+  lags the 1st by several minutes, so "both ≥ 20 % in the same 15-min
+  window" never coincides with the breakout (A·B·D aligned 115 times in
+  2025–26; C was never simultaneously true on both strikes).
+
+### Relaxation sweep (8 variants × 299 expiry days)
+
+`analyze_sweep.py` + `bracket_sim.py`. Holding to EOD is a bad metric for
+expiry-day longs (theta), so quality is judged with a bracket exit on the
+premium — TP +80 % / SL −40 %, whichever 1-min bar prints first
+(same-bar → SL, conservative):
+
+| Variant | C rule | B | A | n | /yr | win % | expectancy |
+|---|---|---|---|---:|---:|---:|---:|
+| spec+1of2 | 1of2 @ 20 % | 10 % | 0.15 % | 7 | 1.1 | 29 % | −0.14 R |
+| **b10 (default)** | **1of2 @ 10 %** | 10 % | 0.15 % | **14** | **2.2** | **43 %** | **+0.29 R** |
+| b5 | 1of2 @ 5 % | 10 % | 0.15 % | 22 | 3.4 | 41 % | +0.23 R |
+| u5 | 1of2 @ 10 % | 5 % | 0.15 % | 22 | 3.4 | 41 % | +0.23 R |
+| noC | C disabled | 10 % | 0.15 % | 41 | 6.4 | 37 % | +0.10 R |
+| loose | C off | 5 % | 0.25 % | 60 | 9.4 | 30 % | −0.10 R |
+
+Takeaways:
+
+* **C = 1-of-2 @ +10 % is the sweet spot** — now the shipped default
+  (~2.2 trades/yr, best per-trade edge). `--buildup 5` or `--unwind 5`
+  buys ~3.4/yr at slightly lower edge; dropping C entirely (6.4/yr) keeps a
+  thin positive edge; loosening A/B beyond that destroys it.
+* Widening proximity (0.25 %) adds **zero** trades once C is relaxed — A is
+  not the binding constraint. Keep 0.15 %.
+* The bracket shape matters: symmetric ±50 % is breakeven at best — the
+  edge only shows with asymmetric cut-losers/let-winners-run (median
+  post-entry max is ~1.9× entry across variants). Phase-2 exits should be
+  built that way.
+* All samples are small (n ≤ 60) — treat expectancies as direction, not
+  gospel.
 
 ## Dashboard
 

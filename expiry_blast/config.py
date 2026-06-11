@@ -32,14 +32,17 @@ class BlastConfig:
     window_start: time = time(10, 30)
     window_end: time = time(14, 45)
 
-    # ── Signal thresholds (spec: INPUT PARAMETERS) ───────────────────────
+    # ── Signal thresholds ────────────────────────────────────────────────
+    # Defaults are the relaxation-sweep winner (see README §Validation):
+    # C = 1-of-2 strikes @ +10% gives ~2.2 trades/yr at the best bracket
+    # expectancy (+0.29R at TP+80%/SL-40%). The original spec values
+    # (both strikes @ +20%) never fire in 6 years; pass them explicitly
+    # to reproduce: put_oi_buildup_pct=20, put_strikes_required=2.
     spot_proximity_pct: float = 0.15     # A: spot within % of the call wall
     call_oi_unwind_pct: float = 10.0     # B: min % DROP in wall CE OI
-    put_oi_buildup_pct: float = 20.0     # C: min % RISE in PE OI, 2 strikes below
-    # Spec default: BOTH strikes below the wall must pass C. Backtests show
-    # the 2nd strike's PE buildup lags the 1st by several minutes, so the
-    # strict form never fires — set to 1 to require only the nearest strike.
-    put_strikes_required: int = 2
+    put_oi_buildup_pct: float = 10.0     # C: min % RISE in below-wall PE OI
+    # How many of the 2 strikes below the wall must pass C (0 disables C).
+    put_strikes_required: int = 1
     oi_lookback_min: int = 15            # rolling window for B and C, minutes
 
     # ── Price confirmation ───────────────────────────────────────────────

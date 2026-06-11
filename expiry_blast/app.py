@@ -193,8 +193,8 @@ tr.detail td { text-align:left; background:#0d1118; color:var(--muted);
   <select id="day-sel"></select>
   <span class="sub">C strikes:</span>
   <select id="cstrikes" title="how many of the 2 below-wall PE strikes must pass condition C">
-    <option value="2">2 of 2 (spec)</option>
-    <option value="1">1 of 2 (relaxed)</option>
+    <option value="1">1 of 2 (default)</option>
+    <option value="2">2 of 2 (strict spec)</option>
   </select>
   <span class="sub" id="stat"></span>
 </header>
