@@ -14,6 +14,7 @@ Mounted behind nginx at /strategy/ (set APP_BASE=/strategy via env).
 
 from __future__ import annotations
 
+import json
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -30,6 +31,7 @@ ROOT = Path(os.environ.get(
     if os.name == "nt" else "/home/ajay/investeq_ajs/DATA"))
 MASTER     = ROOT / "nifty_1m_master.parquet"
 OI_INTRA   = ROOT / "_atm_oi_intraday.parquet"
+LTP_JSON   = ROOT / "_nifty_ltp.json"
 APP_BASE   = os.environ.get("APP_BASE", "").rstrip("/")
 
 
@@ -109,6 +111,23 @@ def to_unix(ts: pd.Series) -> np.ndarray:
 
 
 app = FastAPI(title="Strategy Suite — OI Options")
+
+
+@app.on_event("startup")
+def _prewarm():
+    """Warm the heavy caches in the background right after boot, so the
+    first page load doesn't eat the ~minutes-long historical compute."""
+    import threading
+
+    def warm():
+        try:
+            _px_by_day_v(_mt(MASTER))
+            _sigma_n_cached("3m", 10)
+            _sigma_total_entries_cached(7)
+        except Exception:
+            pass
+
+    threading.Thread(target=warm, daemon=True).start()
 
 
 @app.get("/api/nifty")
@@ -792,6 +811,16 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
         "mode": mode, "sl_pct": sl_pct, "tgt_pct": tgt_pct,
         "trades": trades, "stats": stats,
     })
+
+
+@app.get("/api/ltp")
+def live_ltp():
+    """Latest NIFTY tick written by the live worker (~every 4s during the
+    session). Tiny file read — never cached, safe to poll."""
+    try:
+        return JSONResponse(json.loads(LTP_JSON.read_text()))
+    except Exception:
+        return JSONResponse({"ts": None, "ltp": None})
 
 
 @app.get("/api/range")
@@ -2368,6 +2397,41 @@ function init() {
     _markLiveBtn();
     if (liveOn) _liveTick();
   });
+
+  // ── Tick-level forming candle ────────────────────────────────────
+  // The worker writes the NIFTY LTP to /api/ltp every ~4s. Poll it and
+  // amend the current TF bucket in place so the rightmost candle ticks
+  // like a real terminal between the 60s full refreshes.
+  const TF_SEC = {"1m":60, "3m":180, "5m":300, "15m":900,
+                  "30m":1800, "1h":3600, "4h":14400};
+  let formBar = null;
+  const _tickPoll = async () => {
+    if (!liveOn || !_isMktHours()) return;
+    const sec = TF_SEC[state.tf];
+    if (!sec || !state.candle) return;
+    try {
+      const r = await fetch(apiUrl('/api/ltp'));
+      const j = await r.json();
+      if (!j.ltp || !j.ts) return;
+      // Chart timestamps are naive-IST-as-UTC (see to_unix server-side):
+      // parse the worker's naive IST stamp as UTC to land in the same frame.
+      const t = Math.floor(Date.parse(j.ts + "Z") / 1000);
+      const bucket = t - (t % sec);
+      if (!formBar || formBar.time !== bucket) {
+        formBar = {time: bucket, open: j.ltp, high: j.ltp,
+                   low: j.ltp, close: j.ltp};
+      } else {
+        formBar.high  = Math.max(formBar.high, j.ltp);
+        formBar.low   = Math.min(formBar.low,  j.ltp);
+        formBar.close = j.ltp;
+      }
+      // series.update throws if the bucket is older than the last bar
+      // (e.g. right after a full refresh replaced the data) — ignore.
+      try { state.candle.update(formBar); } catch (_) {}
+      $("last-val").textContent = fmtPrice(j.ltp);
+    } catch (_) {}
+  };
+  setInterval(_tickPoll, 4000);
 
   // Rich hover tooltip on entry/exit arrows — shows SL/Target/exit/P&L.
   setupHoverTooltip();

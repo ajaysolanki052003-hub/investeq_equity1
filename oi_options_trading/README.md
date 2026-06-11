@@ -208,11 +208,15 @@ Every 60 s during the session (Mon–Fri 09:15–15:35 IST) the worker:
 
 1. Appends the latest **1-min NIFTY bars** to `DATA/nifty_1m_master.parquet`
    (historical-candles endpoint serves index bars intraday).
-2. Reads **live OI** for the 6 ATM±1 legs (CE/PE × ATM−50/ATM/ATM+50,
-   nearest weekly expiry) via `/v1/live-data/quote` — this endpoint carries
-   `open_interest` intraday, unlike the historical archive which settles
-   OI overnight — and appends one `(timestamp, ce_oi, pe_oi, atm, spot)`
-   row to `DATA/_atm_oi_intraday.parquet`.
+2. Pulls the **full option chain** for the nearest weekly expiry via
+   `/v1/option-chain/exchange/NSE/underlying/NIFTY?expiry_date=…` — one
+   request returns spot LTP + per-strike CE/PE `open_interest` intraday
+   (the historical archive only settles OI overnight) — and appends one
+   `(timestamp, ce_oi, pe_oi, atm, spot)` row (ATM±1 sums) to
+   `DATA/_atm_oi_intraday.parquet`.
+
+A side thread also writes the NIFTY LTP to `DATA/_nifty_ltp.json` every
+~4 s — the tick feed behind the UI's forming candle.
 
 Today's live OI rows are **transient**: next morning the 09:00 IST
 `investeq-oi-daily` timer rebuilds the aggregate from settled per-strike
@@ -228,11 +232,18 @@ strategies reset per-day, so **historical days are computed once per data
 version** (~40 s, re-warmed only after the morning rebuild or a restart)
 and **only today's slice is recomputed per request** (~1 s warm).
 
-### UI — `LIVE` button
+### UI — `LIVE` button + ticking candle
 
 Top-bar `LIVE` toggle (default ON): refetches candles + merged trades
-every 60 s during market hours. Today's trade pops onto the chart with
-its entry arrow ~1 min after the cross candle closes.
+every 60 s during market hours, and polls `/api/ltp` every 4 s to amend
+the rightmost candle in place — the forming bar ticks like a terminal.
+Today's trade pops onto the chart with its entry arrow ~1 min after the
+cross candle closes.
+
+> Rate-budget note: Groww's live-data quota is shared across all workers
+> on the box. The scanner's LTP worker must run the current
+> `ema_cross_swing/scan_app.py` (chart-symbol-only watchlist) — the old
+> 100-symbol version starves this worker into 429 backoff.
 
 ---
 

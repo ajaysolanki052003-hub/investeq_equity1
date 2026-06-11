@@ -27,8 +27,10 @@ Run (on the VM, via investeq-live-strategy.service):
 from __future__ import annotations
 
 import csv
+import json
 import os
 import sys
+import threading
 import time
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
@@ -47,9 +49,12 @@ MASTER    = ROOT / "nifty_1m_master.parquet"
 OI_INTRA  = ROOT / "_atm_oi_intraday.parquet"
 OI_DIR    = ROOT / "oi"
 INSTR_CSV = ROOT / "_groww_instruments.csv"
+LTP_JSON  = ROOT / "_nifty_ltp.json"   # tick feed for the UI's forming candle
+LTP_POLL_SEC = 4
 
 LTP_URL   = "https://api.groww.in/v1/live-data/ltp"
 QUOTE_URL = "https://api.groww.in/v1/live-data/quote"
+CHAIN_URL = "https://api.groww.in/v1/option-chain/exchange/NSE/underlying/NIFTY"
 INSTR_URL = "https://growwapi-assets.groww.in/instruments/instrument.csv"
 
 STRIKE_STEP = 50
@@ -90,6 +95,9 @@ class Groww:
     def __init__(self):
         self.token = None
         self.sess = requests.Session()
+        # The LTP tick thread and the per-minute cycle share this client —
+        # serialize API calls so the Session isn't used concurrently.
+        self.lock = threading.Lock()
         self._auth()
 
     def _auth(self):
@@ -98,12 +106,14 @@ class Groww:
         log("auth OK")
 
     def _get(self, url: str, params: dict, tries: int = 4):
-        h = {"Accept": "application/json",
-             "Authorization": f"Bearer {self.token}", "X-API-VERSION": "1.0"}
         backoff = 1.0
         for i in range(tries):
+            h = {"Accept": "application/json",
+                 "Authorization": f"Bearer {self.token}",
+                 "X-API-VERSION": "1.0"}
             try:
-                r = self.sess.get(url, headers=h, params=params, timeout=10)
+                with self.lock:
+                    r = self.sess.get(url, headers=h, params=params, timeout=10)
             except requests.RequestException:
                 time.sleep(backoff); backoff *= 2; continue
             if r.status_code == 200:
@@ -129,6 +139,13 @@ class Groww:
         if not p or p.get("open_interest") is None:
             return None
         return float(p["open_interest"]), float(p.get("previous_open_interest") or 0)
+
+    def option_chain(self, expiry: date) -> dict | None:
+        """Full NIFTY chain for one expiry — per-strike CE/PE OI + spot LTP
+        in a single request (vs 1 LTP + 6 quotes), the cheapest way to feed
+        the per-minute OI row. Once a minute, so patient retries are fine."""
+        return self._get(CHAIN_URL, {"expiry_date": expiry.isoformat()},
+                         tries=6)
 
 
 # ─── Instruments map: groww_symbol -> trading_symbol ─────────────────────────
@@ -246,6 +263,29 @@ def append_oi_row(ts: pd.Timestamp, ce: float, pe: float,
     _atomic_save(merged, OI_INTRA)
 
 
+# ─── LTP tick thread ─────────────────────────────────────────────────────────
+
+def ltp_tick_loop(g: "Groww") -> None:
+    """Every few seconds during the session, write the latest NIFTY LTP to a
+    tiny JSON the UI polls to animate the forming candle. Atomic replace so
+    readers never see a torn write."""
+    while True:
+        t = now_ist()
+        if not in_session(t):
+            time.sleep(60)
+            continue
+        try:
+            ltp = g.spot_ltp()
+            if ltp:
+                tmp = LTP_JSON.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(
+                    {"ts": t.strftime("%Y-%m-%dT%H:%M:%S"), "ltp": ltp}))
+                tmp.replace(LTP_JSON)
+        except Exception as e:
+            log(f"ltp tick error: {e!r}")
+        time.sleep(LTP_POLL_SEC)
+
+
 # ─── Main loop ───────────────────────────────────────────────────────────────
 
 def in_session(t: datetime) -> bool:
@@ -264,6 +304,7 @@ def seconds_to_next_open(t: datetime) -> float:
 
 def run() -> None:
     g = Groww()
+    threading.Thread(target=ltp_tick_loop, args=(g,), daemon=True).start()
     symmap: dict[str, str] = {}
     scale = 1.0
     scale_done_for: date | None = None
@@ -281,44 +322,42 @@ def run() -> None:
             today = t.date()
             expiry = next_weekly_expiry(today)
 
-            if not symmap or scale_done_for != today:
+            if not symmap:
                 symmap = load_symbol_map()
 
             # 1. index bars
             last = update_master(g.token)
 
-            # 2. live OI snapshot
-            spot = g.spot_ltp()
+            # 2. live OI snapshot — one option-chain call covers spot LTP +
+            #    per-strike OI for every leg we need.
+            chain = g.option_chain(expiry)
+            spot = float(chain.get("underlying_ltp") or 0) if chain else 0.0
             if spot:
                 atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
                 if scale_done_for != today:
                     scale = oi_unit_scale(g, symmap, expiry, atm)
                     scale_done_for = today
+                strikes = chain.get("strikes") or {}
                 ce_sum = pe_sum = 0.0
                 got = 0
                 for strike in (atm - STRIKE_STEP, atm, atm + STRIKE_STEP):
-                    for opt in ("CE", "PE"):
-                        tsym = symmap.get(gsym(expiry, strike, opt))
-                        if tsym is None:
-                            continue
-                        q = g.quote_oi(tsym)
-                        if q is None:
-                            continue
+                    legs = strikes.get(str(strike)) or {}
+                    ce = (legs.get("CE") or {}).get("open_interest")
+                    pe = (legs.get("PE") or {}).get("open_interest")
+                    if ce is not None and pe is not None:
                         got += 1
-                        if opt == "CE":
-                            ce_sum += q[0] * scale
-                        else:
-                            pe_sum += q[0] * scale
-                if got == 6:
+                        ce_sum += float(ce) * scale
+                        pe_sum += float(pe) * scale
+                if got == 3:
                     ts = pd.Timestamp(t.replace(second=0, microsecond=0))
                     append_oi_row(ts, ce_sum, pe_sum, atm, spot)
                     log(f"tick {ts:%H:%M} spot={spot:.1f} atm={atm} "
                         f"ce={ce_sum:,.0f} pe={pe_sum:,.0f} "
                         f"(master->{str(last)[11:16] if last is not None else '?'})")
                 else:
-                    log(f"skip OI append — only {got}/6 legs answered")
+                    log(f"skip OI append — only {got}/3 strikes in chain")
             else:
-                log("skip cycle — no spot LTP")
+                log("skip cycle — no chain / spot")
         except Exception as e:
             log(f"cycle error: {e!r}")
 
