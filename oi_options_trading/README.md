@@ -197,6 +197,45 @@ Show/hide the entire cumulative-PnL pane. Lit blue when visible.
 
 ---
 
+## 4.5 · LIVE mode
+
+The suite runs **live during NSE hours** — today's entries appear on the
+chart within ~1 minute of the cross.
+
+### Data side — `live_strategy_worker.py` (`investeq-live-strategy.service`)
+
+Every 60 s during the session (Mon–Fri 09:15–15:35 IST) the worker:
+
+1. Appends the latest **1-min NIFTY bars** to `DATA/nifty_1m_master.parquet`
+   (historical-candles endpoint serves index bars intraday).
+2. Reads **live OI** for the 6 ATM±1 legs (CE/PE × ATM−50/ATM/ATM+50,
+   nearest weekly expiry) via `/v1/live-data/quote` — this endpoint carries
+   `open_interest` intraday, unlike the historical archive which settles
+   OI overnight — and appends one `(timestamp, ce_oi, pe_oi, atm, spot)`
+   row to `DATA/_atm_oi_intraday.parquet`.
+
+Today's live OI rows are **transient**: next morning the 09:00 IST
+`investeq-oi-daily` timer rebuilds the aggregate from settled per-strike
+data, replacing them with the canonical series. At startup the worker
+reconciles live-vs-settled OI units (median settled/previous-OI ratio
+across the 6 legs) and scales if they diverge beyond 2×.
+
+### App side — mtime-keyed caches + historical/today split
+
+Every cache in `app.py` is keyed on the parquet's mtime, so each worker
+append busts it on the next request. Entry computation is split: both
+strategies reset per-day, so **historical days are computed once per data
+version** (~40 s, re-warmed only after the morning rebuild or a restart)
+and **only today's slice is recomputed per request** (~1 s warm).
+
+### UI — `LIVE` button
+
+Top-bar `LIVE` toggle (default ON): refetches candles + merged trades
+every 60 s during market hours. Today's trade pops onto the chart with
+its entry arrow ~1 min after the cross candle closes.
+
+---
+
 ## 5 · Backtest notebook
 
 `notebooks/oi_strategy_backtest.ipynb` — runnable end-to-end.

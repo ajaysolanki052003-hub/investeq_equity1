@@ -63,7 +63,8 @@ def _add_tot(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_entries(entry_start: dtime = ENTRY_WINDOW_START,
                     entry_end:   dtime = ENTRY_WINDOW_END,
-                    min_gap_bars: int = 7
+                    min_gap_bars: int = 7,
+                    df: pd.DataFrame | None = None
                     ) -> tuple[list[dict], dict]:
     """EVERY qualifying ΣOI cross per day inside the entry window, with a
     whipsaw filter applied: a new cross is only valid if at least
@@ -74,7 +75,9 @@ def compute_entries(entry_start: dtime = ENTRY_WINDOW_START,
 
     Multiple entries per day are still allowed; the filter only debounces
     flip-flop signals fired within the gap window."""
-    df = _add_tot(_load_oi())
+    # `df` lets the caller compute on a slice (live mode: cached historical
+    # days + a fresh pass over just today's rows).
+    df = _add_tot(_load_oi() if df is None else df)
     df["t"]   = df["timestamp"].dt.time
     df["pe_minus_ce_tot"] = df["pe_tot"] - df["ce_tot"]
 

@@ -39,8 +39,25 @@ TF_RULE = {
 }
 
 
-@lru_cache(maxsize=1)
-def _load_master_1m() -> pd.DataFrame:
+# ─── Live-aware caching ──────────────────────────────────────────────────────
+# The live worker appends to both parquets every minute during market hours.
+# Every cache below is keyed on the file's mtime, so a fresh write busts it
+# on the next request while repeated requests between writes stay warm.
+
+def _mt(p: Path) -> int:
+    try:
+        return p.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _now_ist():
+    from datetime import datetime, timedelta
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
+
+@lru_cache(maxsize=2)
+def _load_master_1m_v(v: int) -> pd.DataFrame:
     if not MASTER.exists():
         return pd.DataFrame()
     df = pd.read_parquet(MASTER)
@@ -52,9 +69,13 @@ def _load_master_1m() -> pd.DataFrame:
               .reset_index(drop=True))
 
 
-@lru_cache(maxsize=8)
-def _resampled(tf: str) -> pd.DataFrame:
-    df = _load_master_1m()
+def _load_master_1m() -> pd.DataFrame:
+    return _load_master_1m_v(_mt(MASTER))
+
+
+@lru_cache(maxsize=16)
+def _resampled_v(tf: str, v: int) -> pd.DataFrame:
+    df = _load_master_1m_v(v)
     if df.empty:
         return df
     if tf == "1m":
@@ -77,6 +98,10 @@ def _resampled(tf: str) -> pd.DataFrame:
              .dropna(subset=["open", "close"])
              .reset_index())
     return out
+
+
+def _resampled(tf: str) -> pd.DataFrame:
+    return _resampled_v(tf, _mt(MASTER))
 
 
 def to_unix(ts: pd.Series) -> np.ndarray:
@@ -103,8 +128,8 @@ def nifty(tf: str = Query("1d")):
                          "first": out[0]["time"], "last": out[-1]["time"]})
 
 
-@lru_cache(maxsize=1)
-def _load_oi_intraday() -> pd.DataFrame:
+@lru_cache(maxsize=2)
+def _load_oi_intraday_v(v: int) -> pd.DataFrame:
     if not OI_INTRA.exists():
         return pd.DataFrame()
     df = pd.read_parquet(OI_INTRA)
@@ -112,12 +137,16 @@ def _load_oi_intraday() -> pd.DataFrame:
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-@lru_cache(maxsize=8)
-def _oi_resampled(tf: str) -> pd.DataFrame:
+def _load_oi_intraday() -> pd.DataFrame:
+    return _load_oi_intraday_v(_mt(OI_INTRA))
+
+
+@lru_cache(maxsize=16)
+def _oi_resampled_v(tf: str, v: int) -> pd.DataFrame:
     """Resample the per-tick ATM±1 OI series to the requested TF using 'last'
     aggregation. For TFs coarser than the native ~3-min cadence the line is
     smooth; for 1m the line steps (same value held for 3 consecutive 1m bars)."""
-    df = _load_oi_intraday()
+    df = _load_oi_intraday_v(v)
     if df.empty:
         return df
     if tf == "1d":
@@ -142,6 +171,10 @@ def _oi_resampled(tf: str) -> pd.DataFrame:
              .dropna(subset=["ce_oi", "pe_oi"])
              .reset_index())
     return out
+
+
+def _oi_resampled(tf: str) -> pd.DataFrame:
+    return _oi_resampled_v(tf, _mt(OI_INTRA))
 
 
 @app.get("/api/nifty_oi")
@@ -273,26 +306,62 @@ def strategy_signals():
     return JSONResponse({"signals": sigs, "stats": stats, "n": len(sigs)})
 
 
-@lru_cache(maxsize=8)
+# Live split: entry computation over the full history takes ~10-40s, far too
+# slow to redo every time the live worker appends a row. Both strategies
+# reset per-day, so entries for past days can never change once the day is
+# over — compute them once per historical-data version and only re-run
+# today's (tiny) slice on every request.
+_HIST_ENTRIES_CACHE: dict[tuple, tuple] = {}
+
+
+def _entries_live(kind: str, tf: str = "1m", window: int = 10,
+                  min_gap: int = 7) -> tuple[list, dict]:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent))
+    from strategies.sigma5_entry_exit import compute_entries as _ce_sigma_n
+    from strategies.sigma_total_oi_entry import compute_entries as _ce_sigma_oi
+
+    def _compute(frame):
+        if frame is not None and frame.empty:
+            return [], {}
+        if kind == "sigma_n":
+            return _ce_sigma_n(tf=tf, window=window, df=frame)
+        return _ce_sigma_oi(min_gap_bars=min_gap, df=frame)
+
+    df = _load_oi_intraday()
+    if df.empty:
+        return [], {}
+
+    today = _now_ist().date()
+    dts = df["timestamp"].dt.date
+    hist = df[dts < today]
+    live = df[dts >= today]
+
+    # Fingerprint the historical slice by its row count + last timestamp —
+    # invariant while the live worker appends today's rows, changes when the
+    # morning rebuild lands settled data.
+    fp = (kind, tf, window, min_gap, len(hist),
+          str(hist["timestamp"].iloc[-1]) if len(hist) else "")
+    if fp not in _HIST_ENTRIES_CACHE:
+        if len(_HIST_ENTRIES_CACHE) > 32:
+            _HIST_ENTRIES_CACHE.clear()
+        _HIST_ENTRIES_CACHE[fp] = _compute(hist)
+    hist_entries, stats = _HIST_ENTRIES_CACHE[fp]
+
+    live_entries = _compute(live)[0] if len(live) else []
+    return hist_entries + live_entries, stats
+
+
 def _sigma5_entries_cached(tf: str):
-    """First qualifying Σ-N entry per day on the requested TF. Cached
-    per-TF — switching TF on the UI hits a different cache key."""
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).parent.parent))
-    from strategies.sigma5_entry_exit import compute_entries
-    return compute_entries(tf=tf)
+    """First qualifying Σ-N entry per day on the requested TF. Historical
+    days cached; today recomputed live on each request."""
+    return _entries_live("sigma_n", tf=tf)
 
 
-@lru_cache(maxsize=32)
 def _sigma_n_cached(tf: str, window: int):
-    """Σ-N entries with a sweepable rolling window. Used by the backtest
-    panel where the user can vary N. The 8-slot cap on the legacy helper
-    above only keys on TF; this one keys on (TF, window) so all combos
-    the user explores stay warm in memory."""
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).parent.parent))
-    from strategies.sigma5_entry_exit import compute_entries
-    return compute_entries(tf=tf, window=window)
+    """Σ-N entries with a sweepable rolling window. Historical days cached
+    per (TF, window); today recomputed live on each request."""
+    return _entries_live("sigma_n", tf=tf, window=window)
 
 
 @app.get("/api/strategy/sigma5_entries")
@@ -305,15 +374,11 @@ def sigma5_entries(tf: str = Query("1m")):
     return JSONResponse({"entries": entries, "stats": stats, "n": len(entries)})
 
 
-@lru_cache(maxsize=8)
 def _sigma_total_entries_cached(min_gap_bars: int = 7):
     """ΣOI-cross entries with the min-gap-bars whipsaw filter applied
     inside the strategy module. Default 7 — best-PF setting per the
-    notebook backtest. Process-level cache keyed on min_gap_bars."""
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).parent.parent))
-    from strategies.sigma_total_oi_entry import compute_entries
-    return compute_entries(min_gap_bars=min_gap_bars)
+    notebook backtest. Historical days cached; today recomputed live."""
+    return _entries_live("sigma_oi", min_gap=min_gap_bars)
 
 
 @app.get("/api/strategy/sigma_total_entries")
@@ -507,6 +572,24 @@ def api_backtest(strategy: str = Query("C", description="A=multi-strike, B=Σ-N 
     })
 
 
+@lru_cache(maxsize=2)
+def _px_by_day_v(v: int) -> dict:
+    """{date_str: (ts_array, close_array)} from the 1-min master — the
+    walk-forward exit's working set. Keyed on master mtime so the live
+    worker's per-minute append busts it."""
+    px_df = _load_master_1m_v(v)
+    if px_df.empty:
+        return {}
+    px_df = px_df[["timestamp", "close"]].copy()
+    px_df["date_key"] = px_df["timestamp"].dt.date.astype(str)
+    out = {}
+    for d, g in px_df.groupby("date_key", sort=True):
+        g = g.sort_values("timestamp")
+        out[d] = (g["timestamp"].values.astype("datetime64[ns]"),
+                  g["close"].values.astype("float64"))
+    return out
+
+
 @app.get("/api/merged_trades")
 def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_oi | both"),
                       sl_pct: float = Query(0.18),
@@ -563,16 +646,9 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
         raise HTTPException(400, f"unknown mode: {mode}")
 
     # 2. Walk-forward exit on 1-min NIFTY index
-    px_df = _load_master_1m()
-    if px_df.empty:
+    px_by_day = _px_by_day_v(_mt(MASTER))
+    if not px_by_day:
         return JSONResponse({"error": "1-min NIFTY master not available"}, status_code=503)
-    px_df = px_df[["timestamp", "close"]].copy()
-    px_df["date_key"] = px_df["timestamp"].dt.date.astype(str)
-    px_by_day = {}
-    for d, g in px_df.groupby("date_key", sort=True):
-        g = g.sort_values("timestamp")
-        px_by_day[d] = (g["timestamp"].values.astype("datetime64[ns]"),
-                        g["close"].values.astype("float64"))
 
     sl_frac, tgt_frac = sl_pct / 100.0, tgt_pct / 100.0
     trades = []
@@ -907,6 +983,7 @@ HTML = """<!doctype html>
   </span>
 
   <button class="btn" id="pnl-toggle" title="Show / hide the cumulative-PnL pane below the candle chart.">PnL</button>
+  <button class="btn" id="live-toggle" title="Auto-refresh candles + trades every 60s while the NSE session is open. The live worker appends fresh 1-min bars and ATM±1 OI every minute.">LIVE</button>
 
   <div class="spot">
     <span class="l">LAST</span>
@@ -2254,6 +2331,43 @@ function init() {
     }
   });
 
+
+  // ── LIVE auto-refresh ────────────────────────────────────────────
+  // Every 60s during the NSE session, re-pull candles + merged trades.
+  // The live worker appends fresh 1-min bars and ATM±1 OI each minute,
+  // so today's entries appear here within ~1 min of the cross.
+  let liveOn = true;
+  const _isMktHours = () => {
+    const ist = new Date(Date.now() + 330 * 60000);   // UTC+5:30
+    const d = ist.getUTCDay(), m = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+    return d >= 1 && d <= 5 && m >= 555 && m <= 935;  // Mon-Fri 09:15–15:35
+  };
+  const _markLiveBtn = () => {
+    const btn = $("live-toggle");
+    if (liveOn) {
+      btn.style.background = "linear-gradient(135deg, #34d399 0%, #059669 100%)";
+      btn.style.color = "#0a0c10";
+      btn.style.borderColor = "transparent";
+      btn.style.fontWeight = "700";
+    } else {
+      btn.style.background = ""; btn.style.color = "";
+      btn.style.borderColor = ""; btn.style.fontWeight = "";
+    }
+  };
+  const _liveTick = async () => {
+    if (!liveOn || !_isMktHours()) return;
+    try {
+      await loadTF(state.tf);     // fresh candles first ...
+      await loadTrades();         // ... then markers/stats on top
+    } catch (_) {}
+  };
+  _markLiveBtn();
+  setInterval(_liveTick, 60000);
+  $("live-toggle").addEventListener("click", () => {
+    liveOn = !liveOn;
+    _markLiveBtn();
+    if (liveOn) _liveTick();
+  });
 
   // Rich hover tooltip on entry/exit arrows — shows SL/Target/exit/P&L.
   setupHoverTooltip();

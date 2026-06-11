@@ -104,7 +104,8 @@ def _cross_up(prev_diff: float, curr_diff: float) -> bool:
 def compute_entries(tf: str = "1m",
                     window: int = SIGMA_WINDOW,
                     entry_start: dtime = ENTRY_WINDOW_START,
-                    entry_end:   dtime = ENTRY_WINDOW_END) -> tuple[list[dict], dict]:
+                    entry_end:   dtime = ENTRY_WINDOW_END,
+                    df: pd.DataFrame | None = None) -> tuple[list[dict], dict]:
     """Σ-N entries on the requested TF.
 
     Intraday TFs:
@@ -116,7 +117,10 @@ def compute_entries(tf: str = "1m",
       time-of-day gate (each daily bucket is pinned at 09:15 — a wall-
       clock gate would reject all of them).
     """
-    df = _resample_oi(_load_oi(), tf).sort_values("timestamp").reset_index(drop=True)
+    # `df` lets the caller compute on a slice (e.g. live mode: cached
+    # historical days + a fresh pass over just today's rows).
+    df = _resample_oi(_load_oi() if df is None else df, tf) \
+        .sort_values("timestamp").reset_index(drop=True)
     df["date"] = df["timestamp"].dt.date
 
     # Rolling sum strategy depends on TF: per-day reset for intraday so the
