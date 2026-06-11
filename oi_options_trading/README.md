@@ -121,25 +121,27 @@ execution.
 
 ### 3.4 · Exit rules
 
-Walk the 1-min NIFTY bars forward from `entry_time` with **touch-based
-fills** — a stop/limit fills when the bar's HIGH/LOW touches the level,
-the way a resting order fills live. (Until 2026-06-11 the walk used
-closes only, which let intra-minute wicks sail through stops — e.g. the
-2026-06-10 11:00 SHORT showed TGT despite six 1-min highs crossing the
-SL. Close-based walking flattered PF from ~1.13 to ~1.42.)
+Walk the 1-min NIFTY **closes** forward from `entry_time` — every level
+(SL, TGT, trailed stop) triggers only when a 1-minute close crosses it;
+intra-minute wicks through a level do NOT fill. This models exiting on
+close confirmations rather than resting stop orders at the broker.
+
+> A touch-based variant (fills on bar high/low, the way resting orders
+> fill) was evaluated on 2026-06-11: PF 1.13 / +3.3k pts vs 1.43 /
+> +9.6k here. Close-confirmed is the deliberate live choice — be aware
+> the difference is real: wicks through the stop are held, not stopped.
 
 | Exit | Trigger |
 |------|---------|
-| **SL**    | Bar high/low touches `entry × (1 ∓ sl_pct)` before the trail activates |
-| **TGT**   | Bar high/low touches `entry × (1 ± tgt_pct)` |
-| **TRAIL** | After trail activation, bar touches the trailed stop |
+| **TGT**   | Close reaches `entry × (1 + tgt_pct)` for LONG (mirror SHORT) |
+| **SL**    | Close reaches `entry × (1 − sl_pct)` BEFORE the trail activates |
+| **TRAIL** | After trail activation, close reaches the trailed stop |
 | **EOD**   | Day's last 1-min bar (~15:29) — square-off if no other hit |
 
-Same-bar ambiguity (SL and TGT inside one bar) resolves to **SL** —
-conservative. The trail is **MULTI-STEP staircase**: it RATCHETS on
-closes (a wick into profit doesn't move the stop), but the trailed
-level fills on touch like any stop; the SL **never** moves against the
-trade.
+The trail is **MULTI-STEP staircase**: once the close moves into profit
+by `trail_pct` points, the SL ratchets to `close − trail_distance`.
+Every subsequent advance ratchets it further; the SL **never** moves
+against the trade.
 
 ### 3.5 · Live locked defaults
 
@@ -155,16 +157,13 @@ trade.
 These were picked from the standalone trail-variant analysis (see §6) —
 **30-pt MULTI** was the win-rate winner.
 
-### 3.6 · Live performance (current data, touch-based fills)
+### 3.6 · Live performance (current data, close-confirmed fills)
 
 ```
-1674 trades · ~1.4 / day
-WR 54.4 %  ·  PF 1.13  ·  Total PnL +3285 pts
+1638 trades · ~1.4 / day
+WR 58.4 %  ·  PF 1.43  ·  Total PnL +9602 pts
+SL / TGT / EOD / TRAIL = 650 / 130 / 106 / 752
 ```
-
-> The pre-2026-06-11 close-based numbers (PF 1.42, +9527) overstated the
-> edge — wicks through the stop didn't count as stop-outs. The §3.3
-> position-mode comparison table above also predates touch fills.
 
 ---
 
