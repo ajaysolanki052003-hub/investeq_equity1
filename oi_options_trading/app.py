@@ -1351,6 +1351,17 @@ function setupChart() {
     wickUpColor: "#26a69a", wickDownColor: "#ef5350",
     priceLineVisible: false, lastValueVisible: false,
   });
+  // SL / Target levels of one trade — dashed horizontal segments spanning
+  // entry→exit, drawn on marker hover (and kept up for an open live trade).
+  const lvlOpts = {
+    lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed,
+    priceLineVisible: false, lastValueVisible: false,
+    crosshairMarkerVisible: false,
+  };
+  state.slLine  = state.chart.addLineSeries(
+    Object.assign({color: "#ef4444"}, lvlOpts));
+  state.tgtLine = state.chart.addLineSeries(
+    Object.assign({color: "#22c55e"}, lvlOpts));
 
   // CUMULATIVE-PnL sub-pane — area series painted blue above zero, red
   // below. Wrapped in try/catch so an unexpected lightweight-charts API
@@ -1784,6 +1795,47 @@ function _hhmm(iso) { return (iso || '').slice(11, 16); }
 function _day(d)    { return String(d).slice(0, 10); }
 function _f(n, d=2) { return (n == null || isNaN(n)) ? '—' : n.toFixed(d); }
 
+// ── Trade SL/Target level marks ────────────────────────────────────────
+// Dashed horizontal segments at the trade's SL (red) and Target (green)
+// levels, spanning entry→exit so the mark sits exactly where the bracket
+// was active. Levels derive from entry_spot × the backtest sl/tgt %, the
+// same numbers the hover tooltip shows. (TRAIL exits ratchet the stop
+// upward intraday — the line shows the INITIAL stop level.)
+let _lvlKey = null;
+function showTradeLevels(tr) {
+  if (!state.slLine || !state.tgtLine) return;
+  // crosshair-move calls this on every mouse move — skip identical redraws
+  const key = (tr && state.bt.sl_pct != null)
+    ? `${tr.entry_time}|${tr.exit_time}|${tr.side}|${state.bt.sl_pct}|${state.bt.tgt_pct}|${state.tf}`
+    : 'none';
+  if (key === _lvlKey) return;
+  _lvlKey = key;
+  if (key === 'none') {
+    state.slLine.setData([]); state.tgtLine.setData([]); return;
+  }
+  const sl = state.bt.sl_pct, tgt = state.bt.tgt_pct;
+  const sl_px  = tr.side === 'LONG' ? tr.entry_spot * (1 - sl/100)
+                                    : tr.entry_spot * (1 + sl/100);
+  const tgt_px = tr.side === 'LONG' ? tr.entry_spot * (1 + tgt/100)
+                                    : tr.entry_spot * (1 - tgt/100);
+  const t0 = _barTime(tr.entry_time);
+  let   t1 = _barTime(tr.exit_time);
+  if (t1 <= t0) t1 = t0 + (TF_SEC[state.tf] || 86400);  // same-bar trade
+  state.slLine.setData([{time: t0, value: sl_px}, {time: t1, value: sl_px}]);
+  state.tgtLine.setData([{time: t0, value: tgt_px}, {time: t1, value: tgt_px}]);
+}
+
+// A trade that hasn't resolved yet (today, reason still EOD = walked to
+// the latest bar without hitting a level) keeps its levels on screen
+// permanently so the live SL is always visible.
+function _openLiveTrade() {
+  const trs = (state.bt.trades || []);
+  if (!trs.length) return null;
+  const tr = trs[trs.length - 1];
+  const todayIST = new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
+  return (tr.reason === 'EOD' && _day(tr.day) === todayIST) ? tr : null;
+}
+
 function renderTradeTooltip(tip, trades, pt) {
   // Choose first trade — multi-trade collisions are rare on intraday TF.
   const tr = trades[0];
@@ -1850,14 +1902,21 @@ function setupHoverTooltip() {
   const tip = ensureTooltipEl();
   state.chart.subscribeCrosshairMove((param) => {
     if (!param || !param.point || param.time == null) {
-      tip.style.display = 'none'; return;
+      tip.style.display = 'none';
+      showTradeLevels(_openLiveTrade());      // revert to live trade, if any
+      return;
     }
     const t = typeof param.time === 'number' ? param.time : Number(param.time);
     const trades = state.tradeByTime[t];
-    if (trades && trades.length) { renderTradeTooltip(tip, trades, param.point); return; }
+    if (trades && trades.length) {
+      renderTradeTooltip(tip, trades, param.point);
+      showTradeLevels(trades[0]);             // SL/TGT marks for this trade
+      return;
+    }
     const sigs   = state.signalByTime[t];
     if (sigs   && sigs.length)   { renderSignalTooltip(tip, sigs, param.point); return; }
     tip.style.display = 'none';
+    showTradeLevels(_openLiveTrade());
   });
 }
 
@@ -1932,7 +1991,11 @@ function updateCumPnLChart() {
 // Everything except position_mode is locked to the winning defaults; the
 // panel only exposes the Opp OK / Single toggle. Mode/SL/TGT/Trail live
 // in state.bt only.
-async function loadTrades() {
+async function loadTrades(opts) {
+  // fit:false → background/live refresh: update data + markers but DO NOT
+  // touch the viewport (fitContent here zoomed the chart back out to the
+  // full multi-year range on every 60s live cycle).
+  const fit = !(opts && opts.fit === false);
   if (state.bt.running) return;
   state.bt.running = true;
   const activePosBtn = $('v-pos-grp').querySelector('button.on');
@@ -1953,8 +2016,9 @@ async function loadTrades() {
     state.bt.stats  = j.stats  || null;
     renderViewStats();
     applyAllMarkers();
+    showTradeLevels(_openLiveTrade());   // live trade's SL/TGT marks
     try { updateCumPnLChart(); } catch (e) { console.error('[updateCumPnL] failed:', e); }
-    if (state.bt.trades.length) {
+    if (fit && state.bt.trades.length) {
       try { state.chart.timeScale().fitContent(); } catch (_) {}
     }
   } catch (e) {
@@ -2565,7 +2629,7 @@ function init() {
         $("range").textContent = fmtDateUnix(state.bars[0].time) + " → "
           + fmtDateUnix(state.bars[state.bars.length - 1].time);
       }
-      await loadTrades();         // markers/stats on top
+      await loadTrades({fit: false});   // markers/stats — keep viewport
     } catch (_) {}
   };
   _markLiveBtn();
