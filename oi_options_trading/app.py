@@ -1340,6 +1340,17 @@ function setupChart() {
     borderUpColor: "#26a69a", borderDownColor: "#ef5350",
     wickUpColor: "#26a69a", wickDownColor: "#ef5350",
   });
+  // Tick overlay — holds ONLY the tick-built forming/unconfirmed candles.
+  // Keeping them OFF the main series means the main series only ever
+  // receives authoritative bars in time order, so series.update() can
+  // amend/append them directly — no full setData (which visually resets
+  // the chart) is ever needed to correct a completed candle.
+  state.formCandle = state.chart.addCandlestickSeries({
+    upColor: "#26a69a", downColor: "#ef5350",
+    borderUpColor: "#26a69a", borderDownColor: "#ef5350",
+    wickUpColor: "#26a69a", wickDownColor: "#ef5350",
+    priceLineVisible: false, lastValueVisible: false,
+  });
 
   // CUMULATIVE-PnL sub-pane — area series painted blue above zero, red
   // below. Wrapped in try/catch so an unexpected lightweight-charts API
@@ -1600,10 +1611,21 @@ function _markerTime(isoStr) {
   return Math.floor(new Date(isoStr + (isoStr.endsWith('Z') ? '' : 'Z')).getTime() / 1000);
 }
 
+// Floor an event time to the TF bucket that CONTAINS it. Markers with a
+// time that isn't an exact bar time snap FORWARD to the next bar — e.g. a
+// 10:04 exit rendered on the 10:06 candle of a 3m chart, whose range
+// doesn't even cover the exit price. On 1d the day-open anchor is used
+// upstream, so no flooring applies.
+function _barTime(isoStr) {
+  const t = _markerTime(isoStr);
+  const sec = TF_SEC[state.tf];
+  return sec ? t - (t % sec) : t;
+}
+
 // STRATEGY (multi-strike crossover) — green BUY ▲ / red SELL ▼.
 function signalToMarker(s) {
   const isDaily = state.tf === '1d';
-  const t = _markerTime(isDaily ? s.day_open_time : s.signal_time);
+  const t = _barTime(isDaily ? s.day_open_time : s.signal_time);
   const spot = Math.round(s.signal_spot).toLocaleString();
   if (s.signal === 'BULLISH') {
     return { time: t, position: 'belowBar', color: '#22c55e',
@@ -1616,7 +1638,7 @@ function signalToMarker(s) {
 // Σ·5 ENTRY — cyan LONG ▲ / orange SHORT ▼ (distinct hue from STRATEGY).
 function entryToMarker(e) {
   const isDaily = state.tf === '1d';
-  const t = _markerTime(isDaily ? e.day_open_time : e.entry_time);
+  const t = _barTime(isDaily ? e.day_open_time : e.entry_time);
   const spot = Math.round(e.entry_spot).toLocaleString();
   if (e.side === 'LONG') {
     return { time: t, position: 'belowBar', color: '#06b6d4',
@@ -1631,7 +1653,7 @@ function entryToMarker(e) {
 // (cyan/orange) palettes so all three marker sources can co-exist.
 function totEntryToMarker(e) {
   const isDaily = state.tf === '1d';
-  const t = _markerTime(isDaily ? e.day_open_time : e.entry_time);
+  const t = _barTime(isDaily ? e.day_open_time : e.entry_time);
   const spot = Math.round(e.entry_spot).toLocaleString();
   if (e.side === 'LONG') {
     return { time: t, position: 'belowBar', color: '#14b8a6',
@@ -1666,8 +1688,8 @@ function applyAllMarkers() {
   if (hasTrades) {
     for (const tr of state.bt.trades) {
       const win = tr.pnl_pts > 0;
-      const entryT = _markerTime(isDaily ? tr.day_open_time : tr.entry_time);
-      const exitT  = _markerTime(isDaily ? tr.day_open_time : tr.exit_time);
+      const entryT = _barTime(isDaily ? tr.day_open_time : tr.entry_time);
+      const exitT  = _barTime(isDaily ? tr.day_open_time : tr.exit_time);
       const isTrail = tr.reason === 'TRAIL';
       const entryColor = isTrail ? '#fbbf24'
                        : win     ? '#22c55e' : '#ef4444';
@@ -1711,15 +1733,15 @@ function rebuildHoverIndexes() {
   const isDaily = state.tf === '1d';
   if (state.bt.trades && state.bt.trades.length) {
     for (const tr of state.bt.trades) {
-      const eT = _markerTime(isDaily ? tr.day_open_time : tr.entry_time);
-      const xT = _markerTime(isDaily ? tr.day_open_time : tr.exit_time);
+      const eT = _barTime(isDaily ? tr.day_open_time : tr.entry_time);
+      const xT = _barTime(isDaily ? tr.day_open_time : tr.exit_time);
       (state.tradeByTime[eT] = state.tradeByTime[eT] || []).push(tr);
       if (xT !== eT)
         (state.tradeByTime[xT] = state.tradeByTime[xT] || []).push(tr);
     }
   } else if (state.sigT && state.sigT.length) {
     for (const s of state.sigT) {
-      const t = _markerTime(isDaily ? s.day_open_time : s.entry_time);
+      const t = _barTime(isDaily ? s.day_open_time : s.entry_time);
       (state.signalByTime[t] = state.signalByTime[t] || []).push(s);
     }
   }
@@ -2086,9 +2108,14 @@ function findAtTime(bars, time) {
   return hi >= 0 ? bars[hi] : null;
 }
 
-// Tick-built forming candle (amended every ~4s by _tickPoll in init).
-// Top-level because loadTF resets it on a timeframe switch.
+// Tick-built forming candle (amended every ~4s by _tickPoll in init) plus
+// the closed-but-unconfirmed sketches awaiting their real worker bar. They
+// live on the state.formCandle overlay, never on the main series.
+// Top-level because loadTF resets them on a timeframe switch.
 let formBar = null;
+let pendBars = [];
+const TF_SEC = {"1m":60, "3m":180, "5m":300, "15m":900,
+                "30m":1800, "1h":3600, "4h":14400};
 
 async function loadTF(tf) {
   state.tf = tf;
@@ -2098,7 +2125,9 @@ async function loadTF(tf) {
   const r = await fetch(apiUrl(`/api/nifty?tf=${tf}`));
   const j = await r.json();
   state.bars = j.bars || [];
-  formBar = null;            // old-TF forming candle must not leak across
+  formBar = null;            // old-TF forming candles must not leak across
+  pendBars = [];
+  if (state.formCandle) state.formCandle.setData([]);
   state.candle.setData(state.bars);
   if (state.bars.length) {
     const lastBar = state.bars[state.bars.length - 1];
@@ -2490,22 +2519,16 @@ function init() {
       btn.style.borderColor = ""; btn.style.fontWeight = "";
     }
   };
-  // series.update() can only amend the LAST bar — once the tick-poller has
-  // painted a newer bucket, corrections to completed candles throw. This
-  // rewrites the whole series from the authoritative array (client-side,
-  // cheap) so every previously painted candle snaps to the real 1-min data,
-  // then re-applies the forming bar and restores the visible range.
-  const _redrawBars = () => {
-    if (!state.candle || !state.bars.length) return;
-    const ts = state.chart.timeScale();
-    let vr = null;
-    try { vr = ts.getVisibleLogicalRange(); } catch (_) {}
-    state.candle.setData(state.bars);
-    const last = state.bars[state.bars.length - 1];
-    if (formBar && formBar.time > last.time) {
-      try { state.candle.update(formBar); } catch (_) {}
-    }
-    if (vr) try { ts.setVisibleLogicalRange(vr); } catch (_) {}
+  // Re-sync the tick overlay with what the worker has confirmed: sketches
+  // whose real bar now exists on the main series are dropped (revealing
+  // the authoritative candle beneath); the forming bar always stays.
+  const _pruneOverlay = () => {
+    const lastAuth = state.bars.length
+      ? state.bars[state.bars.length - 1].time : 0;
+    pendBars = pendBars
+      .filter(p => p.time > lastAuth || p === formBar)
+      .slice(-5);                  // bounded if the worker stalls
+    if (state.formCandle) state.formCandle.setData(pendBars);
   };
   const _liveTick = async () => {
     if (!liveOn || !_isMktHours()) return;
@@ -2517,28 +2540,26 @@ function init() {
         ? state.bars[state.bars.length - 1].time : 0;
       const r = await fetch(apiUrl(`/api/nifty?tf=${state.tf}&since=${lastT}`));
       const j = await r.json();
-      let needRedraw = false;
       for (const b of (j.bars || [])) {
         const lb = state.bars[state.bars.length - 1];
         if (lb && lb.time === b.time) {
           state.bars[state.bars.length - 1] = b;     // amend forming bucket
         } else if (!lb || b.time > lb.time) {
           state.bars.push(b);
-        }
+        } else continue;                             // out of order — skip
         if (formBar && b.time === formBar.time) {
           // Server bar covers the elapsed part of the forming bucket from
-          // real 1-min data — fold it in, keep the latest tick close.
+          // real 1-min data — fold it into the tick sketch on top.
           formBar.open = b.open;
           formBar.high = Math.max(formBar.high, b.high);
           formBar.low  = Math.min(formBar.low,  b.low);
-          try { state.candle.update(formBar); } catch (_) { needRedraw = true; }
-        } else if (formBar && b.time < formBar.time) {
-          needRedraw = true;       // completed candle behind the forming one
-        } else {
-          try { state.candle.update(b); } catch (_) { needRedraw = true; }
         }
+        // Main series only ever sees authoritative bars in time order, so
+        // this amends/appends cleanly — completed candles self-correct
+        // without any full redraw.
+        try { state.candle.update(b); } catch (_) {}
       }
-      if (needRedraw) _redrawBars();
+      _pruneOverlay();
       if (state.bars.length) {
         $("bar-count").textContent = state.bars.length.toLocaleString();
         $("range").textContent = fmtDateUnix(state.bars[0].time) + " → "
@@ -2557,14 +2578,13 @@ function init() {
 
   // ── Tick-level forming candle ────────────────────────────────────
   // The worker writes the NIFTY LTP to /api/ltp every ~4s. Poll it and
-  // amend the current TF bucket in place so the rightmost candle ticks
-  // like a real terminal between the 60s full refreshes.
-  const TF_SEC = {"1m":60, "3m":180, "5m":300, "15m":900,
-                  "30m":1800, "1h":3600, "4h":14400};
+  // amend the current TF bucket on the tick OVERLAY series so the
+  // rightmost candle ticks like a real terminal; the closed sketch stays
+  // on the overlay until the worker's authoritative bar replaces it.
   const _tickPoll = async () => {
     if (!liveOn || !_isMktHours()) return;
     const sec = TF_SEC[state.tf];
-    if (!sec || !state.candle) return;
+    if (!sec || !state.formCandle) return;
     try {
       const r = await fetch(apiUrl('/api/ltp'));
       const j = await r.json();
@@ -2584,19 +2604,21 @@ function init() {
         formBar = {time: bucket, open: seed,
                    high: Math.max(seed, j.ltp),
                    low:  Math.min(seed, j.ltp), close: j.ltp};
-        // The just-closed bucket on screen is still a 4s-sample sketch —
-        // pull the real bars for it soon (the worker writes the closed
-        // 1-min bar within its 60s cycle; two tries cover the lag).
+        pendBars = pendBars.filter(p => p.time < bucket);
+        pendBars.push(formBar);
+        _pruneOverlay();
+        // The just-closed bucket is still a 4s-sample sketch — pull the
+        // real bars for it soon (the worker writes the closed 1-min bar
+        // within its 60s cycle; two tries cover the lag).
         setTimeout(_liveTick, 5000);
         setTimeout(_liveTick, 21000);
       } else {
         formBar.high  = Math.max(formBar.high, j.ltp);
         formBar.low   = Math.min(formBar.low,  j.ltp);
         formBar.close = j.ltp;
+        // formBar is always the overlay's last bar — in-order amend.
+        try { state.formCandle.update(formBar); } catch (_) {}
       }
-      // series.update throws if the bucket is older than the last bar
-      // (e.g. right after a full refresh replaced the data) — ignore.
-      try { state.candle.update(formBar); } catch (_) {}
       $("last-val").textContent = fmtPrice(j.ltp);
     } catch (_) {}
   };
