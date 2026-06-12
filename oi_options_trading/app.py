@@ -2086,6 +2086,10 @@ function findAtTime(bars, time) {
   return hi >= 0 ? bars[hi] : null;
 }
 
+// Tick-built forming candle (amended every ~4s by _tickPoll in init).
+// Top-level because loadTF resets it on a timeframe switch.
+let formBar = null;
+
 async function loadTF(tf) {
   state.tf = tf;
   $("tf-grp").querySelectorAll("button").forEach(b => {
@@ -2094,6 +2098,7 @@ async function loadTF(tf) {
   const r = await fetch(apiUrl(`/api/nifty?tf=${tf}`));
   const j = await r.json();
   state.bars = j.bars || [];
+  formBar = null;            // old-TF forming candle must not leak across
   state.candle.setData(state.bars);
   if (state.bars.length) {
     const lastBar = state.bars[state.bars.length - 1];
@@ -2485,6 +2490,23 @@ function init() {
       btn.style.borderColor = ""; btn.style.fontWeight = "";
     }
   };
+  // series.update() can only amend the LAST bar — once the tick-poller has
+  // painted a newer bucket, corrections to completed candles throw. This
+  // rewrites the whole series from the authoritative array (client-side,
+  // cheap) so every previously painted candle snaps to the real 1-min data,
+  // then re-applies the forming bar and restores the visible range.
+  const _redrawBars = () => {
+    if (!state.candle || !state.bars.length) return;
+    const ts = state.chart.timeScale();
+    let vr = null;
+    try { vr = ts.getVisibleLogicalRange(); } catch (_) {}
+    state.candle.setData(state.bars);
+    const last = state.bars[state.bars.length - 1];
+    if (formBar && formBar.time > last.time) {
+      try { state.candle.update(formBar); } catch (_) {}
+    }
+    if (vr) try { ts.setVisibleLogicalRange(vr); } catch (_) {}
+  };
   const _liveTick = async () => {
     if (!liveOn || !_isMktHours()) return;
     try {
@@ -2495,6 +2517,7 @@ function init() {
         ? state.bars[state.bars.length - 1].time : 0;
       const r = await fetch(apiUrl(`/api/nifty?tf=${state.tf}&since=${lastT}`));
       const j = await r.json();
+      let needRedraw = false;
       for (const b of (j.bars || [])) {
         const lb = state.bars[state.bars.length - 1];
         if (lb && lb.time === b.time) {
@@ -2502,8 +2525,20 @@ function init() {
         } else if (!lb || b.time > lb.time) {
           state.bars.push(b);
         }
-        try { state.candle.update(b); } catch (_) {}
+        if (formBar && b.time === formBar.time) {
+          // Server bar covers the elapsed part of the forming bucket from
+          // real 1-min data — fold it in, keep the latest tick close.
+          formBar.open = b.open;
+          formBar.high = Math.max(formBar.high, b.high);
+          formBar.low  = Math.min(formBar.low,  b.low);
+          try { state.candle.update(formBar); } catch (_) { needRedraw = true; }
+        } else if (formBar && b.time < formBar.time) {
+          needRedraw = true;       // completed candle behind the forming one
+        } else {
+          try { state.candle.update(b); } catch (_) { needRedraw = true; }
+        }
       }
+      if (needRedraw) _redrawBars();
       if (state.bars.length) {
         $("bar-count").textContent = state.bars.length.toLocaleString();
         $("range").textContent = fmtDateUnix(state.bars[0].time) + " → "
@@ -2526,7 +2561,6 @@ function init() {
   // like a real terminal between the 60s full refreshes.
   const TF_SEC = {"1m":60, "3m":180, "5m":300, "15m":900,
                   "30m":1800, "1h":3600, "4h":14400};
-  let formBar = null;
   const _tickPoll = async () => {
     if (!liveOn || !_isMktHours()) return;
     const sec = TF_SEC[state.tf];
@@ -2540,8 +2574,21 @@ function init() {
       const t = Math.floor(Date.parse(j.ts + "Z") / 1000);
       const bucket = t - (t % sec);
       if (!formBar || formBar.time !== bucket) {
-        formBar = {time: bucket, open: j.ltp, high: j.ltp,
-                   low: j.ltp, close: j.ltp};
+        // Seed open from the previous candle's close (the first 4s LTP
+        // sample can land mid-bucket) — only across adjacent buckets so a
+        // data gap doesn't paint a phantom wick.
+        const lb = state.bars[state.bars.length - 1];
+        let seed = j.ltp;
+        if (formBar && formBar.time === bucket - sec) seed = formBar.close;
+        else if (lb && lb.time === bucket - sec)      seed = lb.close;
+        formBar = {time: bucket, open: seed,
+                   high: Math.max(seed, j.ltp),
+                   low:  Math.min(seed, j.ltp), close: j.ltp};
+        // The just-closed bucket on screen is still a 4s-sample sketch —
+        // pull the real bars for it soon (the worker writes the closed
+        // 1-min bar within its 60s cycle; two tries cover the lag).
+        setTimeout(_liveTick, 5000);
+        setTimeout(_liveTick, 21000);
       } else {
         formBar.high  = Math.max(formBar.high, j.ltp);
         formBar.low   = Math.min(formBar.low,  j.ltp);
