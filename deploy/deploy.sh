@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-VM_HOST="34.93.70.239"
+VM_HOST="${VM_HOST:-34.14.172.202}"
 VM_USER="ajay"
 VM_TARGET="${VM_USER}@${VM_HOST}"
 VM_PATH="/home/${VM_USER}/investeq_ajs"

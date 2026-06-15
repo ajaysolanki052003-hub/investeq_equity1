@@ -1,0 +1,19 @@
+[Unit]
+Description=Investeq Volatility Desk + Chain Replay data — per-day spot/options OHLCV fetch + straddle P&L rebuild (one-shot, triggered by .timer)
+
+[Service]
+Type=oneshot
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+Environment=INVESTEQ_DATA=/home/ajay/investeq_ajs/DATA
+# 1) Fetch every missing day's per-strike 1m option OHLCV + the per-day spot
+#    file from Groww historical-candles. --catchup resumes from the last
+#    DATA/options/*.parquet. Feeds BOTH Chain Replay (/chain) and the
+#    Volatility Desk (/straddle), which read these files directly.
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python fetch_option_ohlcv.py --catchup --pad 3 --delay 0.35
+# 2) Rebuild the weekly short-straddle P&L table the Volatility Desk renders.
+ExecStartPost=/home/ajay/investeq_ajs/.venv/bin/python regen_straddle_pnl.py
+StandardOutput=journal
+StandardError=journal

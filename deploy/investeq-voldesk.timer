@@ -1,0 +1,16 @@
+[Unit]
+Description=Investeq Volatility Desk + Chain Replay daily data update — Tue–Sat 09:10 IST (settles the prior session)
+
+[Timer]
+# Same lag as the OI archive: Groww's per-minute option candles for "today"
+# read back empty until the next morning, so we fire the morning AFTER each
+# trading session to pick it up:
+#   Tue 09:10 → Monday's data, Wed → Tuesday, ... Sat → Friday.
+# 09:10 (just after the oi-daily 09:00 run) so the OI files Chain Replay also
+# uses are already refreshed for the same day.
+OnCalendar=Tue..Sat 09:10 Asia/Kolkata
+Persistent=true
+Unit=investeq-voldesk.service
+
+[Install]
+WantedBy=timers.target
