@@ -146,6 +146,22 @@ PROJECTS = [
         "accent": "#a78bfa",
     },
     {
+        "id": "indicator-screener",
+        "name": "Indicator Screener",
+        "instrument": "Equities",
+        "tag": "LIVE",
+        "category": "EQUITIES",
+        "thesis": "Filter the NSE universe by threshold values of the 10 most-used "
+                  "technical indicators (RSI, MACD, ADX, Bollinger, Stochastic, "
+                  "CCI, ATR, ROC, SMA/EMA) — combine filters with AND/OR.",
+        "stack": [],
+        "port": 8707,
+        "url": "/screener/",
+        "path": "",
+        "metrics": [],
+        "accent": "#34d399",
+    },
+    {
         "id": "expiry-blast",
         "name": "Expiry Blast",
         "instrument": "NIFTY · weekly options",

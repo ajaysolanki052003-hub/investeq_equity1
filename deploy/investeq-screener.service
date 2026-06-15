@@ -1,0 +1,19 @@
+[Unit]
+Description=Investeq Indicator Screener — filter NSE equities by technical-indicator thresholds (FastAPI on 8707, served at /screener)
+After=network.target
+
+[Service]
+Type=simple
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+Environment=APP_BASE=/screener
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python -m uvicorn stock_screener.app:app --host 127.0.0.1 --port 8707
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
