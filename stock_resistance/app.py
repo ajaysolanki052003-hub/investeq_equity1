@@ -109,7 +109,7 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
   <span class="tag">RESISTANCE MARKER</span>
   <span><label>Stock</label><select id="sym" style="width:160px"></select></span>
   <span class="seg" id="tf"><button data-tf="1d" class="on">Daily</button><button data-tf="1h">Hourly</button></span>
-  <span><label>Pivot</label><select id="k"><option>2</option><option selected>3</option><option>5</option><option>8</option></select></span>
+  <span><label>Pivot</label><select id="k"><option selected>8</option><option>13</option><option>21</option></select></span>
   <span><label>Min touches</label><select id="touch"><option selected>1</option><option>2</option><option>3</option></select></span>
   <button id="apply">⬛ Apply Resistance</button>
   <button id="clear">Clear</button>
