@@ -107,7 +107,7 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
 
 <div id="bar">
   <span class="tag">RESISTANCE MARKER</span>
-  <span><label>Stock</label><input id="sym" list="syms" placeholder="RELIANCE" style="width:130px"><datalist id="syms"></datalist></span>
+  <span><label>Stock</label><select id="sym" style="width:160px"></select></span>
   <span class="seg" id="tf"><button data-tf="1d" class="on">Daily</button><button data-tf="1h">Hourly</button></span>
   <span><label>Pivot</label><select id="k"><option>2</option><option selected>3</option><option>5</option><option>8</option></select></span>
   <span><label>Min touches</label><select id="touch"><option selected>1</option><option>2</option><option>3</option></select></span>
@@ -203,8 +203,8 @@ $("clear").onclick=function(){clearMarks(); $("title").textContent="cleared";};
 // ── boot ─────────────────────────────────────────────────────────────
 (async function(){
   const m=await(await fetch(api("/api/meta"))).json();
-  $("syms").innerHTML=(m.symbols||[]).map(function(s){return "<option value=\""+s+"\">";}).join("");
-  $("sym").value=m.default||"";
+  $("sym").innerHTML=(m.symbols||[]).map(function(s){
+    return "<option"+(s===m.default?" selected":"")+">"+s+"</option>";}).join("");
   await load();
 })();
 </script>
