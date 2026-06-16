@@ -1,9 +1,16 @@
 [Unit]
-Description=Run scan-cache builder Mon-Fri at 15:40 IST (10:10 UTC)
-# Fires 10 minutes after NSE 15:30 close + the 15:35 daily-candle refresh —
-# the 1d CSVs are guaranteed to have today's bar by then.
+Description=Run scan-cache builder Mon-Fri — hourly intraday (10:20-15:20 IST) + EOD pass (15:40 IST)
 
 [Timer]
+# Intraday refreshes so the UI shows the CURRENT day's forming entries.
+# Before the 15:35 close today's 1d bar doesn't exist yet, so the scan
+# synthesizes it from the already-fetched live 1h bars; each rebuild writes
+# scan_<today>.parquet, which makes today scannable (and folds today into
+# the date classifier so it's no longer flagged "no data yet").
+# HH:50 UTC for hours 04..09 = 10:20, 11:20, 12:20, 13:20, 14:20, 15:20 IST.
+OnCalendar=Mon..Fri 04..09:50:00 UTC
+# Final authoritative pass 10 min after close + the 15:35 daily-candle
+# refresh — the 1d CSVs now have today's real bar.
 OnCalendar=Mon..Fri 10:10:00 UTC
 Persistent=true
 
