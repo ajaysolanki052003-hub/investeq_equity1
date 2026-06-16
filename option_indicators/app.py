@@ -155,13 +155,12 @@ def series(expiry: str = Query(...), strike: int = Query(...),
                for t, o, h, l, c in zip(df["timestamp"], df["open"],
                                         df["high"], df["low"], df["close"])]
     return JSONResponse({
-        "symbol":     gsym,
-        "candles":    candles,
-        "volume":     ind.volume_bars(df),
-        "indicators": ind.compute_all(df),
-        "n":          len(df),
-        "live":       d == _today_ist(),
-        "asof":       _now_ist().strftime("%H:%M:%S"),
+        "symbol":  gsym,
+        "candles": candles,
+        "volume":  ind.volume_bars(df),   # drives the client-side Volume Profile
+        "n":       len(df),
+        "live":    d == _today_ist(),
+        "asof":    _now_ist().strftime("%H:%M:%S"),
     })
 
 
@@ -177,7 +176,7 @@ def index():
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Option Indicator Lab</title>
+<title>Option Volume Profile</title>
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 :root{--bg:#0b0d11;--panel:#10131a;--border:#222838;--text:#e7eaf1;--muted:#8a93a6;--accent:#22d3ee;}
@@ -192,23 +191,19 @@ button.on{background:linear-gradient(135deg,#22d3ee,#0891b2);color:#04141a;borde
 .seg button:first-child{border-radius:6px 0 0 6px}
 .seg button:last-child{border-radius:0 6px 6px 0}
 .tag{color:var(--accent);font-weight:700;letter-spacing:.4px;margin-right:4px}
-#title{font-weight:700;font-size:15px}
-.ind-toggles{display:flex;gap:6px;flex-wrap:wrap;padding:8px 14px;background:var(--panel);border-bottom:1px solid var(--border)}
-.ind-toggles .grp{color:var(--muted);font-size:11px;align-self:center;margin-right:2px}
-.charts{display:flex;flex-direction:column;height:calc(100vh - 132px)}
-#price{flex:1 1 auto;position:relative}
+#title{font-weight:700;font-size:13px;color:var(--muted);margin-left:auto}
+.charts{height:calc(100vh - 56px)}
+#price{height:100%;position:relative}
 #vpcanvas{position:absolute;top:0;right:0;height:100%;pointer-events:none;z-index:5}
-.sub{height:120px;border-top:1px solid var(--border);position:relative;display:none}
-.sub .lab{position:absolute;left:8px;top:4px;z-index:4;font-size:11px;color:var(--muted)}
-#status{margin-left:auto;color:var(--muted);font-size:11px}
+#status{color:var(--muted);font-size:11px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;margin-right:5px;vertical-align:middle}
 .dot.live{background:#22c55e;box-shadow:0 0 6px #22c55e}
 #replay{display:flex;gap:8px;align-items:center}
-#scrub{width:240px}
+#scrub{width:220px}
 </style></head><body>
 
 <div id="bar">
-  <span class="tag">⚡ OPTION INDICATOR LAB</span>
+  <span class="tag">VOLUME PROFILE</span>
   <span><label>Expiry</label><select id="expiry"></select></span>
   <span><label>Strike</label><select id="strike"></select></span>
   <span class="seg" id="cepe"><button data-t="CE" class="on">CE</button><button data-t="PE">PE</button></span>
@@ -216,148 +211,66 @@ button.on{background:linear-gradient(135deg,#22d3ee,#0891b2);color:#04141a;borde
   <span class="seg" id="ivl">
     <button data-i="1m" class="on">1m</button><button data-i="3m">3m</button>
     <button data-i="5m">5m</button><button data-i="15m">15m</button></span>
-  <button id="live-btn">● LIVE</button>
+  <span><label>Bins</label><select id="bins">
+    <option>24</option><option selected>48</option><option>72</option><option>96</option></select></span>
+  <button id="live-btn">&#9679; LIVE</button>
   <span id="replay">
-    <button id="play">▶</button>
+    <button id="play">&#9654;</button>
     <input type="range" id="scrub" min="0" max="0" value="0">
-    <select id="speed"><option value="500">1×</option><option value="250">2×</option>
-      <option value="100">5×</option><option value="40">12×</option></select>
+    <select id="speed"><option value="500">1x</option><option value="250">2x</option>
+      <option value="100">5x</option><option value="40">12x</option></select>
   </span>
-  <span id="status"><span class="dot"></span><span id="status-txt">—</span></span>
+  <span id="status"><span class="dot"></span><span id="status-txt">&mdash;</span></span>
+  <span id="title"></span>
 </div>
 
-<div class="ind-toggles" id="overlays">
-  <span class="grp">Overlays:</span>
-  <button data-ov="ema" class="on">EMA 9/20/50</button>
-  <button data-ov="bb">Bollinger</button>
-  <button data-ov="vwap" class="on">VWAP</button>
-  <button data-ov="vprofile" class="on">Volume Profile</button>
-  <span class="grp" style="margin-left:12px">Panes:</span>
-  <button data-pane="macd" class="on">MACD</button>
-  <button data-pane="rsi" class="on">RSI</button>
-  <button data-pane="stoch">Stochastic</button>
-  <button data-pane="adx">ADX</button>
-  <button data-pane="obv">OBV</button>
-  <span id="title" style="margin-left:14px"></span>
-</div>
-
-<div class="charts">
-  <div id="price"><canvas id="vpcanvas" width="160"></canvas></div>
-  <div class="sub" id="p-vol"><span class="lab">Volume</span></div>
-  <div class="sub" id="p-macd"><span class="lab">MACD 12,26,9</span></div>
-  <div class="sub" id="p-rsi"><span class="lab">RSI 14</span></div>
-  <div class="sub" id="p-stoch"><span class="lab">Stochastic 14,3</span></div>
-  <div class="sub" id="p-adx"><span class="lab">ADX 14 (+DI green / −DI red)</span></div>
-  <div class="sub" id="p-obv"><span class="lab">OBV</span></div>
-</div>
+<div class="charts"><div id="price"><canvas id="vpcanvas" width="170"></canvas></div></div>
 
 <script>
 const APP_BASE="__APP_BASE__";
-const api=p=>(APP_BASE||"")+p;
-const $=id=>document.getElementById(id);
-const COL={ema9:"#f59e0b",ema20:"#22d3ee",ema50:"#a78bfa",bb:"#64748b",vwap:"#e879f9",
-           macd:"#22d3ee",signal:"#f59e0b",rsi:"#e879f9",k:"#22d3ee",d:"#f59e0b",
-           adx:"#e7eaf1",plus:"#22c55e",minus:"#ef4444",obv:"#22d3ee"};
+const api=function(p){return (APP_BASE||"")+p;};
+const $=function(id){return document.getElementById(id);};
 
 const S={data:null, idx:0, live:false, playing:false, timer:null, liveTimer:null,
-         ov:{ema:true,bb:false,vwap:true,vprofile:true},
-         panes:{macd:true,rsi:true,stoch:false,adx:false,obv:false},
-         tf:"1m", type:"CE"};
+         tf:"1m", type:"CE", today:null};
 
-// ── chart construction ──────────────────────────────────────────────
-const base={layout:{background:{color:"#0b0d11"},textColor:"#cfd6e4"},
+const price=LightweightCharts.createChart($("price"),{autoSize:true,
+  layout:{background:{color:"#0b0d11"},textColor:"#cfd6e4"},
   grid:{vertLines:{color:"#161b27"},horzLines:{color:"#161b27"}},
   timeScale:{timeVisible:true,secondsVisible:false,borderColor:"#222838",rightOffset:6},
-  rightPriceScale:{borderColor:"#222838"},crosshair:{mode:0}};
-const price=LightweightCharts.createChart($("price"),Object.assign({autoSize:true},base));
+  rightPriceScale:{borderColor:"#222838"},crosshair:{mode:0}});
 const candle=price.addCandlestickSeries({upColor:"#26a69a",downColor:"#ef5350",
   borderUpColor:"#26a69a",borderDownColor:"#ef5350",wickUpColor:"#26a69a",wickDownColor:"#ef5350"});
-const ovS={ema9:price.addLineSeries({color:COL.ema9,lineWidth:1}),
-  ema20:price.addLineSeries({color:COL.ema20,lineWidth:1}),
-  ema50:price.addLineSeries({color:COL.ema50,lineWidth:1}),
-  bbU:price.addLineSeries({color:COL.bb,lineWidth:1,lineStyle:2}),
-  bbM:price.addLineSeries({color:COL.bb,lineWidth:1,lineStyle:0}),
-  bbL:price.addLineSeries({color:COL.bb,lineWidth:1,lineStyle:2}),
-  vwap:price.addLineSeries({color:COL.vwap,lineWidth:2})};
-let vpLines=[];   // POC/VAH/VAL price lines
+let vpLines=[];
 
-function mkSub(el){const c=LightweightCharts.createChart(el,Object.assign({autoSize:true},base,
-  {timeScale:{visible:false,borderColor:"#222838"}}));return c;}
-const subs={};
-subs.vol=mkSub($("p-vol")); const volS=subs.vol.addHistogramSeries({priceFormat:{type:"volume"}});
-subs.macd=mkSub($("p-macd"));
-const macdHist=subs.macd.addHistogramSeries({}),
-      macdLine=subs.macd.addLineSeries({color:COL.macd,lineWidth:1}),
-      macdSig=subs.macd.addLineSeries({color:COL.signal,lineWidth:1});
-subs.rsi=mkSub($("p-rsi")); const rsiS=subs.rsi.addLineSeries({color:COL.rsi,lineWidth:1});
-subs.stoch=mkSub($("p-stoch"));
-const stoK=subs.stoch.addLineSeries({color:COL.k,lineWidth:1}),
-      stoD=subs.stoch.addLineSeries({color:COL.d,lineWidth:1});
-subs.adx=mkSub($("p-adx"));
-const adxA=subs.adx.addLineSeries({color:COL.adx,lineWidth:1}),
-      adxP=subs.adx.addLineSeries({color:COL.plus,lineWidth:1}),
-      adxM=subs.adx.addLineSeries({color:COL.minus,lineWidth:1});
-subs.obv=mkSub($("p-obv")); const obvS=subs.obv.addLineSeries({color:COL.obv,lineWidth:1});
+price.timeScale().subscribeVisibleTimeRangeChange(function(){drawVP();});
 
-// RSI 30/70 + Stoch 20/80 guide lines
-rsiS.createPriceLine({price:70,color:"#ef444455",lineStyle:2,lineWidth:1});
-rsiS.createPriceLine({price:30,color:"#22c55e55",lineStyle:2,lineWidth:1});
+function render(t){ candle.setData(S.data.candles.filter(function(c){return c.time<=t;})); drawVP(); }
 
-// keep every sub-pane's time axis locked to the price chart
-price.timeScale().subscribeVisibleTimeRangeChange(r=>{
-  if(!r)return; for(const k in subs){try{subs[k].timeScale().setVisibleRange(r);}catch(e){}}
-  drawVP();
-});
-
-// ── helpers ─────────────────────────────────────────────────────────
-const upto=(arr,t)=>arr?arr.filter(p=>p.time<=t):[];
-function sliceAll(t){
-  const I=S.data.indicators;
-  candle.setData(S.data.candles.filter(c=>c.time<=t));
-  volS.setData(upto(S.data.volume,t));
-  ovS.ema9.setData(S.ov.ema?upto(I.ema["9"],t):[]);
-  ovS.ema20.setData(S.ov.ema?upto(I.ema["20"],t):[]);
-  ovS.ema50.setData(S.ov.ema?upto(I.ema["50"],t):[]);
-  ovS.bbU.setData(S.ov.bb?upto(I.bb.upper,t):[]);
-  ovS.bbM.setData(S.ov.bb?upto(I.bb.mid,t):[]);
-  ovS.bbL.setData(S.ov.bb?upto(I.bb.lower,t):[]);
-  ovS.vwap.setData(S.ov.vwap?upto(I.vwap,t):[]);
-  macdLine.setData(upto(I.macd.macd,t)); macdSig.setData(upto(I.macd.signal,t));
-  macdHist.setData(upto(I.macd.hist,t));
-  rsiS.setData(upto(I.rsi,t));
-  stoK.setData(upto(I.stoch.k,t)); stoD.setData(upto(I.stoch.d,t));
-  adxA.setData(upto(I.adx.adx,t)); adxP.setData(upto(I.adx.plus,t)); adxM.setData(upto(I.adx.minus,t));
-  obvS.setData(upto(I.obv,t));
-  drawVP();
-}
-
-// ── Volume Profile (client-side, over the revealed window) ───────────
 function drawVP(){
   const cv=$("vpcanvas"),ctx=cv.getContext("2d");
-  const ph=$("price").clientHeight; cv.height=ph; cv.style.width="160px";
+  cv.height=$("price").clientHeight; cv.style.width="170px";
   ctx.clearRect(0,0,cv.width,cv.height);
-  vpLines.forEach(l=>{try{candle.removePriceLine(l)}catch(e){}}); vpLines=[];
-  if(!S.data||!S.ov.vprofile)return;
+  vpLines.forEach(function(l){try{candle.removePriceLine(l)}catch(e){}}); vpLines=[];
+  if(!S.data||!S.data.candles.length)return;
   const t=S.data.candles[S.idx]?S.data.candles[S.idx].time:1e18;
-  const cs=S.data.candles.filter(c=>c.time<=t);
+  const cs=S.data.candles.filter(function(c){return c.time<=t;});
   if(cs.length<2)return;
-  const vols=S.data.volume.filter(v=>v.time<=t);
-  const vmap={}; vols.forEach(v=>vmap[v.time]=v.value);
-  let lo=Infinity,hi=-Infinity; cs.forEach(c=>{lo=Math.min(lo,c.low);hi=Math.max(hi,c.high)});
+  const vmap={}; (S.data.volume||[]).forEach(function(v){vmap[v.time]=v.value;});
+  let lo=Infinity,hi=-Infinity; cs.forEach(function(c){lo=Math.min(lo,c.low);hi=Math.max(hi,c.high);});
   if(!(hi>lo))return;
-  const N=48,bins=new Array(N).fill(0),step=(hi-lo)/N;
-  cs.forEach(c=>{const b=Math.min(N-1,Math.floor((c.close-lo)/step));bins[b]+=(vmap[c.time]||0)});
-  const max=Math.max(...bins)||1; let pocB=bins.indexOf(max);
-  // value area = 70% of volume around POC
-  const tot=bins.reduce((a,b)=>a+b,0); let lo_i=pocB,hi_i=pocB,acc=bins[pocB];
+  const N=+$("bins").value,bins=new Array(N).fill(0),step=(hi-lo)/N;
+  cs.forEach(function(c){const b=Math.min(N-1,Math.floor((c.close-lo)/step));bins[b]+=(vmap[c.time]||0);});
+  const max=Math.max.apply(null,bins)||1, pocB=bins.indexOf(max);
+  const tot=bins.reduce(function(a,b){return a+b;},0); let lo_i=pocB,hi_i=pocB,acc=bins[pocB];
   while(acc<0.7*tot&&(lo_i>0||hi_i<N-1)){
     const dn=lo_i>0?bins[lo_i-1]:-1, up=hi_i<N-1?bins[hi_i+1]:-1;
-    if(up>=dn){hi_i++;acc+=bins[hi_i]}else{lo_i--;acc+=bins[lo_i]}}
-  const y=p=>{const c=candle.priceToCoordinate(p);return c==null?null:c;};
+    if(up>=dn){hi_i++;acc+=bins[hi_i];}else{lo_i--;acc+=bins[lo_i];}}
+  const y=function(p){const c=candle.priceToCoordinate(p);return c==null?null:c;};
   for(let i=0;i<N;i++){
     const p0=lo+i*step,p1=p0+step,y0=y(p1),y1=y(p0); if(y0==null||y1==null)continue;
-    const w=(bins[i]/max)*150;
-    ctx.fillStyle=(i>=lo_i&&i<=hi_i)?"#22d3ee33":"#5b677a22";
+    const w=(bins[i]/max)*158;
+    ctx.fillStyle=(i>=lo_i&&i<=hi_i)?"#22d3ee3a":"#5b677a22";
     ctx.fillRect(cv.width-w,y0,w,Math.max(1,y1-y0));
   }
   const poc=lo+(pocB+0.5)*step, vah=lo+(hi_i+1)*step, val=lo+lo_i*step;
@@ -366,78 +279,55 @@ function drawVP(){
   vpLines.push(candle.createPriceLine({price:val,color:"#22d3ee66",lineStyle:2,lineWidth:1,title:"VAL"}));
 }
 
-// ── load + render ───────────────────────────────────────────────────
 async function load(){
   const exp=$("expiry").value, k=$("strike").value, d=$("date").value;
   if(!exp||!k)return;
-  setStatus(false,"loading…");
-  const u=api(`/api/series?expiry=${exp}&strike=${k}&type=${S.type}&date=${d}&interval=${S.tf}`);
+  setStatus(false,"loading...");
+  const u=api("/api/series?expiry="+exp+"&strike="+k+"&type="+S.type+"&date="+d+"&interval="+S.tf);
   let j; try{j=await(await fetch(u)).json();}catch(e){setStatus(false,"fetch error");return;}
   S.data=j; S.idx=(j.candles.length||1)-1;
-  $("title").textContent=`${j.symbol||""} · ${j.n||0} bars`;
+  $("title").textContent=(j.symbol||"")+" - "+(j.n||0)+" bars";
   $("scrub").max=Math.max(0,(j.candles.length||1)-1); $("scrub").value=S.idx;
-  if(!j.candles||!j.candles.length){setStatus(false,"no data for this contract/day");
-    candle.setData([]); return;}
-  sliceAll(j.candles[S.idx].time);
+  if(!j.candles||!j.candles.length){setStatus(false,"no data for this contract/day");candle.setData([]);return;}
+  render(j.candles[S.idx].time);
   price.timeScale().fitContent();
-  S.live=j.live; setStatus(j.live&&!S.replayActive(),j.asof?("live · "+j.asof):"loaded");
+  S.live=j.live; setStatus(j.live,j.asof?("live - "+j.asof):"loaded");
 }
-S.replayActive=()=>S.playing||(+$("scrub").value < (S.data?S.data.candles.length-1:0));
-
 function setStatus(live,txt){$("status").querySelector(".dot").className="dot"+(live?" live":"");
   $("status-txt").textContent=txt||"";}
 
-// ── replay ──────────────────────────────────────────────────────────
-function step(){
-  if(!S.data)return;
+function step(){ if(!S.data)return;
   if(S.idx>=S.data.candles.length-1){pause();return;}
-  S.idx++; $("scrub").value=S.idx; sliceAll(S.data.candles[S.idx].time);
-}
-function playPause(){S.playing?pause():play();}
+  S.idx++; $("scrub").value=S.idx; render(S.data.candles[S.idx].time); }
 function play(){if(!S.data)return; stopLive(); S.playing=true; $("play").textContent="⏸";
-  setStatus(false,"replay");
-  S.timer=setInterval(step,+$("speed").value);}
+  setStatus(false,"replay"); S.timer=setInterval(step,+$("speed").value);}
 function pause(){S.playing=false; $("play").textContent="▶"; clearInterval(S.timer);}
 
-// ── live polling ────────────────────────────────────────────────────
 function startLive(){stopLive(); if($("date").value!==S.today)return;
-  S.liveTimer=setInterval(async()=>{
-    if(S.playing)return;
-    await load();
-  },20000);}
+  S.liveTimer=setInterval(function(){if(!S.playing)load();},20000);}
 function stopLive(){clearInterval(S.liveTimer);}
 
-// ── wire-up ─────────────────────────────────────────────────────────
-function seg(id,attr,fn){[...$(id).children].forEach(b=>b.onclick=()=>{
-  [...$(id).children].forEach(x=>x.classList.remove("on")); b.classList.add("on");
-  fn(b.dataset[attr]);});}
-seg("cepe","t",t=>{S.type=t;load();});
-seg("ivl","i",i=>{S.tf=i;load();});
-$("overlays").querySelectorAll("[data-ov]").forEach(b=>b.onclick=()=>{
-  const k=b.dataset.ov; S.ov[k]=!S.ov[k]; b.classList.toggle("on",S.ov[k]);
-  if(S.data)sliceAll(S.data.candles[S.idx].time);});
-$("overlays").querySelectorAll("[data-pane]").forEach(b=>b.onclick=()=>{
-  const k=b.dataset.pane; S.panes[k]=!S.panes[k]; b.classList.toggle("on",S.panes[k]);
-  $("p-"+k).style.display=S.panes[k]?"block":"none";});
-$("scrub").oninput=e=>{pause(); S.idx=+e.target.value;
-  if(S.data)sliceAll(S.data.candles[S.idx].time); setStatus(false,"replay @ "+S.idx);};
-$("play").onclick=playPause;
-$("speed").onchange=()=>{if(S.playing){pause();play();}};
+function seg(id,attr,fn){[].slice.call($(id).children).forEach(function(b){b.onclick=function(){
+  [].slice.call($(id).children).forEach(function(x){x.classList.remove("on");}); b.classList.add("on"); fn(b.dataset[attr]);};});}
+seg("cepe","t",function(t){S.type=t;load();});
+seg("ivl","i",function(i){S.tf=i;load();});
+$("bins").onchange=drawVP;
+$("scrub").oninput=function(e){pause(); S.idx=+e.target.value;
+  if(S.data)render(S.data.candles[S.idx].time); setStatus(false,"replay @ "+S.idx);};
+$("play").onclick=function(){S.playing?pause():play();};
+$("speed").onchange=function(){if(S.playing){pause();play();}};
 $("expiry").onchange=load; $("strike").onchange=load;
-$("date").onchange=()=>{pause(); if($("date").value===S.today)startLive(); else stopLive(); load();};
-$("live-btn").onclick=()=>{$("date").value=S.today; pause(); startLive(); load();};
+$("date").onchange=function(){pause(); if($("date").value===S.today)startLive(); else stopLive(); load();};
+$("live-btn").onclick=function(){$("date").value=S.today; pause(); startLive(); load();};
 
-// initial visibility of panes
-for(const k in S.panes)$("p-"+k).style.display=S.panes[k]?"block":"none";
-
-// ── boot ────────────────────────────────────────────────────────────
 (async function(){
   const m=await(await fetch(api("/api/meta"))).json();
-  S.today=m.today;
-  $("date").value=m.today;
-  $("expiry").innerHTML=m.expiries.map(e=>`<option>${e}</option>`).join("");
-  $("strike").innerHTML=m.strikes.map(s=>`<option ${s===m.atm?"selected":""}>${s}</option>`).join("");
+  S.today=m.today; $("date").value=m.today;
+  $("expiry").innerHTML=m.expiries.map(function(e){return "<option>"+e+"</option>";}).join("");
+  $("strike").innerHTML=m.strikes.map(function(s){return "<option "+(s===m.atm?"selected":"")+">"+s+"</option>";}).join("");
   await load(); startLive();
 })();
 </script>
 </body></html>"""
+
+

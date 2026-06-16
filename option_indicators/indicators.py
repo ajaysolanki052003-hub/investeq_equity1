@@ -139,7 +139,6 @@ def volume_bars(df):
 def compute_all(df):
     """Bundle every indicator series for one contract's OHLCV frame."""
     return {
-        "ema":   {"9": ema(df, 9), "20": ema(df, 20), "50": ema(df, 50)},
         "bb":    bollinger(df),
         "vwap":  vwap(df),
         "macd":  macd(df),
