@@ -1090,9 +1090,9 @@ HTML = """<!doctype html>
   <button class="btn" id="fit-all">FIT ALL</button>
   <!-- Hidden by request — kept in DOM so JS handlers and state continue to work; un-hide here to restore. -->
   <button class="btn" id="oi-toggle"   style="display:none;" title="ATM·OI">ATM·OI</button>
-  <button class="btn" id="cum-toggle"  style="display:none;" title="Σ·10">Σ·10</button>
+  <button class="btn" id="cum-toggle"  title="Σ·10 rolling-window OI cross (last 10 bars of TF). Green ● = PE rolling-sum crosses above CE; red ● = mirror.">Σ·10 ✕</button>
   <button class="btn" id="chg-toggle"  style="display:none;" title="ΔOI">ΔOI</button>
-  <button class="btn" id="tot-toggle"  style="display:none;" title="ΣOI">ΣOI</button>
+  <button class="btn" id="tot-toggle"  title="ΣOI cumulative-since-09:15 OI cross. Green ● = PE cumulative crosses above CE; red ● = mirror.">ΣOI ✕</button>
   <button class="btn" id="strat-toggle" style="display:none;" title="STRATEGY">STRATEGY</button>
   <button class="btn" id="sig5-toggle"  style="display:none;" title="Σ·10 ENTRY">Σ·10 ENTRY</button>
   <button class="btn" id="sigt-toggle"  style="display:none;" title="ΣOI ENTRY">ΣOI ENTRY</button>
@@ -1191,7 +1191,8 @@ HTML = """<!doctype html>
     <div id="cum-label" class="hidden">
       ATM±1 OI · Σ(<b id="cum-win">10</b>) &nbsp;·&nbsp;
       <span class="ce">CE <b id="cum-ce-val">—</b></span> &nbsp;·&nbsp;
-      <span class="pe">PE <b id="cum-pe-val">—</b></span>
+      <span class="pe">PE <b id="cum-pe-val">—</b></span> &nbsp;·&nbsp;
+      <b id="cum-xcount">—</b> ✕
     </div>
   </div>
   <div id="chg-resizer" class="hidden" title="Drag to resize ΔOI pane (8% – 35%)"></div>
@@ -1507,9 +1508,13 @@ function setupChart() {
       syncing = false;
     });
   };
-  for (const src of allCharts) {
-    propagate(src, allCharts.filter(c => c !== src));
-  }
+  // ONE-WAY sync: the main candle chart is the master; every sub-pane
+  // follows it. Bidirectional sync (every chart driving every other) let a
+  // sub-pane with a shorter history CLAMP the master's visible range and
+  // echo it back — so dragging the candle chart left past the OI data's
+  // start (2020) snapped it forward and you couldn't pan into older
+  // history. The panes are pure followers; they never drive the master.
+  propagate(state.chart, allCharts.filter(c => c !== state.chart));
 
   // Re-render markers when the visible range changes, throttled via rAF
   // so it runs at most once per frame even if the user pans fast. Covers
@@ -1704,7 +1709,8 @@ function applyAllMarkers() {
       const isTrail = tr.reason === 'TRAIL';
       const entryColor = isTrail ? '#fbbf24'
                        : win     ? '#22c55e' : '#ef4444';
-      const exitColor  = tr.reason === 'TGT'   ? '#16a34a'
+      const exitColor  = _isLiveOpen(tr)       ? '#3b82f6'   // OPEN (live)
+                       : tr.reason === 'TGT'   ? '#16a34a'
                        : tr.reason === 'SL'    ? '#b91c1c'
                        : tr.reason === 'TRAIL' ? '#fbbf24'
                        :                          '#9ca3af';   // EOD
@@ -1723,7 +1729,7 @@ function applyAllMarkers() {
           time: exitT,
           position: tr.side === 'LONG' ? 'aboveBar' : 'belowBar',
           color: exitColor, shape: 'circle',
-          text: `${tr.reason} ${sign}${pnl}`, size: 1,
+          text: `${_displayReason(tr)} ${sign}${pnl}`, size: 1,
         });
       }
     }
@@ -1828,12 +1834,24 @@ function showTradeLevels(tr) {
 // A trade that hasn't resolved yet (today, reason still EOD = walked to
 // the latest bar without hitting a level) keeps its levels on screen
 // permanently so the live SL is always visible.
+function _todayIST() {
+  return new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
+}
+// True when a trade is TODAY's still-unresolved position: the backend walks
+// an open trade to the latest bar and stamps reason="EOD" (it can't know
+// it's "open" until the session ends), so an EOD trade dated today is in
+// fact live — label it OPEN, not EOD.
+function _isLiveOpen(tr) {
+  return !!tr && tr.reason === 'EOD' && _day(tr.day) === _todayIST();
+}
+function _displayReason(tr) {
+  return _isLiveOpen(tr) ? 'OPEN' : tr.reason;
+}
 function _openLiveTrade() {
   const trs = (state.bt.trades || []);
   if (!trs.length) return null;
   const tr = trs[trs.length - 1];
-  const todayIST = new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
-  return (tr.reason === 'EOD' && _day(tr.day) === todayIST) ? tr : null;
+  return _isLiveOpen(tr) ? tr : null;
 }
 
 function renderTradeTooltip(tip, trades, pt) {
@@ -1845,7 +1863,8 @@ function renderTradeTooltip(tip, trades, pt) {
   const tgt_px = tr.side === 'LONG' ? tr.entry_spot * (1 + tgt/100) : tr.entry_spot * (1 - tgt/100);
   const sign   = tr.pnl_pts >= 0 ? '+' : '';
   const pnlCol = isWin ? '#22c55e' : '#ef4444';
-  const reasonCol = tr.reason === 'TGT'   ? '#22c55e'
+  const reasonCol = _isLiveOpen(tr)       ? '#3b82f6'
+                  : tr.reason === 'TGT'   ? '#22c55e'
                   : tr.reason === 'SL'    ? '#ef4444'
                   : tr.reason === 'TRAIL' ? '#fbbf24'
                   :                          '#9ca3af';
@@ -1866,10 +1885,10 @@ function renderTradeTooltip(tip, trades, pt) {
       ${td('Entry',  `<b>${_f(tr.entry_spot)}</b> @ ${_hhmm(tr.entry_time)}`)}
       ${td('SL',     `${_f(sl_px)}  (-${sl}%)`, '#ef4444')}
       ${td('Target', `${_f(tgt_px)}  (+${tgt}%)`, '#22c55e')}
-      ${td('Exit',   `<b>${_f(tr.exit_spot)}</b> @ ${_hhmm(tr.exit_time)} · <span style="color:${reasonCol}">${tr.reason}</span>`)}
+      ${td(_isLiveOpen(tr) ? 'Now' : 'Exit', `<b>${_f(tr.exit_spot)}</b> @ ${_hhmm(tr.exit_time)} · <span style="color:${reasonCol}">${_displayReason(tr)}</span>`)}
     </table>
     <div style="margin-top:6px; padding-top:6px; border-top:1px solid #2b3142;">
-      <span style="color:#7b8294;">P&amp;L:</span>
+      <span style="color:#7b8294;">${_isLiveOpen(tr) ? 'Unrealized P&amp;L:' : 'P&amp;L:'}</span>
       <b style="color:${pnlCol}; font-size:13px;">${sign}${_f(tr.pnl_pts, 1)} pts</b>
       <span style="color:${pnlCol}; margin-left:6px;">(${sign}${_f(tr.pnl_pct)}%)</span>
     </div>
@@ -2276,6 +2295,7 @@ async function loadCum(tf) {
     state.peCumBars = state.cumByTf[tf].pe;
     state.ceCumLine.setData(state.ceCumBars);
     state.peCumLine.setData(state.peCumBars);
+    state.peCumLine.setMarkers(findCrossoverMarkers(state.ceCumBars, state.peCumBars));
     syncCumToIndex();
     return;
   }
@@ -2288,6 +2308,12 @@ async function loadCum(tf) {
     state.cumByTf[tf] = { ce: state.ceCumBars, pe: state.peCumBars };
     state.ceCumLine.setData(state.ceCumBars);
     state.peCumLine.setData(state.peCumBars);
+    // Crossover markers — green ● where PE rolling-sum crosses above CE,
+    // red ● where CE crosses above PE. Same treatment as the ΣOI pane;
+    // attached to the PE line so the dots ride on top of the lines.
+    const xMarkers = findCrossoverMarkers(state.ceCumBars, state.peCumBars);
+    state.peCumLine.setMarkers(xMarkers);
+    $("cum-xcount").textContent = xMarkers.length.toLocaleString();
     if (state.ceCumBars.length) {
       const last = state.ceCumBars[state.ceCumBars.length - 1];
       $("cum-ce-val").textContent = (last.value/1e5).toFixed(2) + " L";
