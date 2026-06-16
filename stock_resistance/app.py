@@ -190,14 +190,20 @@ function applyResistance(){
   $("title").textContent=drawn+" resistance level(s) on this window  ("+vis.length+" bars)";
 }
 
-function clearMarks(){ S.marks.forEach(function(s){try{chart.removeSeries(s)}catch(e){}}); S.marks=[]; }
+function clearMarks(){ S.marks.forEach(function(s){try{chart.removeSeries(s)}catch(e){}}); S.marks=[];
+  $("apply").classList.remove("on"); $("apply").textContent="⬛ Apply Resistance"; }
 
 // ── wire-up ──────────────────────────────────────────────────────────
 [].slice.call($("tf").children).forEach(function(b){b.onclick=function(){
   [].slice.call($("tf").children).forEach(function(x){x.classList.remove("on")});
   b.classList.add("on"); S.tf=b.dataset.tf; load();};});
 $("sym").addEventListener("change",load);
-$("apply").onclick=applyResistance;
+// Toggle: 1st click draws resistance for the visible window, 2nd click removes.
+$("apply").onclick=function(){
+  if(S.marks.length){ clearMarks(); $("title").textContent="resistance removed"; return; }
+  applyResistance();
+  if(S.marks.length){ $("apply").classList.add("on"); $("apply").textContent="✕ Remove Resistance"; }
+};
 $("clear").onclick=function(){clearMarks(); $("title").textContent="cleared";};
 
 // ── boot ─────────────────────────────────────────────────────────────
