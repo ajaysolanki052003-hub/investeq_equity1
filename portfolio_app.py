@@ -177,6 +177,23 @@ PROJECTS = [
         "metrics": [],
         "accent": "#fb7185",
     },
+    {
+        "id": "option-indicator-lab",
+        "name": "Option Indicator Lab",
+        "instrument": "NIFTY · options",
+        "tag": "LIVE",
+        "category": "OPTIONS",
+        "thesis": "Watch the popular indicators (Volume Profile, MACD, RSI, VWAP, "
+                  "Bollinger, EMA stack, ADX, Stochastic, OBV) evolve on any option "
+                  "contract's premium — live during market hours, or replay any past "
+                  "session by scrubbing its 1-minute bars.",
+        "stack": [],
+        "port": 8708,
+        "url": "/optlab/",
+        "path": "",
+        "metrics": [],
+        "accent": "#22d3ee",
+    },
 ]
 
 
