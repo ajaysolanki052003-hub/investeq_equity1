@@ -194,6 +194,23 @@ PROJECTS = [
         "metrics": [],
         "accent": "#22d3ee",
     },
+    {
+        "id": "resistance-marker",
+        "name": "Resistance Marker",
+        "instrument": "Equities",
+        "tag": "TOOL",
+        "category": "EQUITIES",
+        "thesis": "Load any NIFTY-500 stock, scroll/zoom to a window, and hit "
+                  "Apply Resistance — swing-high pivot zones are computed from "
+                  "only the candles on screen and drawn as horizontal levels on "
+                  "that window.",
+        "stack": [],
+        "port": 8709,
+        "url": "/resistance/",
+        "path": "",
+        "metrics": [],
+        "accent": "#f59e0b",
+    },
 ]
 
 
