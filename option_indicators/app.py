@@ -194,7 +194,7 @@ button.on{background:linear-gradient(135deg,#22d3ee,#0891b2);color:#04141a;borde
 #title{font-weight:700;font-size:13px;color:var(--muted);margin-left:auto}
 .charts{height:calc(100vh - 56px)}
 #price{height:100%;position:relative}
-#vpcanvas{position:absolute;top:0;right:0;height:100%;pointer-events:none;z-index:5}
+#vpcanvas{position:absolute;top:0;left:0;height:100%;pointer-events:none;z-index:5}
 #status{color:var(--muted);font-size:11px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;margin-right:5px;vertical-align:middle}
 .dot.live{background:#22c55e;box-shadow:0 0 6px #22c55e}
@@ -224,7 +224,7 @@ button.on{background:linear-gradient(135deg,#22d3ee,#0891b2);color:#04141a;borde
   <span id="title"></span>
 </div>
 
-<div class="charts"><div id="price"><canvas id="vpcanvas" width="170"></canvas></div></div>
+<div class="charts"><div id="price"><canvas id="vpcanvas" width="200"></canvas></div></div>
 
 <script>
 const APP_BASE="__APP_BASE__";
@@ -245,11 +245,12 @@ let vpLines=[];
 
 price.timeScale().subscribeVisibleTimeRangeChange(function(){drawVP();});
 
-function render(t){ candle.setData(S.data.candles.filter(function(c){return c.time<=t;})); drawVP(); }
+function render(t){ candle.setData(S.data.candles.filter(function(c){return c.time<=t;}));
+  drawVP(); requestAnimationFrame(drawVP); }
 
 function drawVP(){
   const cv=$("vpcanvas"),ctx=cv.getContext("2d");
-  cv.height=$("price").clientHeight; cv.style.width="170px";
+  cv.height=$("price").clientHeight; cv.style.width="200px";
   ctx.clearRect(0,0,cv.width,cv.height);
   vpLines.forEach(function(l){try{candle.removePriceLine(l)}catch(e){}}); vpLines=[];
   if(!S.data||!S.data.candles.length)return;
@@ -269,9 +270,12 @@ function drawVP(){
   const y=function(p){const c=candle.priceToCoordinate(p);return c==null?null:c;};
   for(let i=0;i<N;i++){
     const p0=lo+i*step,p1=p0+step,y0=y(p1),y1=y(p0); if(y0==null||y1==null)continue;
-    const w=(bins[i]/max)*158;
-    ctx.fillStyle=(i>=lo_i&&i<=hi_i)?"#22d3ee3a":"#5b677a22";
-    ctx.fillRect(cv.width-w,y0,w,Math.max(1,y1-y0));
+    const w=(bins[i]/max)*188;
+    // POC bin brightest, value-area bins solid cyan, the rest a muted slate —
+    // left-anchored solid horizontal volume bars (extend right from x=0).
+    ctx.fillStyle = i===pocB ? "#22d3eecc"
+                  : (i>=lo_i&&i<=hi_i) ? "#22d3ee88" : "#64748b77";
+    ctx.fillRect(0,y0,w,Math.max(1,(y1-y0)-1));
   }
   const poc=lo+(pocB+0.5)*step, vah=lo+(hi_i+1)*step, val=lo+lo_i*step;
   vpLines.push(candle.createPriceLine({price:poc,color:"#22d3ee",lineWidth:2,title:"POC"}));
@@ -312,6 +316,7 @@ function seg(id,attr,fn){[].slice.call($(id).children).forEach(function(b){b.onc
 seg("cepe","t",function(t){S.type=t;load();});
 seg("ivl","i",function(i){S.tf=i;load();});
 $("bins").onchange=drawVP;
+window.addEventListener("resize",function(){requestAnimationFrame(drawVP);});
 $("scrub").oninput=function(e){pause(); S.idx=+e.target.value;
   if(S.data)render(S.data.candles[S.idx].time); setStatus(false,"replay @ "+S.idx);};
 $("play").onclick=function(){S.playing?pause():play();};
