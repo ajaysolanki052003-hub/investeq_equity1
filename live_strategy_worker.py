@@ -41,6 +41,9 @@ import requests
 sys.path.insert(0, str(Path(__file__).parent / "ema_scanner"))
 from groww_client import get_access_token, fetch_candles  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).parent))
+import strategy_telegram  # noqa: E402  — Strategy Suite OI-cross Telegram alerts
+
 ROOT = Path(os.environ.get(
     "INVESTEQ_DATA",
     r"C:\Users\User\Desktop\investeq_ajs\DATA"
@@ -304,6 +307,7 @@ def seconds_to_next_open(t: datetime) -> float:
 
 def run() -> None:
     g = Groww()
+    strategy_telegram._startup_creds_check(log)
     threading.Thread(target=ltp_tick_loop, args=(g,), daemon=True).start()
     symmap: dict[str, str] = {}
     scale = 1.0
@@ -354,6 +358,12 @@ def run() -> None:
                     log(f"tick {ts:%H:%M} spot={spot:.1f} atm={atm} "
                         f"ce={ce_sum:,.0f} pe={pe_sum:,.0f} "
                         f"(master->{str(last)[11:16] if last is not None else '?'})")
+                    # Fire Telegram alerts for any fresh Strategy Suite signal
+                    # the just-appended OI row produced. Non-fatal by design.
+                    try:
+                        strategy_telegram.maybe_alert(today, log=log)
+                    except Exception as e:
+                        log(f"telegram alert error: {e!r}")
                 else:
                     log(f"skip OI append — only {got}/3 strikes in chain")
             else:
