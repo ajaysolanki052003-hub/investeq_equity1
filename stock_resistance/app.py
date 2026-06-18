@@ -38,22 +38,49 @@ def _symbols() -> list[str]:
     return sorted(os.path.basename(f).replace("_historical.csv", "") for f in files)
 
 
+def _resample_30m(bars: list[dict]) -> list[dict]:
+    """Build 30m bars from 15m: pair consecutive 15m bars within each trading
+    day (day = timestamp // 86400, since times are naive-IST-as-UTC)."""
+    out: list[dict] = []
+    day = None
+    idx = 0
+    cur = None
+    for b in bars:
+        d = b["time"] // 86400
+        if d != day:
+            day, idx = d, 0
+        if idx % 2 == 0:
+            cur = {"time": b["time"], "open": b["open"], "high": b["high"],
+                   "low": b["low"], "close": b["close"], "volume": b["volume"]}
+            out.append(cur)
+        else:
+            cur["high"] = max(cur["high"], b["high"])
+            cur["low"] = min(cur["low"], b["low"])
+            cur["close"] = b["close"]
+            cur["volume"] += b["volume"]
+        idx += 1
+    return out
+
+
 def _candles(sym: str, tf: str) -> list[dict]:
-    if tf not in ("1d", "1h"):
-        raise HTTPException(400, "tf must be 1d or 1h")
-    path = DATA_DIR / tf / f"{sym}_historical.csv"
+    if tf not in ("1d", "1h", "30m", "15m"):
+        raise HTTPException(400, "tf must be 1d, 1h, 30m or 15m")
+    src_tf = "15m" if tf == "30m" else tf      # 30m is resampled from 15m
+    path = DATA_DIR / src_tf / f"{sym}_historical.csv"
     if not path.exists():
         raise HTTPException(404, f"no data for {sym} ({tf})")
     mt = path.stat().st_mtime
     hit = _cache.get((sym, tf))
     if hit and hit[0] == mt:
         return hit[1]
-    df = pd.read_csv(path, usecols=["timestamp", "open", "high", "low", "close"])
-    df = df.dropna().sort_values("timestamp")
-    out = [{"time": int(t), "open": float(o), "high": float(h),
-            "low": float(l), "close": float(c)}
-           for t, o, h, l, c in zip(df["timestamp"], df["open"], df["high"],
-                                    df["low"], df["close"])]
+    df = pd.read_csv(path, usecols=["timestamp", "open", "high", "low", "close", "volume"])
+    df = df.dropna(subset=["timestamp", "open", "high", "low", "close"]).sort_values("timestamp")
+    df["volume"] = df["volume"].fillna(0.0)
+    base = [{"time": int(t), "open": float(o), "high": float(h),
+             "low": float(l), "close": float(c), "volume": float(v)}
+            for t, o, h, l, c, v in zip(df["timestamp"], df["open"], df["high"],
+                                        df["low"], df["close"], df["volume"])]
+    out = _resample_30m(base) if tf == "30m" else base
     _cache[(sym, tf)] = (mt, out)
     return out
 
@@ -62,7 +89,7 @@ def _candles(sym: str, tf: str) -> list[dict]:
 def meta():
     syms = _symbols()
     default = "RELIANCE" if "RELIANCE" in syms else (syms[0] if syms else "")
-    return {"symbols": syms, "timeframes": ["1d", "1h"], "default": default}
+    return {"symbols": syms, "timeframes": ["1d", "1h", "30m", "15m"], "default": default}
 
 
 @app.get("/api/candles")
@@ -108,12 +135,14 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
 <div id="bar">
   <span class="tag">RESISTANCE MARKER</span>
   <span><label>Stock</label><select id="sym" style="width:160px"></select></span>
-  <span class="seg" id="tf"><button data-tf="1d" class="on">Daily</button><button data-tf="1h">Hourly</button></span>
+  <span class="seg" id="tf"><button data-tf="1d" class="on">Daily</button><button data-tf="1h">Hourly</button><button data-tf="30m">30m</button><button data-tf="15m">15m</button></span>
   <span><label>Pivot</label><select id="k"><option selected>8</option><option>13</option><option>21</option></select></span>
   <span><label>Min touches</label><select id="touch"><option selected>1</option><option>2</option><option>3</option></select></span>
   <button id="apply">⬛ Apply Resistance</button>
+  <button id="setups">🎯 Find Setups</button>
+  <button id="vwap">VWAP</button>
   <button id="clear">Clear</button>
-  <span class="hint">scroll/zoom to a window, then Apply — marks only the visible screen</span>
+  <span class="hint">Apply = current unbroken resistance (visible window) · Find Setups = scans the FULL chart for levels tested ≥2× with price within 3%, then boxes ① dip→VWAP-reclaim · ② held higher-lows above VWAP · ③ riding flat/up VWAP (closes above)</span>
   <span id="title"></span>
 </div>
 
@@ -124,7 +153,8 @@ const APP_BASE="__APP_BASE__";
 const api=function(p){return (APP_BASE||"")+p;};
 const $=function(id){return document.getElementById(id);};
 
-const S={candles:[], tf:"1d", marks:[]};
+const S={candles:[], tf:"1d", zones:[], setups:[]};  // zones=resistance blocks · setups=scenario boxes
+let vwapOn=false, vwapSeries=null;
 
 const chart=LightweightCharts.createChart($("chart"),{autoSize:true,
   layout:{background:{color:"#0b0d11"},textColor:"#cfd6e4"},
@@ -133,6 +163,81 @@ const chart=LightweightCharts.createChart($("chart"),{autoSize:true,
   rightPriceScale:{borderColor:"#222838"},crosshair:{mode:0}});
 const candle=chart.addCandlestickSeries({upColor:"#26a69a",downColor:"#ef5350",
   borderUpColor:"#26a69a",borderDownColor:"#ef5350",wickUpColor:"#26a69a",wickDownColor:"#ef5350"});
+
+// ── overlay canvas: resistance is drawn as shaded BLOCKS, not lines ──
+$("chart").style.position="relative";
+const ov=document.createElement("canvas");
+ov.style.cssText="position:absolute;left:0;top:0;pointer-events:none;z-index:2;";
+$("chart").appendChild(ov);
+
+function drawBlocks(){
+  const w=$("chart").clientWidth, h=$("chart").clientHeight;
+  const dpr=window.devicePixelRatio||1;
+  if(ov.width!==w*dpr||ov.height!==h*dpr){ ov.width=w*dpr; ov.height=h*dpr; ov.style.width=w+"px"; ov.style.height=h+"px"; }
+  const ctx=ov.getContext("2d");
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  if(!S.zones.length && !S.setups.length) return;
+  const ts=chart.timeScale();
+  S.zones.forEach(function(z){
+    const y=candle.priceToCoordinate(z.top);   // line at the cluster's top (the ceiling)
+    if(y==null) return;
+    let x0=ts.timeToCoordinate(z.fromTime);     // where the level first formed
+    if(x0==null||x0<0) x0=0;
+    // end the line at the LAST test, not the right edge — don't extend to full
+    let lastT=z.fromTime;
+    if(z.touches){ z.touches.forEach(function(p){ if(p.time>lastT) lastT=p.time; }); }
+    let x1=ts.timeToCoordinate(lastT);
+    if(x1==null||x1>w) x1=w;
+    if(x1<=x0) return;
+    const strong=z.n>=3, mid=z.n===2;
+    const stroke = strong?"#f59e0b":(mid?"#fbbf24":"#fcd34d");
+    ctx.strokeStyle=stroke; ctx.lineWidth=strong?3:(mid?2:1.5);
+    ctx.beginPath(); ctx.moveTo(x0,y); ctx.lineTo(x1,y); ctx.stroke();
+    ctx.fillStyle=stroke; ctx.font="600 11px system-ui,Segoe UI,sans-serif";
+    ctx.textBaseline="bottom"; ctx.textAlign="left";
+    ctx.fillText(z.n+"× touch", x1+5, y-3);
+    // multi-touch: mark each contributing peak with a dot at its exact high
+    if(z.n>=2 && z.touches){
+      z.touches.forEach(function(p){
+        const px=ts.timeToCoordinate(p.time), py=candle.priceToCoordinate(p.value);
+        if(px==null||py==null) return;
+        ctx.beginPath(); ctx.arc(px,py,4.5,0,2*Math.PI);
+        ctx.fillStyle=stroke; ctx.fill();
+        ctx.lineWidth=1.5; ctx.strokeStyle="#0b0d11"; ctx.stroke();
+      });
+    }
+  });
+  // ── scenario boxes: highlight WHERE the bullish setup conditions were met ──
+  S.setups.forEach(function(b){
+    let x0=ts.timeToCoordinate(b.x0), x1=ts.timeToCoordinate(b.x1);
+    const yT=candle.priceToCoordinate(b.yTop), yB=candle.priceToCoordinate(b.yBottom);
+    if(x0==null||x1==null||yT==null||yB==null) return;
+    if(x0<0)x0=0; if(x1>w)x1=w;
+    const col = b.kind===1 ? "#22d3ee" : (b.kind===3 ? "#34d399" : "#a78bfa");  // ① cyan · ② violet · ③ green
+    ctx.save();
+    ctx.fillStyle = b.kind===1 ? "rgba(34,211,238,0.10)" : (b.kind===3 ? "rgba(52,211,153,0.10)" : "rgba(167,139,250,0.10)");
+    ctx.fillRect(x0, yT, x1-x0, yB-yT);
+    ctx.strokeStyle=col; ctx.lineWidth=1.5; ctx.setLineDash([5,3]);
+    ctx.strokeRect(x0, yT, x1-x0, yB-yT); ctx.setLineDash([]);
+    ctx.fillStyle=col; ctx.font="700 11px system-ui,Segoe UI,sans-serif";
+    ctx.textBaseline="top"; ctx.textAlign="left";
+    ctx.fillText(b.label, x0+5, yT+4);
+    (b.pts||[]).forEach(function(p){
+      const px=ts.timeToCoordinate(p.time), py=candle.priceToCoordinate(p.value);
+      if(px==null||py==null) return;
+      if(p.star){   // reclaim candle — point of interest, drawn as an up-triangle
+        ctx.beginPath(); ctx.moveTo(px,py-10); ctx.lineTo(px-6,py+3); ctx.lineTo(px+6,py+3); ctx.closePath();
+        ctx.fillStyle=col; ctx.fill(); ctx.lineWidth=1.2; ctx.strokeStyle="#0b0d11"; ctx.stroke();
+      } else {      // a held swing low
+        ctx.beginPath(); ctx.arc(px,py,3.5,0,2*Math.PI);
+        ctx.fillStyle=col; ctx.fill(); ctx.lineWidth=1.2; ctx.strokeStyle="#0b0d11"; ctx.stroke();
+      }
+    });
+    ctx.restore();
+  });
+}
+(function loop(){ drawBlocks(); requestAnimationFrame(loop); })();
 
 // ── load candles for a symbol/tf ─────────────────────────────────────
 async function load(){
@@ -144,8 +249,216 @@ async function load(){
   if(j.error||!j.candles||!j.candles.length){$("title").textContent=sym+": no data";candle.setData([]);return;}
   S.candles=j.candles;
   candle.setData(S.candles);
-  chart.timeScale().fitContent();
+  // Daily: fit the full history. Intraday (1h/30m/15m): thousands of bars, so
+  // fitContent looks fully compressed — default to the most recent ~200 bars.
+  if(S.tf!=="1d"){
+    const n=S.candles.length;
+    chart.timeScale().setVisibleLogicalRange({from:Math.max(0,n-200), to:n-1+6});
+  } else {
+    chart.timeScale().fitContent();
+  }
+  drawVWAP();
   $("title").textContent=sym+" · "+S.tf+" · "+S.candles.length+" bars";
+}
+
+// ── VWAP: typical price (H+L+C)/3 weighted by volume. Resets each trading
+//    day on Hourly (intraday session VWAP); cumulative anchor on Daily. ──
+function computeVWAP(candles, resetDaily){
+  const out=[]; let pv=0, vv=0, curDay=null;
+  for(let i=0;i<candles.length;i++){
+    const c=candles[i], day=Math.floor(c.time/86400);
+    if(resetDaily && day!==curDay){ pv=0; vv=0; curDay=day; }
+    const tp=(c.high+c.low+c.close)/3, v=c.volume||0;
+    pv+=tp*v; vv+=v;
+    out.push({time:c.time, value: vv>0 ? pv/vv : tp});
+  }
+  return out;
+}
+
+function drawVWAP(){
+  if(vwapSeries){ try{chart.removeSeries(vwapSeries)}catch(e){} vwapSeries=null; }
+  if(!vwapOn || !S.candles.length) return;
+  vwapSeries=chart.addLineSeries({color:"#a855f7", lineWidth:2, lineStyle:0,
+    priceLineVisible:false, lastValueVisible:true, crosshairMarkerVisible:false, title:"VWAP"});
+  vwapSeries.setData(computeVWAP(S.candles, S.tf!=="1d"));
+}
+
+// VWAP values aligned to a visible slice (uses the same full-history/daily-reset
+// series that is drawn, so detection matches what the eye sees on the chart).
+function visVwap(vis){
+  const full=computeVWAP(S.candles, S.tf!=="1d");
+  const off=S.candles.indexOf(vis[0]);
+  return vis.map(function(c,i){ const w=full[off+i]; return w?w.value:(c.high+c.low+c.close)/3; });
+}
+
+// ── cluster swing-high pivots into resistance zones ────────────────────
+// Base collecting tolerance scales with the timeframe (1d 1.6% / 1h 0.8% /
+// 30m·15m 0.35%). Two refinements:
+//  • ADAPTIVE %: once a level has 2 touches that sit close together, the
+//    collecting band shrinks proportionally (down to TOL/4) so a far-away pivot
+//    can't widen an already-tight resistance.
+//  • MIN GAP: two touches must be ≥12 candles apart in time — a pivot too close
+//    to an existing touch is the same swing, so it's ignored (not a new test).
+function clusterPivots(piv, tf){
+  piv.sort(function(a,b){return a.price-b.price;});
+  const TOL = tf==="1d" ? 0.016 : (tf==="1h" ? 0.008 : 0.0035);
+  const MINTOL=TOL*0.25, MINBARS=12;
+  const zones=[];
+  for(let i=0;i<piv.length;i++){
+    const z=zones[zones.length-1];
+    if(z){
+      let effTol=TOL;
+      if(z.n>=2){ const sr=(z.top-z.bottom)/z.avg; effTol=Math.min(TOL, Math.max(MINTOL, sr*1.5)); }
+      if(Math.abs(piv[i].price-z.avg)<=z.avg*effTol){
+        // too close in time to an existing touch → same swing, ignore it
+        if(z.pts.some(function(p){return Math.abs(piv[i].i-p.i)<MINBARS;})) continue;
+        z.sum+=piv[i].price; z.n++; z.avg=z.sum/z.n;
+        z.top=Math.max(z.top,piv[i].price); z.bottom=Math.min(z.bottom,piv[i].price);
+        z.firstIdx=Math.min(z.firstIdx,piv[i].i); z.pts.push(piv[i]);
+        continue;
+      }
+    }
+    zones.push({sum:piv[i].price, n:1, avg:piv[i].price,
+                top:piv[i].price, bottom:piv[i].price, firstIdx:piv[i].i, pts:[piv[i]]});
+  }
+  return zones;
+}
+
+// ── scenario detection for ONE resistance level, scanning the PAST ──────
+// Returns 0..N boxes. The "price within 3% of the resistance" rule is applied
+// HISTORICALLY — at each setup's formation point in the past — NOT against the
+// latest price. A level is active from its first test until a close decisively
+// breaks above it; setups are only sought inside that active window.
+//   ① after a test, price dips (any depth) while VWAP is flat, then a candle
+//      closes back above VWAP → that reclaim candle is the point of interest.
+//   ② between tests the lower-lows don't break, price hugs within 3% under the
+//      level, and SOME (not all) candles close above VWAP.
+function detectScenario(vis, vw, z){
+  const out=[], n=vis.length, PROX=0.03, BREAK=0.0015;
+  const level=z.avg, top=z.top, lo=level*(1-PROX);   // "within 3% under the level" floor
+  const touches=z.pts.map(function(p){return p.i;}).sort(function(a,b){return a-b;});
+  const firstTouch=touches[0], lastTouch=touches[touches.length-1];
+  const secondTouch=touches[1];   // resistance is "established" only after the 2nd test
+  let brkIdx=n;                                       // first bar that closes above the level
+  for(let j=firstTouch+1;j<n;j++){ if(vis[j].close>top*(1+BREAK)){ brkIdx=j; break; } }
+  // Skip role-reversal levels: the level was CROSSED (a close above it) and price
+  // later RETURNED to re-test it. A genuine setup is on resistance that was never
+  // broken before the test — so if any test happens after the break, drop the level.
+  if(lastTouch > brkIdx) return out;
+
+  // ── ② tests held: higher-lows + mixed closes>VWAP, all hugging within 3% ──
+  (function(){
+    const a=firstTouch, b=Math.min(lastTouch, brkIdx-1);
+    if(b-a<4) return;
+    for(let i=a;i<=b;i++){ if(vis[i].close < lo) return; }   // stayed within 3% of the level
+    const k=Math.max(2, Math.min(5, Math.floor((b-a)/4)));
+    const lows=[];
+    for(let i=a+1;i<b;i++){
+      let isLow=true;
+      for(let j=Math.max(a,i-k);j<=Math.min(b,i+k);j++){ if(vis[j].low<vis[i].low){isLow=false;break;} }
+      if(isLow) lows.push({i:i, low:vis[i].low});
+    }
+    if(lows.length<2) return;
+    for(let i=1;i<lows.length;i++){ if(lows[i].low < lows[i-1].low*(1-0.004)) return; }  // lower-lows held
+    // closes-above-VWAP only count AFTER the 2nd test (resistance established first)
+    let above=0; for(let i=secondTouch;i<=b;i++){ if(vis[i].close>vw[i]) above++; }
+    const tot=b-secondTouch+1;
+    if(!(above>=2 && above<tot && above/tot>=0.25)) return;
+    // box encloses the WHOLE setup: the resistance line (top, padded above) down
+    // to the lowest low, spanning the full test sequence
+    let minLow=Infinity; for(let i=a;i<=b;i++) minLow=Math.min(minLow,vis[i].low);
+    out.push({kind:2, x0:vis[a].time, x1:vis[b].time, yTop:top*(1+0.004), yBottom:minLow*(1-0.002),
+              label:"② tests held · higher-lows + closes>VWAP",
+              pts:lows.map(function(p){return {time:vis[p.i].time, value:p.low};})});
+  })();
+
+  // ── ③ riding the VWAP (AFTER the 2nd test): VWAP flat-to-slightly-up while
+  //    many candles hug/straddle the VWAP line and MOST of them close above it ──
+  (function(){
+    const a=secondTouch, b=Math.min(brkIdx-1, n-1);
+    if(b-a<5) return;
+    for(let i=a;i<=b;i++){ if(vis[i].close < lo) return; }   // stayed within 3% of the level
+    if(vw[b] < vw[a]*(1-0.001)) return;                      // VWAP not declining (flat or up)
+    let touchCnt=0, above=0;
+    for(let i=a;i<=b;i++){
+      if(vis[i].low<=vw[i] && vis[i].high>=vw[i]) touchCnt++; // candle straddles the VWAP line
+      if(vis[i].close>vw[i]) above++;                         // ...and closes above it
+    }
+    const tot=b-a+1;
+    if(touchCnt < Math.max(3, Math.floor(tot*0.4))) return;  // many candles around the line
+    if(above/tot < 0.5) return;                              // most of them close above VWAP
+    let minLow=Infinity; for(let i=a;i<=b;i++) minLow=Math.min(minLow,vis[i].low);
+    out.push({kind:3, x0:vis[firstTouch].time, x1:vis[b].time, yTop:top*(1+0.004), yBottom:minLow*(1-0.002),
+              label:"③ riding VWAP · flat/up + closes above",
+              pts:[]});
+  })();
+
+  // ── ① dip→flat-VWAP→reclaim — the VWAP-reclaim ENTRY must come AFTER the 2nd
+  //    test of the resistance (proper order: touch1 → touch2 → dip → reclaim) ──
+  let lastR=-1, did1=false;
+  touches.forEach(function(a, ti){
+    if(did1 || ti<1 || a>=brkIdx-1) return;   // ti>=1 → anchor the dip at the 2nd touch onward
+    const W=Math.min(brkIdx-1, n-1, a+40);       // "some candles" ahead, within the active window
+    if(W-a<3) return;
+    let tIdx=a+1, tMin=vis[a+1].close;           // trough = lowest close after the test
+    for(let i=a+1;i<=W;i++){ if(vis[i].close<tMin){tMin=vis[i].close; tIdx=i;} }
+    if(!(tMin < vis[a].close)) return;           // price actually dipped (any depth)
+    let rIdx=-1;                                 // reclaim = first close back above VWAP
+    for(let i=tIdx+1;i<=W;i++){ if(vis[i].close>vw[i]){ rIdx=i; break; } }
+    if(rIdx<0) return;
+    if(Math.abs(vw[rIdx]-vw[a])/vw[a] > 0.006) return;   // VWAP flat through the dip
+    if(rIdx<=lastR) return;
+    lastR=rIdx; did1=true;
+    // box from the level's FIRST test through the reclaim (and at least to the last
+    // test) so the resistance line and the whole dip→reclaim are inside the box
+    const left=firstTouch, right=Math.max(rIdx, lastTouch);
+    let minLow=Infinity; for(let i=left;i<=right;i++) minLow=Math.min(minLow,vis[i].low);
+    out.push({kind:1, x0:vis[left].time, x1:vis[right].time, yTop:top*(1+0.004), yBottom:minLow*(1-0.002),
+              label:"① dip · flat VWAP · reclaim ↑",
+              pts:[{time:vis[rIdx].time, value:vis[rIdx].close, star:true}]});
+  });
+
+  return out;
+}
+
+// ── Find Setups: enforce the two MANDATORY conditions, then box scenarios ──
+function detectSetups(){
+  if(S.setups.length){ clearMarks(); $("title").textContent="setups cleared"; return; }
+  if(!S.candles.length) return;
+  const vis=S.candles;                       // FULL chart history — not just the visible window
+  if(vis.length<10){$("title").textContent="not enough bars on this chart";return;}
+  chart.timeScale().fitContent();            // show the whole chart so every setup is in view
+  const k=+$("k").value;
+  const vw=visVwap(vis);
+  // swing-high pivots → clustered zones (same recipe as Apply Resistance)
+  const piv=[];
+  for(let i=k;i<vis.length-k;i++){
+    let isHigh=true;
+    for(let j=i-k;j<=i+k;j++){ if(vis[j].high>vis[i].high){isHigh=false;break;} }
+    if(isHigh) piv.push({i:i, price:vis[i].high});
+  }
+  const zones=clusterPivots(piv, S.tf);
+  // MANDATORY: tested >=2 times. The "price within 3% of the resistance" rule is
+  // checked HISTORICALLY inside detectScenario, at each setup's formation point in
+  // the past — NOT against today's price. A level is shown only if it produced >=1
+  // past setup (scenario ① OR ②).
+  S.zones=[]; S.setups=[];
+  zones.forEach(function(z){
+    if(z.n<2) return;
+    const found=detectScenario(vis,vw,z);
+    if(!found.length) return;
+    found.forEach(function(s){S.setups.push(s);});
+    S.zones.push({top:z.top, bottom:z.bottom, n:z.n, fromTime:vis[z.firstIdx].time,
+                  touches: z.pts.map(function(p){return {time:vis[p.i].time, value:p.price};})});
+  });
+  if(!S.setups.length){$("title").textContent="no past setups on this chart (≥2-tested level + price within 3% + scenario ① or ②)";return;}
+  drawBlocks();
+  const s1=S.setups.filter(function(s){return s.kind===1;}).length;
+  const s2=S.setups.filter(function(s){return s.kind===2;}).length;
+  const s3=S.setups.filter(function(s){return s.kind===3;}).length;
+  $("setups").classList.add("on"); $("setups").textContent="✕ Clear Setups";
+  $("title").textContent = "full chart · "+S.zones.length+" level(s) · "+S.setups.length+" past setup(s)  ["
+                         + s1+" ① reclaim / "+s2+" ② held / "+s3+" ③ riding VWAP]";
 }
 
 // ── resistance on the VISIBLE window only ────────────────────────────
@@ -156,42 +469,43 @@ function applyResistance(){
   const vis=S.candles.filter(function(c){return c.time>=r.from && c.time<=r.to;});
   if(vis.length<5){$("title").textContent="zoom out a little — too few bars on screen";return;}
   const k=+$("k").value, minTouch=+$("touch").value;
-  // 1) swing-high pivots: high[i] is the max within +/- k bars
+  const BREAK=0.0015;  // a close >0.15% above a level counts as a break (level invalidated)
+  // 1) swing-high pivots: high[i] is the max within +/- k bars (keep bar index)
   const piv=[];
   for(let i=k;i<vis.length-k;i++){
     let isHigh=true;
     for(let j=i-k;j<=i+k;j++){ if(vis[j].high>vis[i].high){isHigh=false;break;} }
-    if(isHigh) piv.push(vis[i].high);
+    if(isHigh) piv.push({i:i, price:vis[i].high});
   }
   if(!piv.length){$("title").textContent="no swing highs in this window";return;}
-  // 2) cluster nearby pivots into zones (within 0.6% of the running average)
-  piv.sort(function(a,b){return a-b;});
-  const TOL=0.006, zones=[];
-  for(let i=0;i<piv.length;i++){
-    const z=zones[zones.length-1];
-    if(z && Math.abs(piv[i]-z.avg)<=z.avg*TOL){ z.sum+=piv[i]; z.n++; z.avg=z.sum/z.n; }
-    else zones.push({sum:piv[i], n:1, avg:piv[i]});
-  }
-  // 3) keep zones with >= minTouch pivots; draw a segment across the visible window
-  const t0=vis[0].time, t1=vis[vis.length-1].time;
-  const kept=zones.filter(function(z){return z.n>=minTouch;}).sort(function(a,b){return b.n-a.n;});
-  let drawn=0;
-  kept.forEach(function(z){
-    const strong=z.n>=3, mid=z.n===2;
-    const seg=chart.addLineSeries({
-      color: strong?"#f59e0b":(mid?"#fbbf24":"#fcd34d"),
-      lineWidth: strong?3:(mid?2:1), lineStyle:0,
-      priceLineVisible:false, lastValueVisible:true, crosshairMarkerVisible:false,
-      title: z.n+"×",
-    });
-    seg.setData([{time:t0,value:z.avg},{time:t1,value:z.avg}]);
-    S.marks.push(seg); drawn++;
+  // 2) cluster nearby pivots into zones (shared recipe: timeframe-scaled tolerance
+  //    that tightens for close touches, and a ≥12-candle min gap between touches).
+  const zones=clusterPivots(piv, S.tf);
+  // 3) CURRENT resistance only: tested >= minTouch AND still intact — a level the
+  //    price later CLOSED above (broke) is no longer resistance, so drop it.
+  const t1=vis[vis.length-1].time;
+  const kept=[];
+  zones.forEach(function(z){
+    if(z.n<minTouch) return;
+    const brk=z.top*(1+BREAK);   // broken only when price closes above the cluster's top peak
+    let broken=false;
+    for(let j=z.firstIdx+1;j<vis.length;j++){ if(vis[j].close>brk){broken=true;break;} }
+    if(!broken) kept.push(z);
   });
-  $("title").textContent=drawn+" resistance level(s) on this window  ("+vis.length+" bars)";
+  if(!kept.length){$("title").textContent="no intact resistance overhead in this window (price near its high)";return;}
+  kept.sort(function(a,b){return b.n-a.n;});
+  // store as blocks (band = lowest..highest peak of the cluster), drawn on the overlay
+  S.zones=kept.map(function(z){
+    return {top:z.top, bottom:z.bottom, n:z.n, fromTime:vis[z.firstIdx].time,
+            touches: z.pts.map(function(p){return {time:vis[p.i].time, value:p.price};})};
+  });
+  drawBlocks();
+  $("title").textContent=S.zones.length+" current resistance line(s) · tested & unbroken  ("+vis.length+" bars)";
 }
 
-function clearMarks(){ S.marks.forEach(function(s){try{chart.removeSeries(s)}catch(e){}}); S.marks=[];
-  $("apply").classList.remove("on"); $("apply").textContent="⬛ Apply Resistance"; }
+function clearMarks(){ S.zones=[]; S.setups=[]; drawBlocks();
+  $("apply").classList.remove("on"); $("apply").textContent="⬛ Apply Resistance";
+  $("setups").classList.remove("on"); $("setups").textContent="🎯 Find Setups"; }
 
 // ── wire-up ──────────────────────────────────────────────────────────
 [].slice.call($("tf").children).forEach(function(b){b.onclick=function(){
@@ -200,10 +514,13 @@ function clearMarks(){ S.marks.forEach(function(s){try{chart.removeSeries(s)}cat
 $("sym").addEventListener("change",load);
 // Toggle: 1st click draws resistance for the visible window, 2nd click removes.
 $("apply").onclick=function(){
-  if(S.marks.length){ clearMarks(); $("title").textContent="resistance removed"; return; }
+  if(S.zones.length){ clearMarks(); $("title").textContent="resistance removed"; return; }
   applyResistance();
-  if(S.marks.length){ $("apply").classList.add("on"); $("apply").textContent="✕ Remove Resistance"; }
+  if(S.zones.length){ $("apply").classList.add("on"); $("apply").textContent="✕ Remove Resistance"; }
 };
+$("setups").onclick=function(){ detectSetups(); };
+$("vwap").onclick=function(){ vwapOn=!vwapOn; $("vwap").classList.toggle("on",vwapOn); drawVWAP();
+  $("title").textContent="VWAP "+(vwapOn?("on · "+(S.tf==="1d"?"cumulative anchor":"daily-session reset")):"off"); };
 $("clear").onclick=function(){clearMarks(); $("title").textContent="cleared";};
 
 // ── boot ─────────────────────────────────────────────────────────────
