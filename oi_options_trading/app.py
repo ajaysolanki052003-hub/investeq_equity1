@@ -194,7 +194,15 @@ def nifty(tf: str = Query("1d"),
 def _load_oi_intraday_v(v: int) -> pd.DataFrame:
     if not OI_INTRA.exists():
         return pd.DataFrame()
-    df = pd.read_parquet(OI_INTRA)
+    try:
+        df = pd.read_parquet(OI_INTRA)
+    except Exception as e:
+        # A torn/corrupt parquet (e.g. a write interrupted by a worker restart)
+        # must NOT 500 every OI endpoint and blank the chart — degrade to empty
+        # and recover automatically on the next good write (mtime changes the key).
+        import sys
+        print(f"[strategy] OI intraday read failed: {e!r}", file=sys.stderr)
+        return pd.DataFrame()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     return df.sort_values("timestamp").reset_index(drop=True)
 
@@ -446,7 +454,16 @@ def _entries_live(kind: str, tf: str = "1m", window: int = 10,
                 _HIST_ENTRIES_CACHE[fp] = res
     hist_entries, stats = _HIST_ENTRIES_CACHE[fp]
 
-    live_entries = _compute(live)[0] if len(live) else []
+    # Today's slice is recomputed live and can be thin/odd (e.g. only a handful of
+    # OI rows after a mid-session worker restart). A failure here must NEVER blank
+    # out the cached HISTORICAL trades — show past trades regardless.
+    try:
+        live_entries = _compute(live)[0] if len(live) else []
+    except Exception as e:
+        import sys
+        print(f"[strategy] today's entries compute failed (showing history only): {e!r}",
+              file=sys.stderr)
+        live_entries = []
     return list(hist_entries) + live_entries, stats
 
 

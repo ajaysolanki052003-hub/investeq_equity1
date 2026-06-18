@@ -329,8 +329,14 @@ def run() -> None:
             if not symmap:
                 symmap = load_symbol_map()
 
-            # 1. index bars
-            last = update_master(g.token)
+            # 1. index bars — isolated so an index-fetch hiccup (e.g. an inverted
+            #    "start must be < end" window) can NEVER skip the per-minute OI
+            #    snapshot below, which is what the Strategy Suite trades need.
+            try:
+                last = update_master(g.token)
+            except Exception as e:
+                last = None
+                log(f"master update skipped: {e!r}")
 
             # 2. live OI snapshot — one option-chain call covers spot LTP +
             #    per-strike OI for every leg we need.
