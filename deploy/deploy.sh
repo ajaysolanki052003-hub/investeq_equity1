@@ -75,6 +75,13 @@ EXCLUDES=(
     --exclude='./NEW_FOLDER'
     --exclude='./DATA/README.md'
     --exclude='./_regen_straddle_pnl.py'
+    # VM-AUTHORITATIVE LIVE DATA — never ship local copies, they are stale and
+    # would clobber data the VM generates (OI aggregate, 1m index master, per-day
+    # OI, instruments dump, and the candle CSVs the timers keep current). This
+    # bit us 2026-06-18: a stale local _atm_oi_intraday.parquet overwrote the VM's
+    # fresh file via the tar fallback (no rsync --update), wiping 7 weeks of OI.
+    --exclude='./DATA'
+    --exclude='./ema_scanner/data'
 )
 
 if (( USE_RSYNC )); then
