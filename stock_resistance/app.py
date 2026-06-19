@@ -130,6 +130,16 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
 .charts{height:calc(100vh - 56px)}
 #chart{height:100%}
 .hint{color:var(--muted);font-size:11px}
+#logic{position:absolute;right:14px;top:54px;z-index:9;width:430px;max-width:calc(100vw - 28px);
+  background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:14px 16px;
+  box-shadow:0 12px 40px rgba(0,0,0,.55);display:none;font-size:12px;line-height:1.55}
+#logic.on{display:block}
+#logic h4{margin:0 0 6px;font-size:12px;letter-spacing:.4px;color:var(--accent)}
+#logic ol{margin:4px 0 10px;padding-left:18px}#logic li{margin:2px 0}
+#logic .cat{display:flex;gap:8px;align-items:flex-start;margin:5px 0}
+#logic .sw{flex:0 0 12px;height:12px;border-radius:3px;margin-top:3px}
+#logic .muted{color:var(--muted)}
+#logic code{background:#161b27;padding:1px 5px;border-radius:4px;color:#cfd6e4}
 </style></head><body>
 
 <div id="bar">
@@ -142,8 +152,28 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
   <button id="setups">🎯 Find Setups</button>
   <button id="vwap">VWAP</button>
   <button id="clear">Clear</button>
-  <span class="hint">Apply = current unbroken resistance (visible window) · Find Setups = scans the FULL chart for levels tested ≥2× with price within 3%, then boxes ① dip→VWAP-reclaim · ② held higher-lows above VWAP · ③ riding flat/up VWAP (closes above)</span>
+  <button id="info">ℹ Logic</button>
+  <span class="hint">Apply = current resistance (intact; one false breakout tolerated if rejected ≥3×) · Find Setups = scans the FULL chart for levels tested ≥2× where price holds BELOW resistance, closes HUG a flat VWAP for ≥5 candles, then a GREEN candle lifts off above the VWAP</span>
   <span id="title"></span>
+</div>
+
+<div id="logic">
+  <h4>HOW FIND SETUPS WORKS</h4>
+  <div class="muted">Scans the FULL chart history (the past), per resistance level.</div>
+  <b>The setup — hug the flat VWAP, then GREEN lift-off, UNDER resistance:</b>
+  <ol>
+    <li>Level <b>tested ≥ 2×</b> (price rejected there — the resistance "takes it back"). <i>One <b>false breakout</b> — a poke above that returns below — is tolerated if the level rejected <b>≥ 3×</b>.</i></li>
+    <li>Price <b>HOLDS BELOW</b> the resistance up to any sustained break (the lone false breakout aside).</li>
+    <li>For <b>≥ 5 candles the closes HUG the VWAP</b> — each close within <code>0.4%</code> of the line (price sits on the VWAP).</li>
+    <li>The <b>VWAP is flat / slight-slope</b> across that hug (within <code>±0.4%</code>).</li>
+    <li><b>Trigger:</b> the next candle is <b>GREEN</b> (close &gt; open) and <b>closes clearly ABOVE the VWAP</b> — the lift-off off the line — still below the resistance.</li>
+  </ol>
+  <div class="cat"><span class="sw" style="background:#34d399"></span><span>The <b>bold green line</b> inside each box is the <b>flat VWAP segment</b> threading through the hug and lift-off — drawn over the thin blue VWAP. The <b>▲ triangle</b> marks the green lift-off candle (the entry).</span></div>
+  <div class="cat" style="margin-top:6px"><span class="sw" style="background:#ef4444"></span><span>Each setup draws <b>two boxes</b>: the <b>green outer box</b> = the FULL setup (first test → lift-off, incl. the resistance line), and the <b>red dotted inner box</b> = just the <b>VWAP-logic region</b> (the hug → lift-off).</span></div>
+  <div class="muted" style="margin-top:9px">
+    The label shows the <code>VWAP slope</code> across the hug and how many
+    <code>candles</code> hugged the line before the lift-off.
+  </div>
 </div>
 
 <div class="charts"><div id="chart"></div></div>
@@ -213,6 +243,7 @@ function drawBlocks(){
     let x0=ts.timeToCoordinate(b.x0), x1=ts.timeToCoordinate(b.x1);
     const yT=candle.priceToCoordinate(b.yTop), yB=candle.priceToCoordinate(b.yBottom);
     if(x0==null||x1==null||yT==null||yB==null) return;
+    if((x0<0&&x1<0) || (x0>w&&x1>w)) return;   // entirely outside the view → don't clutter the edge
     if(x0<0)x0=0; if(x1>w)x1=w;
     const col = b.kind===1 ? "#22d3ee" : (b.kind===3 ? "#34d399" : "#a78bfa");  // ① cyan · ② violet · ③ green
     ctx.save();
@@ -220,9 +251,39 @@ function drawBlocks(){
     ctx.fillRect(x0, yT, x1-x0, yB-yT);
     ctx.strokeStyle=col; ctx.lineWidth=1.5; ctx.setLineDash([5,3]);
     ctx.strokeRect(x0, yT, x1-x0, yB-yT); ctx.setLineDash([]);
+    // ── highlight the JUDGED VWAP segment (2nd test → re-approach): a bold,
+    //    box-coloured polyline over the plain blue VWAP so you can SEE the
+    //    slope/hug the category was decided on ──
+    if(b.vwPts && b.vwPts.length>1){
+      ctx.beginPath(); let started=false;
+      b.vwPts.forEach(function(p){
+        const px=ts.timeToCoordinate(p.time), py=candle.priceToCoordinate(p.value);
+        if(px==null||py==null) return;
+        if(!started){ ctx.moveTo(px,py); started=true; } else ctx.lineTo(px,py);
+      });
+      ctx.strokeStyle=col; ctx.lineWidth=3; ctx.globalAlpha=0.9; ctx.stroke(); ctx.globalAlpha=1;
+    }
+    // INNER box — the VWAP-logic region only (hug → lift-off), drawn in amber so it
+    // stands out from the green full-setup box
+    if(b.inner){
+      let ix0=ts.timeToCoordinate(b.inner.x0), ix1=ts.timeToCoordinate(b.inner.x1);
+      const iyT=candle.priceToCoordinate(b.inner.yTop), iyB=candle.priceToCoordinate(b.inner.yBottom);
+      if(ix0!=null&&ix1!=null&&iyT!=null&&iyB!=null){
+        if(ix0<0)ix0=0; if(ix1>w)ix1=w;
+        ctx.fillStyle="rgba(239,68,68,0.10)";
+        ctx.fillRect(ix0, iyT, ix1-ix0, iyB-iyT);
+        ctx.strokeStyle="#ef4444"; ctx.lineWidth=1.4; ctx.setLineDash([2,2]);
+        ctx.strokeRect(ix0, iyT, ix1-ix0, iyB-iyT); ctx.setLineDash([]);
+        ctx.fillStyle="#ef4444"; ctx.font="600 9px system-ui,Segoe UI,sans-serif";
+        ctx.textBaseline="bottom"; ctx.textAlign="left";
+        ctx.fillText("VWAP logic", ix0+3, iyB-2);
+      }
+    }
+    // label + the measured stats behind the category
+    const stat = "  (VWAP "+(b.slope>=0?"+":"")+b.slope+"% · hug "+b.nCand+" candles → lift-off)";
     ctx.fillStyle=col; ctx.font="700 11px system-ui,Segoe UI,sans-serif";
     ctx.textBaseline="top"; ctx.textAlign="left";
-    ctx.fillText(b.label, x0+5, yT+4);
+    ctx.fillText(b.label+stat, x0+5, yT+4);
     (b.pts||[]).forEach(function(p){
       const px=ts.timeToCoordinate(p.time), py=candle.priceToCoordinate(p.value);
       if(px==null||py==null) return;
@@ -324,126 +385,118 @@ function clusterPivots(piv, tf){
   return zones;
 }
 
-// ── scenario detection for ONE resistance level, scanning the PAST ──────
-// Returns 0..N boxes. The "price within 3% of the resistance" rule is applied
-// HISTORICALLY — at each setup's formation point in the past — NOT against the
-// latest price. A level is active from its first test until a close decisively
-// breaks above it; setups are only sought inside that active window.
-//   ① after a test, price dips (any depth) while VWAP is flat, then a candle
-//      closes back above VWAP → that reclaim candle is the point of interest.
-//   ② between tests the lower-lows don't break, price hugs within 3% under the
-//      level, and SOME (not all) candles close above VWAP.
+// ── classify how a level was broken, TOLERATING ONE false breakout ──────
+// A "false breakout" is a close above the level that later RETURNS below it (a
+// bullish candle pokes through then price comes back and keeps rejecting). We
+// allow at most one. Returns {falseBreaks, terminal} where `terminal` is the
+// index of the first SUSTAINED (real) break — i.e. price closed above and never
+// came back — or vis.length if the level was never sustainably broken.
+function levelBreaks(vis, top, fromIdx){
+  const BREAK=0.0015, up=top*(1+BREAK), n=vis.length;
+  let above=false, breakStart=-1, falseBreaks=0;
+  for(let j=fromIdx+1;j<n;j++){
+    if(!above && vis[j].close>up){ above=true; breakStart=j; }     // poked above the level
+    else if(above && vis[j].close<top){ above=false; falseBreaks++; } // came back under → that break was FALSE
+  }
+  return {falseBreaks:falseBreaks, terminal: above ? breakStart : n};
+}
+
+// ── setup detection for ONE resistance level, scanning the PAST ─────────
+// Returns 0 or 1 box. A level is active from its first test until a close
+// decisively breaks above it; the setup is only sought inside that window.
+//
+// THE setup (single definition) — hug-the-flat-VWAP, then GREEN lift-off, UNDER resistance:
+//   • the level is tested >= 2 times (price rejected there — "resistance takes it back"), then
+//   • price HOLDS BELOW the resistance (never closes above the level), and
+//   • for >= 5 candles the closes HUG the VWAP (sit on the line) while the VWAP is
+//     FLAT/slight-slope — price and VWAP coil together, then
+//   • the next candle is a GREEN candle that closes CLEARLY ABOVE the VWAP — the
+//     lift-off off the line — still below the resistance. That is the trigger.
 function detectScenario(vis, vw, z){
-  const out=[], n=vis.length, PROX=0.03, BREAK=0.0015;
-  const level=z.avg, top=z.top, lo=level*(1-PROX);   // "within 3% under the level" floor
+  const out=[], n=vis.length, BREAK=0.0015;
+  const HUG=0.004;    // a close within 0.4% of the VWAP = "sitting on the line"
+  const FLAT=0.004;   // VWAP slope across the hug must stay within +/-0.4% (flat/slight)
+  const MINHUG=5;     // ...for at least 5 candles
+  const top=z.top;
   const touches=z.pts.map(function(p){return p.i;}).sort(function(a,b){return a-b;});
-  const firstTouch=touches[0], lastTouch=touches[touches.length-1];
-  const secondTouch=touches[1];   // resistance is "established" only after the 2nd test
-  let brkIdx=n;                                       // first bar that closes above the level
-  for(let j=firstTouch+1;j<n;j++){ if(vis[j].close>top*(1+BREAK)){ brkIdx=j; break; } }
-  // Skip role-reversal levels: the level was CROSSED (a close above it) and price
-  // later RETURNED to re-test it. A genuine setup is on resistance that was never
-  // broken before the test — so if any test happens after the break, drop the level.
+  if(touches.length<2) return out;                   // MANDATORY: tested >= 2 times
+  const firstTouch=touches[0], secondTouch=touches[1], lastTouch=touches[touches.length-1];
+  // Break handling, tolerating ONE false breakout (a poke above that returns below):
+  //   • qualifies for tolerance when there's <=1 false breakout AND (none, or >=3
+  //     rejections) → the active window extends PAST the lone false breakout to the
+  //     first SUSTAINED (real) break, so re-rejections after the poke still count.
+  //   • otherwise (>1 poke, or 1 poke with <3 rejections) → fall back to the strict
+  //     ceiling at the FIRST close above (old behaviour) — pre-breakout setups kept.
+  const bk=levelBreaks(vis, top, firstTouch);
+  let brkIdx;
+  if(bk.falseBreaks<=1 && (bk.falseBreaks===0 || touches.length>=3)){
+    brkIdx=bk.terminal;
+  } else {
+    brkIdx=n;
+    for(let j=firstTouch+1;j<n;j++){ if(vis[j].close>top*(1+BREAK)){ brkIdx=j; break; } }
+  }
+  // a touch after the (effective) break = role-reversal → drop
   if(lastTouch > brkIdx) return out;
 
-  // ── ② tests held: higher-lows + mixed closes>VWAP, all hugging within 3% ──
-  (function(){
-    const a=firstTouch, b=Math.min(lastTouch, brkIdx-1);
-    if(b-a<4) return;
-    for(let i=a;i<=b;i++){ if(vis[i].close < lo) return; }   // stayed within 3% of the level
-    const k=Math.max(2, Math.min(5, Math.floor((b-a)/4)));
-    const lows=[];
-    for(let i=a+1;i<b;i++){
-      let isLow=true;
-      for(let j=Math.max(a,i-k);j<=Math.min(b,i+k);j++){ if(vis[j].low<vis[i].low){isLow=false;break;} }
-      if(isLow) lows.push({i:i, low:vis[i].low});
+  const a=secondTouch;                               // the rejection (2nd test)
+  const cap=Math.min(brkIdx-1, n-1, a+80);           // stay within the active window (below the level)
+  const belowRes=function(i){ return vis[i].close < top*(1+BREAK); };
+
+  // scan for: a run of >=5 closes hugging a flat VWAP, immediately followed by a
+  // GREEN candle that closes clearly above the VWAP (the lift-off). All below resistance.
+  let i=a+1;
+  while(i+MINHUG<=cap){
+    // extend a hug run while closes sit on the line (within HUG) and stay below resistance
+    let h0=i, h1=i-1, j=i;
+    while(j<=cap && belowRes(j) && Math.abs(vis[j].close-vw[j])/vw[j] <= HUG){ h1=j; j++; }
+    const len=h1-h0+1;
+    if(len>=MINHUG){
+      const flat = Math.abs(vw[h1]-vw[h0])/vw[h0] <= FLAT;     // VWAP flat across the hug
+      const L=j;                                               // candle that ended the hug = lift-off candidate
+      if(flat && L<=cap){
+        const c=vis[L];
+        const greenLift = c.close>c.open && c.close > vw[L]*(1+HUG) && belowRes(L);
+        if(greenLift){
+          const slopePct=+(((vw[h1]-vw[h0])/vw[h0])*100).toFixed(2);
+          // OUTER box: the FULL setup — first test through the lift-off, enclosing the resistance line
+          const left=firstTouch, right=L;
+          let minLow=Infinity; for(let k=left;k<=right;k++) minLow=Math.min(minLow,vis[k].low);
+          // INNER box: just the VWAP-logic region — the hug → lift-off, framed tightly
+          let hiH=-Infinity, loL=Infinity;
+          for(let k=h0;k<=L;k++){ hiH=Math.max(hiH,vis[k].high); loL=Math.min(loL,vis[k].low); }
+          // the flat VWAP segment threading through the hug + lift-off
+          const vwPts=[]; for(let k=h0;k<=L;k++) vwPts.push({time:vis[k].time, value:vw[k]});
+          out.push({kind:3, x0:vis[left].time, x1:vis[right].time, li:left, ri:right,
+                    yTop:top*(1+0.004), yBottom:minLow*(1-0.002),
+                    label:"tested ≥2× · hug flat VWAP · green lift-off ↑",
+                    slope:slopePct, nCand:len, vwPts:vwPts,
+                    inner:{x0:vis[h0].time, x1:vis[L].time, yTop:hiH*(1+0.002), yBottom:loL*(1-0.002)},
+                    pts:[{time:vis[L].time, value:vis[L].close, star:true}]});  // lift-off candle (triangle)
+          return out;
+        }
+      }
+      i=h1+1;          // hug found but no valid lift-off — search on from the run's end
+    } else {
+      i++;
     }
-    if(lows.length<2) return;
-    for(let i=1;i<lows.length;i++){ if(lows[i].low < lows[i-1].low*(1-0.004)) return; }  // lower-lows held
-    // closes-above-VWAP only count AFTER the 2nd test (resistance established first)
-    let above=0; for(let i=secondTouch;i<=b;i++){ if(vis[i].close>vw[i]) above++; }
-    const tot=b-secondTouch+1;
-    if(!(above>=2 && above<tot && above/tot>=0.25)) return;
-    // box encloses the WHOLE setup: the resistance line (top, padded above) down
-    // to the lowest low, spanning the full test sequence
-    let minLow=Infinity; for(let i=a;i<=b;i++) minLow=Math.min(minLow,vis[i].low);
-    out.push({kind:2, x0:vis[a].time, x1:vis[b].time, yTop:top*(1+0.004), yBottom:minLow*(1-0.002),
-              label:"② tests held · higher-lows + closes>VWAP",
-              pts:lows.map(function(p){return {time:vis[p.i].time, value:p.low};})});
-  })();
-
-  // ── ③ riding the VWAP (AFTER the 2nd test): VWAP flat-to-slightly-up while
-  //    many candles hug/straddle the VWAP line and MOST of them close above it ──
-  (function(){
-    const a=secondTouch, b=Math.min(brkIdx-1, n-1);
-    if(b-a<5) return;
-    for(let i=a;i<=b;i++){ if(vis[i].close < lo) return; }   // stayed within 3% of the level
-    if(vw[b] < vw[a]*(1-0.001)) return;                      // VWAP not declining (flat or up)
-    let touchCnt=0, above=0;
-    for(let i=a;i<=b;i++){
-      if(vis[i].low<=vw[i] && vis[i].high>=vw[i]) touchCnt++; // candle straddles the VWAP line
-      if(vis[i].close>vw[i]) above++;                         // ...and closes above it
-    }
-    const tot=b-a+1;
-    if(touchCnt < Math.max(3, Math.floor(tot*0.4))) return;  // many candles around the line
-    if(above/tot < 0.5) return;                              // most of them close above VWAP
-    let minLow=Infinity; for(let i=a;i<=b;i++) minLow=Math.min(minLow,vis[i].low);
-    out.push({kind:3, x0:vis[firstTouch].time, x1:vis[b].time, yTop:top*(1+0.004), yBottom:minLow*(1-0.002),
-              label:"③ riding VWAP · flat/up + closes above",
-              pts:[]});
-  })();
-
-  // ── ① dip→flat-VWAP→reclaim — the VWAP-reclaim ENTRY must come AFTER the 2nd
-  //    test of the resistance (proper order: touch1 → touch2 → dip → reclaim) ──
-  let lastR=-1, did1=false;
-  touches.forEach(function(a, ti){
-    if(did1 || ti<1 || a>=brkIdx-1) return;   // ti>=1 → anchor the dip at the 2nd touch onward
-    const W=Math.min(brkIdx-1, n-1, a+40);       // "some candles" ahead, within the active window
-    if(W-a<3) return;
-    let tIdx=a+1, tMin=vis[a+1].close;           // trough = lowest close after the test
-    for(let i=a+1;i<=W;i++){ if(vis[i].close<tMin){tMin=vis[i].close; tIdx=i;} }
-    if(!(tMin < vis[a].close)) return;           // price actually dipped (any depth)
-    let rIdx=-1;                                 // reclaim = first close back above VWAP
-    for(let i=tIdx+1;i<=W;i++){ if(vis[i].close>vw[i]){ rIdx=i; break; } }
-    if(rIdx<0) return;
-    if(Math.abs(vw[rIdx]-vw[a])/vw[a] > 0.006) return;   // VWAP flat through the dip
-    if(rIdx<=lastR) return;
-    lastR=rIdx; did1=true;
-    // box from the level's FIRST test through the reclaim (and at least to the last
-    // test) so the resistance line and the whole dip→reclaim are inside the box
-    const left=firstTouch, right=Math.max(rIdx, lastTouch);
-    let minLow=Infinity; for(let i=left;i<=right;i++) minLow=Math.min(minLow,vis[i].low);
-    out.push({kind:1, x0:vis[left].time, x1:vis[right].time, yTop:top*(1+0.004), yBottom:minLow*(1-0.002),
-              label:"① dip · flat VWAP · reclaim ↑",
-              pts:[{time:vis[rIdx].time, value:vis[rIdx].close, star:true}]});
-  });
-
+  }
   return out;
 }
 
-// ── Find Setups: enforce the two MANDATORY conditions, then box scenarios ──
+// ── Find Setups: scan the FULL chart, box every lift-off setup, zoom to latest ──
 function detectSetups(){
   if(S.setups.length){ clearMarks(); $("title").textContent="setups cleared"; return; }
   if(!S.candles.length) return;
   const vis=S.candles;                       // FULL chart history — not just the visible window
   if(vis.length<10){$("title").textContent="not enough bars on this chart";return;}
-  chart.timeScale().fitContent();            // show the whole chart so every setup is in view
-  const k=+$("k").value;
-  const vw=visVwap(vis);
-  // swing-high pivots → clustered zones (same recipe as Apply Resistance)
-  const piv=[];
+  chart.timeScale().fitContent();
+  const k=+$("k").value, vw=visVwap(vis), piv=[];
   for(let i=k;i<vis.length-k;i++){
-    let isHigh=true;
-    for(let j=i-k;j<=i+k;j++){ if(vis[j].high>vis[i].high){isHigh=false;break;} }
-    if(isHigh) piv.push({i:i, price:vis[i].high});
+    let hi=true; for(let j=i-k;j<=i+k;j++){ if(vis[j].high>vis[i].high){hi=false;break;} }
+    if(hi) piv.push({i:i, price:vis[i].high});
   }
-  const zones=clusterPivots(piv, S.tf);
-  // MANDATORY: tested >=2 times. The "price within 3% of the resistance" rule is
-  // checked HISTORICALLY inside detectScenario, at each setup's formation point in
-  // the past — NOT against today's price. A level is shown only if it produced >=1
-  // past setup (scenario ① OR ②).
   S.zones=[]; S.setups=[];
-  zones.forEach(function(z){
+  clusterPivots(piv, S.tf).forEach(function(z){
     if(z.n<2) return;
     const found=detectScenario(vis,vw,z);
     if(!found.length) return;
@@ -451,14 +504,19 @@ function detectSetups(){
     S.zones.push({top:z.top, bottom:z.bottom, n:z.n, fromTime:vis[z.firstIdx].time,
                   touches: z.pts.map(function(p){return {time:vis[p.i].time, value:p.price};})});
   });
-  if(!S.setups.length){$("title").textContent="no past setups on this chart (≥2-tested level + price within 3% + scenario ① or ②)";return;}
+  if(!S.setups.length){
+    $("title").textContent = S.tf==="1d"
+      ? "no setups on Daily — this VWAP-hug setup needs an INTRADAY timeframe (15m/30m/1h); Daily VWAP is a slow cumulative line price doesn't hug"
+      : "no setups (need ≥2-tested level, closes hugging a flat VWAP below it, then a green lift-off above VWAP)";
+    return;
+  }
+  // zoom to the MOST RECENT setup (older ones stay drawn — scroll left to see them)
+  let last=S.setups[0];
+  S.setups.forEach(function(s){ if(s.ri>last.ri) last=s; });
+  chart.timeScale().setVisibleLogicalRange({from:Math.max(0,last.li-25), to:last.ri+30});
   drawBlocks();
-  const s1=S.setups.filter(function(s){return s.kind===1;}).length;
-  const s2=S.setups.filter(function(s){return s.kind===2;}).length;
-  const s3=S.setups.filter(function(s){return s.kind===3;}).length;
   $("setups").classList.add("on"); $("setups").textContent="✕ Clear Setups";
-  $("title").textContent = "full chart · "+S.zones.length+" level(s) · "+S.setups.length+" past setup(s)  ["
-                         + s1+" ① reclaim / "+s2+" ② held / "+s3+" ③ riding VWAP]";
+  $("title").textContent = S.zones.length+" level(s) · "+S.setups.length+" setup(s) — showing the latest; scroll ← for earlier";
 }
 
 // ── resistance on the VISIBLE window only ────────────────────────────
@@ -469,7 +527,6 @@ function applyResistance(){
   const vis=S.candles.filter(function(c){return c.time>=r.from && c.time<=r.to;});
   if(vis.length<5){$("title").textContent="zoom out a little — too few bars on screen";return;}
   const k=+$("k").value, minTouch=+$("touch").value;
-  const BREAK=0.0015;  // a close >0.15% above a level counts as a break (level invalidated)
   // 1) swing-high pivots: high[i] is the max within +/- k bars (keep bar index)
   const piv=[];
   for(let i=k;i<vis.length-k;i++){
@@ -481,16 +538,15 @@ function applyResistance(){
   // 2) cluster nearby pivots into zones (shared recipe: timeframe-scaled tolerance
   //    that tightens for close touches, and a ≥12-candle min gap between touches).
   const zones=clusterPivots(piv, S.tf);
-  // 3) CURRENT resistance only: tested >= minTouch AND still intact — a level the
-  //    price later CLOSED above (broke) is no longer resistance, so drop it.
-  const t1=vis[vis.length-1].time;
+  // 3) CURRENT resistance only: tested >= minTouch AND still intact. A level the
+  //    price SUSTAINABLY closed above is gone — but we TOLERATE one false breakout
+  //    (a poke above that returns below), provided the level rejected >= 3 times.
   const kept=[];
   zones.forEach(function(z){
     if(z.n<minTouch) return;
-    const brk=z.top*(1+BREAK);   // broken only when price closes above the cluster's top peak
-    let broken=false;
-    for(let j=z.firstIdx+1;j<vis.length;j++){ if(vis[j].close>brk){broken=true;break;} }
-    if(!broken) kept.push(z);
+    const bk=levelBreaks(vis, z.top, z.firstIdx);
+    const intact = bk.terminal>=vis.length && bk.falseBreaks<=1 && (bk.falseBreaks===0 || z.n>=3);
+    if(intact) kept.push(z);
   });
   if(!kept.length){$("title").textContent="no intact resistance overhead in this window (price near its high)";return;}
   kept.sort(function(a,b){return b.n-a.n;});
@@ -522,6 +578,7 @@ $("setups").onclick=function(){ detectSetups(); };
 $("vwap").onclick=function(){ vwapOn=!vwapOn; $("vwap").classList.toggle("on",vwapOn); drawVWAP();
   $("title").textContent="VWAP "+(vwapOn?("on · "+(S.tf==="1d"?"cumulative anchor":"daily-session reset")):"off"); };
 $("clear").onclick=function(){clearMarks(); $("title").textContent="cleared";};
+$("info").onclick=function(){ const on=$("logic").classList.toggle("on"); $("info").classList.toggle("on",on); };
 
 // ── boot ─────────────────────────────────────────────────────────────
 (async function(){
