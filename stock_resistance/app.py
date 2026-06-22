@@ -263,13 +263,13 @@ def _detect_liftoff(cs, vw, z) -> list[dict]:
 _scan_cache: dict[str, tuple] = {}
 
 
-def _scan(tf: str, pivot_k: int, fresh: int) -> list[dict]:
+def _scan(tf: str, pivot_k: int, days: int = 2) -> list[dict]:
     """Run the 🎯 Lift-off detector over the whole universe; keep, per symbol,
-    the FRESHEST setup whose trigger is within `fresh` bars of the last bar.
-    Cached on the max CSV mtime so repeat calls during a quiet minute are free."""
+    the freshest setup whose TRIGGER falls within the last `days` trading days of
+    that symbol's data. Cached on the max CSV mtime so repeat calls are free."""
     src_tf = "15m" if tf == "30m" else tf
     files = glob.glob(str(DATA_DIR / src_tf / "*_historical.csv"))
-    sig = (tf, pivot_k, fresh,
+    sig = (tf, pivot_k, days,
            max((os.path.getmtime(f) for f in files), default=0.0))
     hit = _scan_cache.get("last")
     if hit and hit[0] == sig:
@@ -285,18 +285,22 @@ def _scan(tf: str, pivot_k: int, fresh: int) -> list[dict]:
         if n < 2 * pivot_k + 12 or not zones:
             continue
         vw = arr["vwap"]
-        # A fresh trigger needs ri >= n-1-fresh and ri <= secondTouch + 80 (the
-        # lift-off scan window). So a zone whose 2nd touch is older than that
-        # can't host a fresh hit — skip it before the O(n) break/detector work.
-        thresh = 80 + fresh + 1
+        # First bar index of the trailing `days` trading days = the freshness
+        # window. A trigger qualifies only if ri >= cutoff_idx.
+        daynums = sorted({c["time"] // 86400 for c in cs})
+        cutoff_day = daynums[-days] if len(daynums) >= days else daynums[0]
+        cutoff_idx = next((i for i, c in enumerate(cs)
+                           if c["time"] // 86400 >= cutoff_day), n)
+        # A setup triggers at ri <= secondTouch + 80, so a zone whose 2nd touch
+        # is >80 bars before the window can't host one — skip before the O(n) work.
         for z in zones:
             touches = sorted(p["i"] for p in z["pts"])
-            if (n - 1) - touches[1] > thresh:        # 2nd touch too old → no fresh setup possible
+            if touches[1] < cutoff_idx - 80:
                 continue
             for st in _detect_liftoff(cs, vw, z):
-                bars_ago = (n - 1) - st["ri"]
-                if bars_ago > fresh:
+                if st["ri"] < cutoff_idx:             # trigger older than `days` days
                     continue
+                bars_ago = (n - 1) - st["ri"]
                 prev = best.get(sym)
                 if prev and prev["bars_ago"] <= bars_ago:
                     continue
@@ -314,13 +318,13 @@ def _scan(tf: str, pivot_k: int, fresh: int) -> list[dict]:
 
 
 @app.get("/api/scan")
-def scan(tf: str = Query("15m"), pivot: int = Query(8), fresh: int = Query(3)):
+def scan(tf: str = Query("15m"), pivot: int = Query(8), days: int = Query(2)):
     tf = tf if tf in ("1d", "1h", "30m", "15m") else "15m"
-    pivot = pivot if pivot in (8, 13, 21) else 8
-    fresh = max(0, min(int(fresh), 30))
-    rows = _scan(tf, pivot, fresh)
+    pivot = max(2, min(int(pivot), 60))      # any input, clamped to a sane range
+    days = max(1, min(int(days), 10))
+    rows = _scan(tf, pivot, days)
     return {"count": len(rows), "universe": len(_symbols()), "tf": tf,
-            "pivot": pivot, "fresh": fresh, "rows": rows}
+            "pivot": pivot, "days": days, "rows": rows}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -406,7 +410,7 @@ def _run_due_scans() -> None:
     for tf in SCAN_TFS:
         lt = _latest_bar_time(tf)
         if lt and lt > _last_scanned[tf]:
-            rows = _scan(tf, 8, 1)
+            rows = _scan(tf, 8, 2)
             n = _append_found(tf, rows)
             _last_scanned[tf] = lt
             _monitor["last_run"] = _ist_now().strftime("%Y-%m-%d %H:%M:%S")
@@ -493,115 +497,56 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
 .seg button:last-child{border-radius:0 6px 6px 0}
 .tag{color:var(--accent);font-weight:700;letter-spacing:.4px;margin-right:4px}
 #title{font-weight:700;font-size:13px;color:var(--muted);margin-left:auto}
-.charts{height:calc(100vh - 56px)}
-#chart{height:100%}
 .hint{color:var(--muted);font-size:11px}
-#logic{position:absolute;right:14px;top:54px;z-index:9;width:430px;max-width:calc(100vw - 28px);
-  background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:14px 16px;
-  box-shadow:0 12px 40px rgba(0,0,0,.55);display:none;font-size:12px;line-height:1.55}
-#logic.on{display:block}
-#logic h4{margin:0 0 6px;font-size:12px;letter-spacing:.4px;color:var(--accent)}
-#logic ol{margin:4px 0 10px;padding-left:18px}#logic li{margin:2px 0}
-#logic .cat{display:flex;gap:8px;align-items:flex-start;margin:5px 0}
-#logic .sw{flex:0 0 12px;height:12px;border-radius:3px;margin-top:3px}
-#logic .muted{color:var(--muted)}
-#logic code{background:#161b27;padding:1px 5px;border-radius:4px;color:#cfd6e4}
 .muted{color:var(--muted)}
-#scanpanel{position:absolute;right:14px;top:54px;z-index:9;width:620px;max-width:calc(100vw - 28px);
-  background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:14px 16px;
-  box-shadow:0 12px 40px rgba(0,0,0,.55);display:none;font-size:12px;max-height:calc(100vh - 78px);overflow:auto}
-#scanpanel.on{display:block}
-#scanpanel h4{margin:0 0 8px;font-size:12px;letter-spacing:.4px;color:var(--accent)}
-#scanpanel .srow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-#scanpanel label{color:var(--muted);font-size:11px}
-#scanRun{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;border-color:transparent;font-weight:700}
-.stbl{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;margin-top:4px}
-.stbl th,.stbl td{padding:6px 8px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--border)}
+#scan{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;border-color:transparent;font-weight:800;padding:6px 16px}
+#k{width:64px;text-align:center}
+.wrap{padding:16px 18px 48px}
+#scanMeta{margin:0 0 10px;font-size:12.5px}
+.stbl{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+.stbl th,.stbl td{padding:8px 12px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--border)}
 .stbl th:first-child,.stbl td:first-child{text-align:left}
-.stbl th{position:sticky;top:0;background:#10131a;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em}
+.stbl th:last-child,.stbl td:last-child{text-align:center}
+.stbl th{position:sticky;top:0;background:#10131a;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;z-index:1}
 .stbl tbody tr{cursor:pointer}
 .stbl tbody tr:hover{background:#141a27}
 .stbl .ssym{font-weight:700;color:var(--text)}
 .stbl .pos{color:#34d399}.stbl .neg{color:#ef5350}
-.fresh0{color:#34d399;font-weight:700}
-#foundpanel{position:absolute;right:14px;top:54px;z-index:9;width:660px;max-width:calc(100vw - 28px);
-  background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:14px 16px;
-  box-shadow:0 12px 40px rgba(0,0,0,.55);display:none;font-size:12px;max-height:calc(100vh - 78px);overflow:auto}
-#foundpanel.on{display:block}
-#foundpanel h4{margin:0 0 8px;font-size:12px;letter-spacing:.4px;color:var(--accent)}
-#foundpanel .srow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-#foundpanel label{color:var(--muted);font-size:11px}
-#foundRefresh{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;border-color:transparent;font-weight:700}
-.tfbadge{display:inline-block;padding:1px 6px;border-radius:5px;background:#172033;color:#9fb0cc;font-size:10.5px;font-weight:700}
+.seebtn{padding:4px 10px;font-size:12px;background:#172033;border:1px solid var(--border);color:#cfd6e4;border-radius:6px}
+.seebtn:hover{border-color:var(--accent);color:var(--accent)}
+#chartwrap{display:none;margin-top:18px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+#chartwrap.show{display:block}
+#charthead{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:#10131a;border-bottom:1px solid var(--border)}
+#chartsym{font-weight:700;color:var(--accent);font-size:13px}
+#chartclose{padding:4px 10px;font-size:12px}
+#chart{height:560px;position:relative}
 </style></head><body>
 
 <div id="bar">
-  <span class="tag">RESISTANCE MARKER</span>
-  <span><label>Stock</label><select id="sym" style="width:160px"></select></span>
-  <span class="seg" id="tf"><button data-tf="1d" class="on">Daily</button><button data-tf="1h">Hourly</button><button data-tf="30m">30m</button><button data-tf="15m">15m</button></span>
-  <span><label>Pivot</label><select id="k"><option selected>8</option><option>13</option><option>21</option></select></span>
-  <button id="setups">🎯 Lift-off</button>
-  <button id="vwap">VWAP</button>
-  <button id="scan">🔭 Scan Universe</button>
-  <button id="found">📋 Found Today</button>
-  <button id="clear">Clear</button>
-  <button id="info">ℹ Logic</button>
-  <span class="hint">🎯 Lift-off = level tested ≥2× (one false breakout tolerated if rejected ≥3×) → closes hug a flat VWAP → GREEN lift-off candle clears the VWAP, still under resistance · (see ℹ Logic)</span>
+  <span class="tag">RESISTANCE SCANNER</span>
+  <span class="seg" id="tf"><button data-tf="1d">Daily</button><button data-tf="1h">Hourly</button><button data-tf="30m">30m</button><button data-tf="15m" class="on">15m</button></span>
+  <span><label>Pivot</label><input id="k" type="number" min="2" max="60" step="1" value="8"></span>
+  <button id="scan">🔭 Scan</button>
+  <span class="hint">Scans all stocks for the 🎯 lift-off setup triggered in the last 2 days · click a stock (or “See chart”) to view it below.</span>
   <span id="title"></span>
 </div>
 
-<div id="logic">
-  <h4>HOW LIFT-OFF WORKS</h4>
-  <div class="muted">Scans the FULL chart history, per resistance level.</div>
-  <b style="color:#34d399">🎯 LIFT-OFF — hug the flat VWAP, then GREEN lift-off, UNDER resistance:</b>
-  <ol>
-    <li>Level <b>tested ≥ 2×</b> (price rejected there — the resistance "takes it back"). <i>One <b>false breakout</b> — a poke above that returns below — is tolerated if the level rejected <b>≥ 3×</b>.</i></li>
-    <li>Price <b>HOLDS BELOW</b> the resistance up to any sustained break (the lone false breakout aside).</li>
-    <li>For <b>≥ 4 candles the closes HUG the VWAP</b> — each close within <code>0.4%</code> of the line (price sits on the VWAP).</li>
-    <li>The <b>VWAP is flat / slight-slope</b> across that hug (within <code>±0.4%</code>).</li>
-    <li><b>Trigger:</b> the next candle is <b>GREEN</b> (close &gt; open) and <b>closes clearly ABOVE the VWAP</b> — the lift-off off the line — still below the resistance.</li>
-  </ol>
-  <div class="cat"><span class="sw" style="background:#34d399"></span><span>The <b>bold green line</b> inside each box is the <b>flat VWAP segment</b> threading through the hug and lift-off — drawn over the thin blue VWAP. The <b>▲ triangle</b> marks the green lift-off candle (the entry).</span></div>
-  <div class="cat" style="margin-top:6px"><span class="sw" style="background:#ef4444"></span><span>Each setup draws <b>two boxes</b>: the <b>green outer box</b> = the FULL setup (first test → lift-off, incl. the resistance line), and the <b>red dotted inner box</b> = just the <b>VWAP-logic region</b> (the hug → lift-off).</span></div>
-  <div class="muted" style="margin-top:9px">
-    The label shows the <code>VWAP slope</code> across the hug and how many
-    <code>candles</code> hugged the line before the lift-off.
-  </div>
-  <div class="muted" style="margin-top:7px">Click <b>🎯 Lift-off</b> to scan this chart; click it again to clear.</div>
-</div>
-
-<div id="scanpanel">
-  <h4>🔭 SCAN UNIVERSE — fresh setups across all stocks (right now)</h4>
-  <div class="srow">
-    <label>Fresh ≤</label>
-    <select id="scanFresh"><option>0</option><option>1</option><option selected>3</option><option>5</option><option>10</option></select>
-    <span class="muted">bars · uses the bar's TF (<b id="scanTf">1d</b>) &amp; pivot</span>
-    <button id="scanRun">↻ Run scan</button>
-  </div>
-  <div class="muted" id="scanMeta" style="margin:8px 0 4px">Pick a timeframe (15m/30m/1h recommended) and run.</div>
+<div class="wrap">
+  <div class="muted" id="scanMeta">Pick a timeframe (15m/30m/1h), set the pivot, then click <b>Scan</b>.</div>
   <div id="scanRes"></div>
-</div>
-
-<div id="foundpanel">
-  <h4>📋 FOUND TODAY — setups the live monitor caught at each bar close</h4>
-  <div class="srow">
-    <label>Date</label><select id="foundDate"></select>
-    <button id="foundRefresh">↻ Refresh</button>
-    <span class="muted" id="foundAuto">auto-refresh: on</span>
+  <div id="chartwrap">
+    <div id="charthead"><span id="chartsym"></span><button id="chartclose">✕ close chart</button></div>
+    <div id="chart"></div>
   </div>
-  <div class="muted" id="foundMeta" style="margin:8px 0 4px">Loading…</div>
-  <div id="foundRes"></div>
 </div>
-
-<div class="charts"><div id="chart"></div></div>
 
 <script>
 const APP_BASE="__APP_BASE__";
 const api=function(p){return (APP_BASE||"")+p;};
 const $=function(id){return document.getElementById(id);};
 
-const S={candles:[], tf:"1d", zones:[], setups:[], mode:null};  // zones=resistance · setups=boxes · mode="Lift-off"
-let vwapOn=false, vwapSeries=null;
+const S={candles:[], tf:"15m", zones:[], setups:[]};  // zones=resistance lines · setups=lift-off boxes
+let vwapSeries=null;
 
 const chart=LightweightCharts.createChart($("chart"),{autoSize:true,
   layout:{background:{color:"#0b0d11"},textColor:"#cfd6e4"},
@@ -718,13 +663,13 @@ function drawBlocks(){
 (function loop(){ drawBlocks(); requestAnimationFrame(loop); })();
 
 // ── load candles for a symbol/tf ─────────────────────────────────────
-async function load(){
-  const sym=$("sym").value.trim().toUpperCase(); if(!sym)return;
-  clearMarks();
+async function load(sym){
+  sym=(sym||"").trim().toUpperCase(); if(!sym)return false;
+  S.zones=[]; S.setups=[]; drawBlocks();
   $("title").textContent="loading "+sym+"…";
   let j; try{j=await(await fetch(api("/api/candles?symbol="+sym+"&tf="+S.tf))).json();}
-  catch(e){$("title").textContent="not found";return;}
-  if(j.error||!j.candles||!j.candles.length){$("title").textContent=sym+": no data";candle.setData([]);return;}
+  catch(e){$("title").textContent="not found";return false;}
+  if(j.error||!j.candles||!j.candles.length){$("title").textContent=sym+": no data";candle.setData([]);return false;}
   S.candles=j.candles;
   candle.setData(S.candles);
   // Daily: fit the full history. Intraday (1h/30m/15m): thousands of bars, so
@@ -737,6 +682,7 @@ async function load(){
   }
   drawVWAP();
   $("title").textContent=sym+" · "+S.tf+" · "+S.candles.length+" bars";
+  return true;
 }
 
 // ── VWAP: typical price (H+L+C)/3 weighted by volume. Resets each trading
@@ -755,7 +701,7 @@ function computeVWAP(candles, resetDaily){
 
 function drawVWAP(){
   if(vwapSeries){ try{chart.removeSeries(vwapSeries)}catch(e){} vwapSeries=null; }
-  if(!vwapOn || !S.candles.length) return;
+  if(!S.candles.length) return;
   vwapSeries=chart.addLineSeries({color:"#a855f7", lineWidth:2, lineStyle:0,
     priceLineVisible:false, lastValueVisible:true, crosshairMarkerVisible:false, title:"VWAP"});
   vwapSeries.setData(computeVWAP(S.candles, S.tf!=="1d"));
@@ -900,193 +846,86 @@ function detectScenario(vis, vw, z){
   return out;
 }
 
-// ── generic runner: scan the FULL chart with a given detector, box + zoom to latest ──
-function runFind(detector, btn, name){
-  if(S.mode===name){ clearMarks(); $("title").textContent=name+" cleared"; return; }   // toggle off
-  // switching modes / fresh run: reset everything first
-  S.zones=[]; S.setups=[]; S.mode=null;
-  $("setups").classList.remove("on"); $("setups").textContent="🎯 Lift-off";
-  if(!S.candles.length) return;
-  const vis=S.candles;
-  if(vis.length<10){$("title").textContent="not enough bars on this chart";return;}
-  chart.timeScale().fitContent();
-  const k=+$("k").value, vw=visVwap(vis), piv=[];
+// ── scan THIS chart's full history for lift-off setups and draw them ──
+function findAndDraw(){
+  S.zones=[]; S.setups=[];
+  const vis=S.candles; if(vis.length<10){ drawBlocks(); return 0; }
+  const k=+$("k").value||8, vw=visVwap(vis), piv=[];
   for(let i=k;i<vis.length-k;i++){
     let hi=true; for(let j=i-k;j<=i+k;j++){ if(vis[j].high>vis[i].high){hi=false;break;} }
     if(hi) piv.push({i:i, price:vis[i].high});
   }
   clusterPivots(piv, S.tf).forEach(function(z){
     if(z.n<2) return;
-    const found=detector(vis,vw,z);
+    const found=detectScenario(vis,vw,z);
     if(!found.length) return;
     found.forEach(function(s){S.setups.push(s);});
     S.zones.push({top:z.top, bottom:z.bottom, n:z.n, fromTime:vis[z.firstIdx].time,
                   touches: z.pts.map(function(p){return {time:vis[p.i].time, value:p.price};})});
   });
-  if(!S.setups.length){
-    $("title").textContent = S.tf==="1d"
-      ? name+": none on Daily — use an INTRADAY timeframe (15m/30m/1h); Daily VWAP is a slow cumulative line"
-      : name+": no setups on this chart";
-    return;
+  if(S.setups.length){
+    let last=S.setups[0]; S.setups.forEach(function(s){ if(s.ri>last.ri) last=s; });
+    chart.timeScale().setVisibleLogicalRange({from:Math.max(0,last.li-25), to:last.ri+30});
   }
-  let last=S.setups[0];
-  S.setups.forEach(function(s){ if(s.ri>last.ri) last=s; });
-  chart.timeScale().setVisibleLogicalRange({from:Math.max(0,last.li-25), to:last.ri+30});
   drawBlocks();
-  S.mode=name; btn.classList.add("on"); btn.textContent="✕ Clear";
-  $("title").textContent = name+": "+S.zones.length+" level(s) · "+S.setups.length+" setup(s) — latest shown; scroll ← for earlier";
+  return S.setups.length;
 }
-function detectSetups(){ runFind(detectScenario, $("setups"), "Lift-off"); }
-
-function clearMarks(){ S.zones=[]; S.setups=[]; S.mode=null; drawBlocks();
-  $("setups").classList.remove("on"); $("setups").textContent="🎯 Lift-off"; }
 
 // ── wire-up ──────────────────────────────────────────────────────────
-function setTf(tf){   // update the TF segment + state WITHOUT loading (caller loads)
-  S.tf=tf;
-  [].slice.call($("tf").children).forEach(function(x){x.classList.toggle("on", x.dataset.tf===tf);});
-  $("scanTf").textContent=tf;
-}
-[].slice.call($("tf").children).forEach(function(b){b.onclick=function(){
-  setTf(b.dataset.tf); load();};});
-$("sym").addEventListener("change",load);
-$("setups").onclick=function(){ detectSetups(); };
-$("vwap").onclick=function(){ vwapOn=!vwapOn; $("vwap").classList.toggle("on",vwapOn); drawVWAP();
-  $("title").textContent="VWAP "+(vwapOn?("on · "+(S.tf==="1d"?"cumulative anchor":"daily-session reset")):"off"); };
-$("clear").onclick=function(){clearMarks(); $("title").textContent="cleared";};
-$("info").onclick=function(){ const on=$("logic").classList.toggle("on"); $("info").classList.toggle("on",on); };
+[].slice.call($("tf").children).forEach(function(b){ b.onclick=function(){
+  [].slice.call($("tf").children).forEach(function(x){x.classList.remove("on");});
+  b.classList.add("on"); S.tf=b.dataset.tf;
+};});
 
-// ── universe scan: run the 🎯 Lift-off detector server-side across all stocks
-//    and list the ones whose trigger is fresh (within N bars of the last bar) ──
+// open a stock's chart BELOW the list and draw its lift-off setups
+async function showStock(sym){
+  $("chartwrap").classList.add("show");
+  $("chartsym").textContent=sym+" · "+S.tf.toUpperCase()+" — loading…";
+  const ok=await load(sym);
+  const n = ok ? findAndDraw() : 0;
+  $("chartsym").textContent=sym+" · "+S.tf.toUpperCase()+(ok?(" · "+n+" lift-off setup(s)"):" · no data");
+  $("chartwrap").scrollIntoView({behavior:"smooth", block:"start"});
+}
+$("chartclose").onclick=function(){ $("chartwrap").classList.remove("show"); };
+
+// ── scan: lift-off setups triggered across the universe in the last 2 days ──
 async function runScan(){
-  const fresh=$("scanFresh").value, k=$("k").value;
-  $("scanMeta").innerHTML='<span>scanning the universe on '+S.tf.toUpperCase()+'…</span>';
-  $("scanRes").innerHTML="";
+  const k=$("k").value||8;
+  $("scanMeta").innerHTML="Scanning all stocks on "+S.tf.toUpperCase()+"…";
+  $("scanRes").innerHTML=""; $("chartwrap").classList.remove("show");
   let j;
-  try{ j=await(await fetch(api("/api/scan?tf="+S.tf+"&fresh="+fresh+"&pivot="+k))).json(); }
+  try{ j=await(await fetch(api("/api/scan?tf="+S.tf+"&pivot="+k))).json(); }
   catch(e){ $("scanMeta").textContent="scan failed — is the server running?"; return; }
   renderScan(j);
 }
 
 function renderScan(j){
-  $("scanMeta").innerHTML="Scanned <b>"+j.universe+"</b> stocks · "+j.tf.toUpperCase()
-    +" · pivot "+j.pivot+" · fresh ≤ "+j.fresh+" bars — <b>"+j.count+"</b> fresh setup(s)"
-    +(j.tf==="1d" ? " &nbsp;<span style='color:#ef5350'>(VWAP setups need an INTRADAY TF — pick 15m/30m/1h)</span>" : "");
+  $("scanMeta").innerHTML="Scanned <b>"+j.universe+"</b> stocks · "+j.tf.toUpperCase()+" · pivot "+j.pivot
+    +" · last "+j.days+" days — <b>"+j.count+"</b> stock(s) with a lift-off setup"
+    +(j.tf==="1d" ? " &nbsp;<span style='color:#ef5350'>(intraday recommended — pick 15m/30m/1h)</span>" : "");
   if(!j.count){
-    $("scanRes").innerHTML='<div class="muted" style="padding:14px 2px">No fresh setups right now. '
-      +'Widen the fresh window, switch timeframe, or check during market hours (the scan needs live data).</div>';
+    $("scanRes").innerHTML='<div class="muted" style="padding:16px 2px">No lift-off setups triggered in the last 2 days. Try a different timeframe or pivot.</div>';
     return;
   }
   const rows=j.rows.map(function(r){
-    const ico="🎯";
-    const fr=r.bars_ago===0?'<span class="fresh0">now</span>':(r.bars_ago+"b ago");
     const sl=(r.slope>0?"+":"")+r.slope+"%";
-    return '<tr data-sym="'+r.symbol+'" data-setup="'+r.setup+'">'
-      +'<td class="ssym">'+r.symbol+'</td>'
-      +'<td>'+ico+'</td>'
-      +'<td>'+fr+'</td>'
+    return '<tr data-sym="'+r.symbol+'">'
+      +'<td class="ssym">🎯 '+r.symbol+'</td>'
       +'<td class="muted">'+r.trig_time+'</td>'
       +'<td>'+r.resistance+'</td>'
       +'<td>'+r.trig_close+'</td>'
       +'<td class="'+(r.slope>=0?"pos":"neg")+'">'+sl+'</td>'
-      +'<td>'+r.n_cand+'</td></tr>';
+      +'<td>'+r.n_cand+'</td>'
+      +'<td><button class="seebtn">📈 See chart</button></td></tr>';
   }).join("");
   $("scanRes").innerHTML='<table class="stbl"><thead><tr>'
-    +'<th>Symbol</th><th>Setup</th><th>Fresh</th><th>Trigger time</th>'
-    +'<th>Resist.</th><th>Close</th><th>VWAP slope</th><th>Bars</th>'
+    +'<th>Symbol</th><th>Trigger time</th><th>Resistance</th><th>Close</th><th>VWAP slope</th><th>Hug bars</th><th></th>'
     +'</tr></thead><tbody>'+rows+'</tbody></table>';
   [].slice.call(document.querySelectorAll("#scanRes tr[data-sym]")).forEach(function(tr){
-    tr.onclick=function(){ loadAndShow(tr.dataset.sym, tr.dataset.setup); };
+    tr.onclick=function(){ showStock(tr.dataset.sym); };
   });
 }
 
-async function loadAndShow(sym, setup, tf){
-  $("scanpanel").classList.remove("on"); $("scan").classList.remove("on");
-  $("foundpanel").classList.remove("on"); $("found").classList.remove("on");
-  stopFoundAuto();
-  if(tf && tf!==S.tf) setTf(tf);                 // jump to the TF the setup was found on
-  $("sym").value=sym;
-  await load();                                  // load() resets marks for the new symbol
-  detectSetups();
-}
-
-$("scan").onclick=function(){
-  const on=$("scanpanel").classList.toggle("on"); $("scan").classList.toggle("on",on);
-  if(on){ $("logic").classList.remove("on"); $("info").classList.remove("on");
-          $("foundpanel").classList.remove("on"); $("found").classList.remove("on"); stopFoundAuto();
-          runScan(); }
-};
-$("scanRun").onclick=runScan;
-
-// ── Found Today: the live monitor's accumulated daily list (auto-refreshing) ──
-let foundTimer=null;
-function stopFoundAuto(){ if(foundTimer){ clearInterval(foundTimer); foundTimer=null; } }
-
-async function loadFound(){
-  const date=$("foundDate").value || "";
-  $("foundMeta").textContent="loading…";
-  let j;
-  try{ j=await(await fetch(api("/api/found"+(date?("?date="+date):"")))).json(); }
-  catch(e){ $("foundMeta").textContent="failed to load found list"; return; }
-  // (re)populate date picker, preserving selection
-  if(j.dates && j.dates.length){
-    const cur=$("foundDate").value || j.date;
-    $("foundDate").innerHTML=j.dates.map(function(d){
-      return "<option"+(d===cur?" selected":"")+">"+d+"</option>";}).join("");
-  } else if(!$("foundDate").options.length){
-    $("foundDate").innerHTML="<option>"+j.date+"</option>";
-  }
-  const lb=j.last_bar||{};
-  const checked=["15m","30m","1h"].map(function(t){return t+" "+(lb[t]?("✓"+lb[t].slice(11)):"—");}).join(" · ");
-  $("foundMeta").innerHTML="Monitor <b>"+(j.status||"?")+"</b> · last run <b>"+(j.last_run||"—")
-    +"</b> · bars checked: "+checked+" — <b>"+j.count+"</b> setup(s) today";
-  if(!j.count){
-    $("foundRes").innerHTML='<div class="muted" style="padding:14px 2px">Nothing caught yet for this day. '
-      +'The monitor scans 15m every 15 min, 30m every 30 min and 1h hourly during market hours (09:15–15:30 IST).</div>';
-    return;
-  }
-  const rows=j.items.map(function(r){
-    const ico="🎯";
-    const sl=(r.slope>0?"+":"")+r.slope+"%";
-    return '<tr data-sym="'+r.symbol+'" data-setup="'+r.setup+'" data-tf="'+r.tf+'">'
-      +'<td class="muted">'+(r.found_at||"")+'</td>'
-      +'<td class="ssym">'+r.symbol+'</td>'
-      +'<td>'+ico+'</td>'
-      +'<td><span class="tfbadge">'+r.tf+'</span></td>'
-      +'<td class="muted">'+r.trig_time+'</td>'
-      +'<td>'+r.resistance+'</td>'
-      +'<td>'+r.trig_close+'</td>'
-      +'<td class="'+(r.slope>=0?"pos":"neg")+'">'+sl+'</td>'
-      +'<td>'+r.n_cand+'</td></tr>';
-  }).join("");
-  $("foundRes").innerHTML='<table class="stbl"><thead><tr>'
-    +'<th>Found</th><th>Symbol</th><th>Setup</th><th>TF</th><th>Trigger time</th>'
-    +'<th>Resist.</th><th>Close</th><th>VWAP slope</th><th>Bars</th>'
-    +'</tr></thead><tbody>'+rows+'</tbody></table>';
-  [].slice.call(document.querySelectorAll("#foundRes tr[data-sym]")).forEach(function(tr){
-    tr.onclick=function(){ loadAndShow(tr.dataset.sym, tr.dataset.setup, tr.dataset.tf); };
-  });
-}
-
-$("found").onclick=function(){
-  const on=$("foundpanel").classList.toggle("on"); $("found").classList.toggle("on",on);
-  if(on){
-    $("logic").classList.remove("on"); $("info").classList.remove("on");
-    $("scanpanel").classList.remove("on"); $("scan").classList.remove("on");
-    loadFound();
-    stopFoundAuto(); foundTimer=setInterval(loadFound, 60000);   // refresh every minute
-  } else { stopFoundAuto(); }
-};
-$("foundRefresh").onclick=loadFound;
-$("foundDate").onchange=loadFound;
-
-// ── boot ─────────────────────────────────────────────────────────────
-(async function(){
-  const m=await(await fetch(api("/api/meta"))).json();
-  $("sym").innerHTML=(m.symbols||[]).map(function(s){
-    return "<option"+(s===m.default?" selected":"")+">"+s+"</option>";}).join("");
-  $("scanTf").textContent=S.tf;
-  await load();
-})();
+$("scan").onclick=runScan;
 </script>
 </body></html>"""
