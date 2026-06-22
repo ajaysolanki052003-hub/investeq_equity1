@@ -14,11 +14,15 @@ Run:
 """
 from __future__ import annotations
 
+import asyncio
 import glob
+import json
 import os
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -85,6 +89,422 @@ def _candles(sym: str, tf: str) -> list[dict]:
     return out
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  UNIVERSE SCAN — run the same two setup detectors the chart draws (🎯 Lift-off
+#  and 📊 Consolidation) across every symbol, server-side, and surface the ones
+#  whose TRIGGER bar is fresh (within the last `fresh` bars = an actionable now
+#  signal). This is a faithful Python port of the JS in PAGE: same swing-pivot
+#  finding, clusterPivots, levelBreaks, detectScenario and detectConsolidation,
+#  with identical constants — so a scan hit matches what the chart shows.
+# ════════════════════════════════════════════════════════════════════════════
+
+_arr_cache: dict[tuple, tuple] = {}   # (sym, tf) -> (candles_obj, {high, vwap})
+
+
+def _arrays(sym: str, tf: str):
+    """OHLC highs + session VWAP as numpy arrays, cached on the candle-list
+    identity (rebuilds only when _candles refreshes on an mtime change). VWAP
+    resets each session for intraday TFs; cumulative anchor on Daily — matching
+    computeVWAP() in the chart."""
+    cs = _candles(sym, tf)
+    hit = _arr_cache.get((sym, tf))
+    if hit and hit[0] is cs:
+        return cs, hit[1]
+    n = len(cs)
+    h  = np.fromiter((c["high"]  for c in cs), float, n)
+    l  = np.fromiter((c["low"]   for c in cs), float, n)
+    cl = np.fromiter((c["close"] for c in cs), float, n)
+    v  = np.fromiter((c["volume"] for c in cs), float, n)
+    tp = (h + l + cl) / 3.0
+    pv = tp * v
+    if tf != "1d":                                   # intraday → daily session reset
+        day = np.fromiter((c["time"] // 86400 for c in cs), np.int64, n)
+        cum_pv = pd.Series(pv).groupby(day).cumsum().to_numpy()
+        cum_v  = pd.Series(v).groupby(day).cumsum().to_numpy()
+    else:
+        cum_pv, cum_v = np.cumsum(pv), np.cumsum(v)
+    vw = np.where(cum_v > 0, cum_pv / np.where(cum_v > 0, cum_v, 1.0), tp)
+    data = {"high": h, "vwap": vw}
+    _arr_cache[(sym, tf)] = (cs, data)
+    return cs, data
+
+
+def _pivots(h: np.ndarray, k: int) -> list[dict]:
+    """Swing highs: bar i where high[i] == max(high[i-k : i+k+1]) (ties kept,
+    edges excluded) — vectorised equivalent of the chart's pivot loop. Uses a
+    sliding-window view (far faster than pandas centred rolling over 500 syms)."""
+    n = len(h)
+    if n < 2 * k + 1:
+        return []
+    W = 2 * k + 1
+    wmax = np.lib.stride_tricks.sliding_window_view(h, W).max(axis=1)  # len n-W+1
+    centers = np.arange(k, n - k)                                      # window centres
+    idx = centers[h[centers] >= wmax]
+    return [{"i": int(i), "price": float(h[i])} for i in idx]
+
+
+_zones_cache: dict[tuple, tuple] = {}   # (sym, tf, k) -> (candles_obj, zones)
+
+
+def _zones(sym: str, tf: str, k: int):
+    """Candles + resistance zones (n≥2 touches), cached on the candle-list
+    identity so a re-scan with a different kind/fresh skips pivot work."""
+    cs, arr = _arrays(sym, tf)
+    key = (sym, tf, k)
+    hit = _zones_cache.get(key)
+    if hit and hit[0] is cs:
+        return cs, arr, hit[1]
+    piv = _pivots(arr["high"], k)
+    zones = [z for z in _cluster_pivots(piv, tf) if z["n"] >= 2] if len(piv) >= 2 else []
+    _zones_cache[key] = (cs, zones)
+    return cs, arr, zones
+
+
+def _cluster_pivots(piv: list[dict], tf: str) -> list[dict]:
+    """Cluster nearby swing-high pivots into resistance zones — timeframe-scaled
+    tolerance that tightens once a level has ≥2 close touches, with a ≥12-bar min
+    gap so a pivot belonging to the same swing isn't counted as a new test."""
+    piv = sorted(piv, key=lambda p: p["price"])
+    TOL = 0.016 if tf == "1d" else (0.008 if tf == "1h" else 0.0035)
+    MINTOL, MINBARS = TOL * 0.25, 12
+    zones: list[dict] = []
+    for p in piv:
+        z = zones[-1] if zones else None
+        if z:
+            eff = TOL
+            if z["n"] >= 2:
+                sr = (z["top"] - z["bottom"]) / z["avg"]
+                eff = min(TOL, max(MINTOL, sr * 1.5))
+            if abs(p["price"] - z["avg"]) <= z["avg"] * eff:
+                if any(abs(p["i"] - q["i"]) < MINBARS for q in z["pts"]):
+                    continue
+                z["sum"] += p["price"]; z["n"] += 1; z["avg"] = z["sum"] / z["n"]
+                z["top"] = max(z["top"], p["price"]); z["bottom"] = min(z["bottom"], p["price"])
+                z["firstIdx"] = min(z["firstIdx"], p["i"]); z["pts"].append(p)
+                continue
+        zones.append({"sum": p["price"], "n": 1, "avg": p["price"], "top": p["price"],
+                      "bottom": p["price"], "firstIdx": p["i"], "pts": [p]})
+    return zones
+
+
+def _level_breaks(cs: list[dict], top: float, from_idx: int) -> dict:
+    """Classify how a level was broken, tolerating ONE false breakout (a close
+    above that later returns below). terminal = index of the first SUSTAINED
+    break, else len(cs)."""
+    BREAK = 0.0015
+    up, n = top * (1 + BREAK), len(cs)
+    above, break_start, false_breaks = False, -1, 0
+    for j in range(from_idx + 1, n):
+        if not above and cs[j]["close"] > up:
+            above, break_start = True, j
+        elif above and cs[j]["close"] < top:
+            above, false_breaks = False, false_breaks + 1
+    return {"falseBreaks": false_breaks, "terminal": break_start if above else n}
+
+
+def _active_window(cs, vw, z):
+    """Shared preamble for both detectors: the touches, and the index where the
+    level's active (still-below) window ends — tolerating one false breakout.
+    Returns (touches, a, cap) or None if the level can't host a setup."""
+    n = len(cs)
+    top = z["top"]
+    touches = sorted(p["i"] for p in z["pts"])
+    if len(touches) < 2:
+        return None
+    first, second, last = touches[0], touches[1], touches[-1]
+    bk = _level_breaks(cs, top, first)
+    if bk["falseBreaks"] <= 1 and (bk["falseBreaks"] == 0 or len(touches) >= 3):
+        brk = bk["terminal"]
+    else:
+        brk = n
+        for j in range(first + 1, n):
+            if cs[j]["close"] > top * (1.0015):
+                brk = j
+                break
+    if last > brk:                       # a touch after the break = role reversal → drop
+        return None
+    return first, second, brk
+
+
+def _detect_liftoff(cs, vw, z) -> list[dict]:
+    """🎯 Lift-off: level tested ≥2× → price holds below → ≥4 closes hug a flat
+    VWAP → next GREEN candle closes clearly above the VWAP, still below the
+    level. Returns ALL such setups in the active window (not just the first)."""
+    win = _active_window(cs, vw, z)
+    if not win:
+        return []
+    first, a, brk = win
+    n, top = len(cs), z["top"]
+    HUG, FLAT, MINHUG = 0.004, 0.004, 4
+    cap = min(brk - 1, n - 1, a + 80)
+    below = lambda i: cs[i]["close"] < top * (1.0015)
+    out, i = [], a + 1
+    while i + MINHUG <= cap:
+        h0, h1, j = i, i - 1, i
+        while j <= cap and below(j) and abs(cs[j]["close"] - vw[j]) / vw[j] <= HUG:
+            h1, j = j, j + 1
+        if h1 - h0 + 1 >= MINHUG:
+            flat = abs(vw[h1] - vw[h0]) / vw[h0] <= FLAT
+            L = j
+            if flat and L <= cap:
+                c = cs[L]
+                if c["close"] > c["open"] and c["close"] > vw[L] * (1 + HUG) and below(L):
+                    out.append({"kind": 3, "li": first, "ri": L, "top": top,
+                                "slope": round((vw[h1] - vw[h0]) / vw[h0] * 100, 2),
+                                "nCand": h1 - h0 + 1,
+                                "trigTime": cs[L]["time"], "trigClose": cs[L]["close"]})
+                    i = L + 1
+                    continue
+            i = h1 + 1
+        else:
+            i += 1
+    return out
+
+
+def _detect_consolidation(cs, vw, z) -> list[dict]:
+    """📊 Consolidation: level tested ≥2× → price holds below → ≥6 candles form a
+    tight parallel range pressed near the level, with a slight-up VWAP through
+    it. Returns ALL such setups in the active window."""
+    win = _active_window(cs, vw, z)
+    if not win:
+        return []
+    first, a, brk = win
+    n, top = len(cs), z["top"]
+    MINCONS, BAND, NEAR = 6, 0.02, 0.025
+    cap = min(brk - 1, n - 1, a + 100)
+    if cap - a < MINCONS:
+        return []
+    below = lambda i: cs[i]["close"] < top * (1.0015)
+    out, i = [], a + 1
+    while i + MINCONS <= cap:
+        s = e = i
+        mx = mn = cs[i]["close"]
+        hiH, j = cs[i]["high"], i
+        while j <= cap and below(j):
+            c = cs[j]["close"]
+            nmx, nmn = max(mx, c), min(mn, c)
+            if (nmx - nmn) / ((nmx + nmn) / 2) > BAND:
+                break
+            mx, mn = nmx, nmn
+            hiH = max(hiH, cs[j]["high"]); e = j; j += 1
+        if e - s + 1 >= MINCONS:
+            avg = (mx + mn) / 2
+            parallel = abs(cs[e]["close"] - cs[s]["close"]) / avg <= BAND * 0.5
+            near = hiH >= top * (1 - NEAR)
+            vslope = (vw[e] - vw[s]) / vw[s]
+            if parallel and near and 0 < vslope <= 0.02:
+                out.append({"kind": 2, "li": first, "ri": e, "top": top,
+                            "slope": round(vslope * 100, 2), "nCand": e - s + 1,
+                            "trigTime": cs[e]["time"], "trigClose": cs[e]["close"]})
+            i = e + 1
+        else:
+            i += 1
+    return out
+
+
+_scan_cache: dict[str, tuple] = {}
+
+
+def _scan(tf: str, kind: str, pivot_k: int, fresh: int) -> list[dict]:
+    """Run the detector(s) over the whole universe; keep, per (symbol, setup),
+    the FRESHEST setup whose trigger is within `fresh` bars of the last bar.
+    Cached on the max CSV mtime so repeat calls during a quiet minute are free."""
+    src_tf = "15m" if tf == "30m" else tf
+    files = glob.glob(str(DATA_DIR / src_tf / "*_historical.csv"))
+    sig = (tf, kind, pivot_k, fresh,
+           max((os.path.getmtime(f) for f in files), default=0.0))
+    hit = _scan_cache.get("last")
+    if hit and hit[0] == sig:
+        return hit[1]
+
+    dets = []
+    if kind in ("liftoff", "both"):
+        dets.append(("liftoff", _detect_liftoff))
+    if kind in ("consolidation", "both"):
+        dets.append(("consolidation", _detect_consolidation))
+
+    best: dict[tuple, dict] = {}
+    for sym in _symbols():
+        try:
+            cs, arr, zones = _zones(sym, tf, pivot_k)
+        except Exception:
+            continue
+        n = len(cs)
+        if n < 2 * pivot_k + 12 or not zones:
+            continue
+        vw = arr["vwap"]
+        # A fresh trigger needs ri >= n-1-fresh and ri <= secondTouch + capExtra
+        # (capExtra = 80 lift-off / 100 consolidation). So a zone whose 2nd touch
+        # is older than that can't host a fresh hit — skip it before the O(n)
+        # break/detector work. This is what makes the universe scan fast.
+        cap_extra = 100 if kind != "liftoff" else 80
+        thresh = cap_extra + fresh + 1
+        for z in zones:
+            touches = sorted(p["i"] for p in z["pts"])
+            if (n - 1) - touches[1] > thresh:        # 2nd touch too old → no fresh setup possible
+                continue
+            for name, det in dets:
+                for st in det(cs, vw, z):
+                    bars_ago = (n - 1) - st["ri"]
+                    if bars_ago > fresh:
+                        continue
+                    key = (sym, name)
+                    prev = best.get(key)
+                    if prev and prev["bars_ago"] <= bars_ago:
+                        continue
+                    best[key] = {
+                        "symbol": sym, "setup": name, "bars_ago": bars_ago,
+                        "trig_time": time.strftime("%Y-%m-%d %H:%M",
+                                                   time.gmtime(st["trigTime"])),
+                        "trig_close": round(st["trigClose"], 2),
+                        "resistance": round(st["top"], 2),
+                        "slope": st["slope"], "n_cand": st["nCand"],
+                    }
+    rows = sorted(best.values(), key=lambda r: (r["bars_ago"], r["symbol"]))
+    _scan_cache["last"] = (sig, rows)
+    return rows
+
+
+@app.get("/api/scan")
+def scan(tf: str = Query("15m"), kind: str = Query("both"),
+         pivot: int = Query(8), fresh: int = Query(3)):
+    tf = tf if tf in ("1d", "1h", "30m", "15m") else "15m"
+    kind = kind if kind in ("liftoff", "consolidation", "both") else "both"
+    pivot = pivot if pivot in (8, 13, 21) else 8
+    fresh = max(0, min(int(fresh), 30))
+    rows = _scan(tf, kind, pivot, fresh)
+    return {"count": len(rows), "universe": len(_symbols()), "tf": tf,
+            "kind": kind, "pivot": pivot, "fresh": fresh, "rows": rows}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  LIVE MONITOR — a background scheduler that, during market hours, re-scans a
+#  timeframe right after each of its bars CLOSES and ACCUMULATES the day's hits
+#  into a persisted per-date list (deduped). 15m fires every 15 min, 30m every
+#  30 min, 1h every hour — driven by the data's latest bar advancing, so we
+#  never hardcode NSE bucket boundaries. The /api/found list is what the
+#  "📋 Found Today" panel shows; click-through reuses the chart.
+# ════════════════════════════════════════════════════════════════════════════
+
+FOUND_DIR = Path(__file__).resolve().parent / "found"
+SCAN_TFS = ("15m", "30m", "1h")
+_last_scanned: dict[str, int] = {tf: 0 for tf in SCAN_TFS}   # last bar time scanned per TF
+_monitor: dict[str, str] = {"last_run": "", "status": "starting"}
+
+
+def _ist_now() -> datetime:
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)   # bars are IST; server may be UTC
+
+
+def _ist_date_str() -> str:
+    return _ist_now().strftime("%Y-%m-%d")
+
+
+def _market_hours(now: datetime) -> bool:
+    if now.weekday() >= 5:                       # Sat/Sun
+        return False
+    m = now.hour * 60 + now.minute
+    return 9 * 60 + 14 <= m <= 15 * 60 + 45      # 09:14–15:45 IST (grace past the 15:30 bar)
+
+
+def _latest_bar_time(tf: str) -> int:
+    """Latest bar timestamp for a TF, read from a liquid reference symbol."""
+    for ref in ("RELIANCE", "HDFCBANK", "INFY", "ICICIBANK"):
+        try:
+            cs = _candles(ref, tf)
+            if cs:
+                return cs[-1]["time"]
+        except Exception:
+            continue
+    return 0
+
+
+def _found_path(date_str: str) -> Path:
+    return FOUND_DIR / f"{date_str}.json"
+
+
+def _load_found(date_str: str) -> list[dict]:
+    p = _found_path(date_str)
+    if not p.exists():
+        return []
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return []
+
+
+def _append_found(tf: str, rows: list[dict]) -> int:
+    """Append NEW setups (deduped by symbol+setup+tf+trigger) to today's list."""
+    date = _ist_date_str()
+    items = _load_found(date)
+    seen = {(it["symbol"], it["setup"], it["tf"], it["trig_time"]) for it in items}
+    found_at = _ist_now().strftime("%H:%M:%S")
+    added = 0
+    for r in rows:
+        key = (r["symbol"], r["setup"], tf, r["trig_time"])
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({**r, "tf": tf, "found_at": found_at})
+        added += 1
+    if added:
+        FOUND_DIR.mkdir(exist_ok=True)
+        _found_path(date).write_text(json.dumps(items))
+    return added
+
+
+def _run_due_scans() -> None:
+    """For each TF whose bar has newly closed, scan it and accumulate hits.
+    fresh=1 → only setups triggering on the just-closed bar (allowing a 1-bar
+    forming-bar offset). Dedup keeps the list clean across repeated cycles."""
+    for tf in SCAN_TFS:
+        lt = _latest_bar_time(tf)
+        if lt and lt > _last_scanned[tf]:
+            rows = _scan(tf, "both", 8, 1)
+            n = _append_found(tf, rows)
+            _last_scanned[tf] = lt
+            _monitor["last_run"] = _ist_now().strftime("%Y-%m-%d %H:%M:%S")
+            if n:
+                print(f"[resistance monitor] {tf}: +{n} new setup(s)")
+
+
+async def _scheduler() -> None:
+    await asyncio.sleep(5)
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            now = _ist_now()
+            if _market_hours(now):
+                _monitor["status"] = "monitoring"
+                await loop.run_in_executor(None, _run_due_scans)   # _scan is blocking → off the event loop
+                await asyncio.sleep(60)
+            else:
+                _monitor["status"] = "closed"
+                await asyncio.sleep(300)
+        except Exception as e:           # never let the loop die
+            print("[resistance monitor] error:", e)
+            await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    FOUND_DIR.mkdir(exist_ok=True)
+    asyncio.create_task(_scheduler())
+
+
+@app.get("/api/found")
+def found(date: str | None = Query(None)):
+    d = date or _ist_date_str()
+    items = _load_found(d)
+    items.sort(key=lambda it: (it.get("found_at", ""), it["symbol"]), reverse=True)
+    dates = sorted((p.stem for p in FOUND_DIR.glob("*.json")), reverse=True) if FOUND_DIR.exists() else []
+    last = {tf: (time.strftime("%Y-%m-%d %H:%M", time.gmtime(t)) if t else None)
+            for tf, t in _last_scanned.items()}
+    return {"date": d, "count": len(items), "items": items, "dates": dates,
+            "status": _monitor["status"], "last_run": _monitor["last_run"],
+            "last_bar": last}
+
+
 @app.get("/api/meta")
 def meta():
     syms = _symbols()
@@ -140,6 +560,33 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
 #logic .sw{flex:0 0 12px;height:12px;border-radius:3px;margin-top:3px}
 #logic .muted{color:var(--muted)}
 #logic code{background:#161b27;padding:1px 5px;border-radius:4px;color:#cfd6e4}
+.muted{color:var(--muted)}
+#scanpanel{position:absolute;right:14px;top:54px;z-index:9;width:620px;max-width:calc(100vw - 28px);
+  background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:14px 16px;
+  box-shadow:0 12px 40px rgba(0,0,0,.55);display:none;font-size:12px;max-height:calc(100vh - 78px);overflow:auto}
+#scanpanel.on{display:block}
+#scanpanel h4{margin:0 0 8px;font-size:12px;letter-spacing:.4px;color:var(--accent)}
+#scanpanel .srow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#scanpanel label{color:var(--muted);font-size:11px}
+#scanRun{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;border-color:transparent;font-weight:700}
+.stbl{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;margin-top:4px}
+.stbl th,.stbl td{padding:6px 8px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--border)}
+.stbl th:first-child,.stbl td:first-child{text-align:left}
+.stbl th{position:sticky;top:0;background:#10131a;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em}
+.stbl tbody tr{cursor:pointer}
+.stbl tbody tr:hover{background:#141a27}
+.stbl .ssym{font-weight:700;color:var(--text)}
+.stbl .pos{color:#34d399}.stbl .neg{color:#ef5350}
+.fresh0{color:#34d399;font-weight:700}
+#foundpanel{position:absolute;right:14px;top:54px;z-index:9;width:660px;max-width:calc(100vw - 28px);
+  background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:14px 16px;
+  box-shadow:0 12px 40px rgba(0,0,0,.55);display:none;font-size:12px;max-height:calc(100vh - 78px);overflow:auto}
+#foundpanel.on{display:block}
+#foundpanel h4{margin:0 0 8px;font-size:12px;letter-spacing:.4px;color:var(--accent)}
+#foundpanel .srow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#foundpanel label{color:var(--muted);font-size:11px}
+#foundRefresh{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;border-color:transparent;font-weight:700}
+.tfbadge{display:inline-block;padding:1px 6px;border-radius:5px;background:#172033;color:#9fb0cc;font-size:10.5px;font-weight:700}
 </style></head><body>
 
 <div id="bar">
@@ -149,22 +596,25 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
   <span><label>Pivot</label><select id="k"><option selected>8</option><option>13</option><option>21</option></select></span>
   <span><label>Min touches</label><select id="touch"><option selected>1</option><option>2</option><option>3</option></select></span>
   <button id="apply">⬛ Apply Resistance</button>
-  <button id="setups">🎯 Find Setups</button>
+  <button id="setups">🎯 Lift-off</button>
+  <button id="cons">📊 Consolidation</button>
   <button id="vwap">VWAP</button>
+  <button id="scan">🔭 Scan Universe</button>
+  <button id="found">📋 Found Today</button>
   <button id="clear">Clear</button>
   <button id="info">ℹ Logic</button>
-  <span class="hint">Apply = current resistance (intact; one false breakout tolerated if rejected ≥3×) · Find Setups = scans the FULL chart for levels tested ≥2× where price holds BELOW resistance, closes HUG a flat VWAP for ≥5 candles, then a GREEN candle lifts off above the VWAP</span>
+  <span class="hint">Apply = current resistance (intact; one false breakout tolerated if rejected ≥3×) · 🎯 Lift-off = hug flat VWAP → green lift-off · 📊 Consolidation = parallel range near resistance + slight-up VWAP · (see ℹ Logic)</span>
   <span id="title"></span>
 </div>
 
 <div id="logic">
   <h4>HOW FIND SETUPS WORKS</h4>
-  <div class="muted">Scans the FULL chart history (the past), per resistance level.</div>
-  <b>The setup — hug the flat VWAP, then GREEN lift-off, UNDER resistance:</b>
+  <div class="muted">Two separate scanners (own buttons) over the FULL chart history, per resistance level.</div>
+  <b style="color:#34d399">🎯 LIFT-OFF — hug the flat VWAP, then GREEN lift-off, UNDER resistance:</b>
   <ol>
     <li>Level <b>tested ≥ 2×</b> (price rejected there — the resistance "takes it back"). <i>One <b>false breakout</b> — a poke above that returns below — is tolerated if the level rejected <b>≥ 3×</b>.</i></li>
     <li>Price <b>HOLDS BELOW</b> the resistance up to any sustained break (the lone false breakout aside).</li>
-    <li>For <b>≥ 5 candles the closes HUG the VWAP</b> — each close within <code>0.4%</code> of the line (price sits on the VWAP).</li>
+    <li>For <b>≥ 4 candles the closes HUG the VWAP</b> — each close within <code>0.4%</code> of the line (price sits on the VWAP).</li>
     <li>The <b>VWAP is flat / slight-slope</b> across that hug (within <code>±0.4%</code>).</li>
     <li><b>Trigger:</b> the next candle is <b>GREEN</b> (close &gt; open) and <b>closes clearly ABOVE the VWAP</b> — the lift-off off the line — still below the resistance.</li>
   </ol>
@@ -174,6 +624,46 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
     The label shows the <code>VWAP slope</code> across the hug and how many
     <code>candles</code> hugged the line before the lift-off.
   </div>
+  <hr style="border-color:#222838;margin:11px 0">
+  <b style="color:#a78bfa">📊 CONSOLIDATION — parallel range near resistance, slight-up VWAP (AND):</b>
+  <ol>
+    <li>Level <b>tested ≥ 2×</b> (same level logic, one false breakout tolerated if ≥3×).</li>
+    <li>Price <b>HOLDS BELOW</b> the resistance.</li>
+    <li><b>≥ 6 candles form a PARALLEL (horizontal) consolidation</b> — closes contained in a tight <code>≤2%</code> band that doesn't drift (flat).</li>
+    <li>The consolidation sits <b>AT / NEAR the resistance</b> — its highs within <code>2.5%</code> of the level.</li>
+    <li>The <b>VWAP trends SLIGHTLY UP</b> through it (slope &gt; 0, ≤ 2%).</li>
+  </ol>
+  <div class="cat"><span class="sw" style="background:#a78bfa"></span><span><b>Violet box</b> = the consolidation setup (the <b>red dotted inner box</b> frames the parallel range; the bold violet line is the slight-up VWAP through it).</span></div>
+  <div class="muted" style="margin-top:7px">Use the <b>🎯 Lift-off</b> and <b>📊 Consolidation</b> buttons to view each independently — clicking one switches to it; clicking it again clears.</div>
+</div>
+
+<div id="scanpanel">
+  <h4>🔭 SCAN UNIVERSE — fresh setups across all stocks (right now)</h4>
+  <div class="srow">
+    <label>Setup</label>
+    <select id="scanKind">
+      <option value="both">Both</option>
+      <option value="liftoff">🎯 Lift-off</option>
+      <option value="consolidation">📊 Consolidation</option>
+    </select>
+    <label>Fresh ≤</label>
+    <select id="scanFresh"><option>0</option><option>1</option><option selected>3</option><option>5</option><option>10</option></select>
+    <span class="muted">bars · uses the bar's TF (<b id="scanTf">1d</b>) &amp; pivot</span>
+    <button id="scanRun">↻ Run scan</button>
+  </div>
+  <div class="muted" id="scanMeta" style="margin:8px 0 4px">Pick a timeframe (15m/30m/1h recommended) and run.</div>
+  <div id="scanRes"></div>
+</div>
+
+<div id="foundpanel">
+  <h4>📋 FOUND TODAY — setups the live monitor caught at each bar close</h4>
+  <div class="srow">
+    <label>Date</label><select id="foundDate"></select>
+    <button id="foundRefresh">↻ Refresh</button>
+    <span class="muted" id="foundAuto">auto-refresh: on</span>
+  </div>
+  <div class="muted" id="foundMeta" style="margin:8px 0 4px">Loading…</div>
+  <div id="foundRes"></div>
 </div>
 
 <div class="charts"><div id="chart"></div></div>
@@ -183,7 +673,7 @@ const APP_BASE="__APP_BASE__";
 const api=function(p){return (APP_BASE||"")+p;};
 const $=function(id){return document.getElementById(id);};
 
-const S={candles:[], tf:"1d", zones:[], setups:[]};  // zones=resistance blocks · setups=scenario boxes
+const S={candles:[], tf:"1d", zones:[], setups:[], mode:null};  // zones=resistance · setups=boxes · mode="Lift-off"|"Consolidation"
 let vwapOn=false, vwapSeries=null;
 
 const chart=LightweightCharts.createChart($("chart"),{autoSize:true,
@@ -280,7 +770,9 @@ function drawBlocks(){
       }
     }
     // label + the measured stats behind the category
-    const stat = "  (VWAP "+(b.slope>=0?"+":"")+b.slope+"% · hug "+b.nCand+" candles → lift-off)";
+    const stat = b.kind===2
+      ? "  (VWAP "+(b.slope>=0?"+":"")+b.slope+"% · "+b.nCand+" candles parallel)"
+      : "  (VWAP "+(b.slope>=0?"+":"")+b.slope+"% · hug "+b.nCand+" candles → lift-off)";
     ctx.fillStyle=col; ctx.font="700 11px system-ui,Segoe UI,sans-serif";
     ctx.textBaseline="top"; ctx.textAlign="left";
     ctx.fillText(b.label+stat, x0+5, yT+4);
@@ -408,7 +900,7 @@ function levelBreaks(vis, top, fromIdx){
 // THE setup (single definition) — hug-the-flat-VWAP, then GREEN lift-off, UNDER resistance:
 //   • the level is tested >= 2 times (price rejected there — "resistance takes it back"), then
 //   • price HOLDS BELOW the resistance (never closes above the level), and
-//   • for >= 5 candles the closes HUG the VWAP (sit on the line) while the VWAP is
+//   • for >= 4 candles the closes HUG the VWAP (sit on the line) while the VWAP is
 //     FLAT/slight-slope — price and VWAP coil together, then
 //   • the next candle is a GREEN candle that closes CLEARLY ABOVE the VWAP — the
 //     lift-off off the line — still below the resistance. That is the trigger.
@@ -416,7 +908,7 @@ function detectScenario(vis, vw, z){
   const out=[], n=vis.length, BREAK=0.0015;
   const HUG=0.004;    // a close within 0.4% of the VWAP = "sitting on the line"
   const FLAT=0.004;   // VWAP slope across the hug must stay within +/-0.4% (flat/slight)
-  const MINHUG=5;     // ...for at least 5 candles
+  const MINHUG=4;     // ...for at least 4 candles
   const top=z.top;
   const touches=z.pts.map(function(p){return p.i;}).sort(function(a,b){return a-b;});
   if(touches.length<2) return out;                   // MANDATORY: tested >= 2 times
@@ -442,7 +934,7 @@ function detectScenario(vis, vw, z){
   const cap=Math.min(brkIdx-1, n-1, a+80);           // stay within the active window (below the level)
   const belowRes=function(i){ return vis[i].close < top*(1+BREAK); };
 
-  // scan for: a run of >=5 closes hugging a flat VWAP, immediately followed by a
+  // scan for: a run of >=4 closes hugging a flat VWAP, immediately followed by a
   // GREEN candle that closes clearly above the VWAP (the lift-off). All below resistance.
   let i=a+1;
   while(i+MINHUG<=cap){
@@ -472,7 +964,7 @@ function detectScenario(vis, vw, z){
                     slope:slopePct, nCand:len, vwPts:vwPts,
                     inner:{x0:vis[h0].time, x1:vis[L].time, yTop:hiH*(1+0.002), yBottom:loL*(1-0.002)},
                     pts:[{time:vis[L].time, value:vis[L].close, star:true}]});  // lift-off candle (triangle)
-          return out;
+          i=L+1; continue;   // collect ALL setups in the window (matches the universe scan), not just the first
         }
       }
       i=h1+1;          // hug found but no valid lift-off — search on from the run's end
@@ -483,11 +975,73 @@ function detectScenario(vis, vw, z){
   return out;
 }
 
-// ── Find Setups: scan the FULL chart, box every lift-off setup, zoom to latest ──
-function detectSetups(){
-  if(S.setups.length){ clearMarks(); $("title").textContent="setups cleared"; return; }
+// ── SETUP #2: parallel consolidation pressed near resistance, with a slight-UP VWAP ──
+// AND-conditions: tested >=2x → price holds below the level → >=6 candles form a
+// PARALLEL (tight, horizontal) consolidation whose highs sit AT/NEAR the resistance,
+// while the VWAP trends SLIGHTLY UP through it.
+function detectConsolidation(vis, vw, z){
+  const out=[], n=vis.length, BREAK=0.0015;
+  const MINCONS=6;     // parallel consolidation length
+  const BAND=0.02;     // closes contained in a <=2% horizontal band (tight & parallel)
+  const NEAR=0.025;    // consolidation highs within 2.5% under the resistance ("at/near")
+  const top=z.top;
+  const touches=z.pts.map(function(p){return p.i;}).sort(function(a,b){return a-b;});
+  if(touches.length<2) return out;
+  const firstTouch=touches[0], secondTouch=touches[1], lastTouch=touches[touches.length-1];
+  const bk=levelBreaks(vis, top, firstTouch);
+  let brkIdx;
+  if(bk.falseBreaks<=1 && (bk.falseBreaks===0 || touches.length>=3)){ brkIdx=bk.terminal; }
+  else { brkIdx=n; for(let j=firstTouch+1;j<n;j++){ if(vis[j].close>top*(1+BREAK)){ brkIdx=j; break; } } }
+  if(lastTouch > brkIdx) return out;
+
+  const a=secondTouch, cap=Math.min(brkIdx-1, n-1, a+100);
+  if(cap-a < MINCONS) return out;
+  const belowRes=function(i){ return vis[i].close < top*(1+BREAK); };
+
+  let i=a+1;
+  while(i+MINCONS<=cap){
+    // extend a tight horizontal window from i while closes stay in a <=BAND band, below resistance
+    let s=i, e=i, mx=vis[i].close, mn=vis[i].close, hiH=vis[i].high, j=i;
+    while(j<=cap && belowRes(j)){
+      const c=vis[j].close, nmx=Math.max(mx,c), nmn=Math.min(mn,c);
+      if((nmx-nmn)/((nmx+nmn)/2) > BAND) break;
+      mx=nmx; mn=nmn; hiH=Math.max(hiH,vis[j].high); e=j; j++;
+    }
+    const len=e-s+1;
+    if(len>=MINCONS){
+      const avg=(mx+mn)/2;
+      const parallel = Math.abs(vis[e].close-vis[s].close)/avg <= BAND*0.5;   // net flat = parallel/horizontal
+      const near     = hiH >= top*(1-NEAR);                                    // pressed up near the level
+      const vslope   = (vw[e]-vw[s])/vw[s];
+      const slightUp = vslope>0 && vslope<=0.02;                              // VWAP slight upward trend
+      if(parallel && near && slightUp){
+        const left=firstTouch, right=e;
+        let minLow=Infinity; for(let k2=left;k2<=right;k2++) minLow=Math.min(minLow,vis[k2].low);
+        let cHi=-Infinity, cLo=Infinity; for(let k2=s;k2<=e;k2++){ cHi=Math.max(cHi,vis[k2].high); cLo=Math.min(cLo,vis[k2].low); }
+        const vwPts=[]; for(let k2=s;k2<=e;k2++) vwPts.push({time:vis[k2].time, value:vw[k2]});
+        out.push({kind:2, x0:vis[left].time, x1:vis[right].time, li:left, ri:right,
+                  yTop:top*(1+0.004), yBottom:minLow*(1-0.002),
+                  label:"tested ≥2× · parallel consolidation near resistance · VWAP slight-up",
+                  slope:+(vslope*100).toFixed(2), nCand:len, vwPts:vwPts,
+                  inner:{x0:vis[s].time, x1:vis[e].time, yTop:cHi*(1+0.002), yBottom:cLo*(1-0.002)},
+                  pts:[]});
+        i=e+1; continue;   // collect ALL setups in the window (matches the universe scan), not just the first
+      }
+      i=e+1;
+    } else { i++; }
+  }
+  return out;
+}
+
+// ── generic runner: scan the FULL chart with a given detector, box + zoom to latest ──
+function runFind(detector, btn, name){
+  if(S.mode===name){ clearMarks(); $("title").textContent=name+" cleared"; return; }   // toggle off
+  // switching modes / fresh run: reset everything first
+  S.zones=[]; S.setups=[]; S.mode=null;
+  $("setups").classList.remove("on"); $("setups").textContent="🎯 Lift-off";
+  $("cons").classList.remove("on");   $("cons").textContent="📊 Consolidation";
   if(!S.candles.length) return;
-  const vis=S.candles;                       // FULL chart history — not just the visible window
+  const vis=S.candles;
   if(vis.length<10){$("title").textContent="not enough bars on this chart";return;}
   chart.timeScale().fitContent();
   const k=+$("k").value, vw=visVwap(vis), piv=[];
@@ -495,10 +1049,9 @@ function detectSetups(){
     let hi=true; for(let j=i-k;j<=i+k;j++){ if(vis[j].high>vis[i].high){hi=false;break;} }
     if(hi) piv.push({i:i, price:vis[i].high});
   }
-  S.zones=[]; S.setups=[];
   clusterPivots(piv, S.tf).forEach(function(z){
     if(z.n<2) return;
-    const found=detectScenario(vis,vw,z);
+    const found=detector(vis,vw,z);
     if(!found.length) return;
     found.forEach(function(s){S.setups.push(s);});
     S.zones.push({top:z.top, bottom:z.bottom, n:z.n, fromTime:vis[z.firstIdx].time,
@@ -506,18 +1059,19 @@ function detectSetups(){
   });
   if(!S.setups.length){
     $("title").textContent = S.tf==="1d"
-      ? "no setups on Daily — this VWAP-hug setup needs an INTRADAY timeframe (15m/30m/1h); Daily VWAP is a slow cumulative line price doesn't hug"
-      : "no setups (need ≥2-tested level, closes hugging a flat VWAP below it, then a green lift-off above VWAP)";
+      ? name+": none on Daily — use an INTRADAY timeframe (15m/30m/1h); Daily VWAP is a slow cumulative line"
+      : name+": no setups on this chart";
     return;
   }
-  // zoom to the MOST RECENT setup (older ones stay drawn — scroll left to see them)
   let last=S.setups[0];
   S.setups.forEach(function(s){ if(s.ri>last.ri) last=s; });
   chart.timeScale().setVisibleLogicalRange({from:Math.max(0,last.li-25), to:last.ri+30});
   drawBlocks();
-  $("setups").classList.add("on"); $("setups").textContent="✕ Clear Setups";
-  $("title").textContent = S.zones.length+" level(s) · "+S.setups.length+" setup(s) — showing the latest; scroll ← for earlier";
+  S.mode=name; btn.classList.add("on"); btn.textContent="✕ Clear";
+  $("title").textContent = name+": "+S.zones.length+" level(s) · "+S.setups.length+" setup(s) — latest shown; scroll ← for earlier";
 }
+function detectSetups(){ runFind(detectScenario, $("setups"), "Lift-off"); }
+function detectConsolidationSetups(){ runFind(detectConsolidation, $("cons"), "Consolidation"); }
 
 // ── resistance on the VISIBLE window only ────────────────────────────
 function applyResistance(){
@@ -559,14 +1113,19 @@ function applyResistance(){
   $("title").textContent=S.zones.length+" current resistance line(s) · tested & unbroken  ("+vis.length+" bars)";
 }
 
-function clearMarks(){ S.zones=[]; S.setups=[]; drawBlocks();
+function clearMarks(){ S.zones=[]; S.setups=[]; S.mode=null; drawBlocks();
   $("apply").classList.remove("on"); $("apply").textContent="⬛ Apply Resistance";
-  $("setups").classList.remove("on"); $("setups").textContent="🎯 Find Setups"; }
+  $("setups").classList.remove("on"); $("setups").textContent="🎯 Lift-off";
+  $("cons").classList.remove("on"); $("cons").textContent="📊 Consolidation"; }
 
 // ── wire-up ──────────────────────────────────────────────────────────
+function setTf(tf){   // update the TF segment + state WITHOUT loading (caller loads)
+  S.tf=tf;
+  [].slice.call($("tf").children).forEach(function(x){x.classList.toggle("on", x.dataset.tf===tf);});
+  $("scanTf").textContent=tf;
+}
 [].slice.call($("tf").children).forEach(function(b){b.onclick=function(){
-  [].slice.call($("tf").children).forEach(function(x){x.classList.remove("on")});
-  b.classList.add("on"); S.tf=b.dataset.tf; load();};});
+  setTf(b.dataset.tf); load();};});
 $("sym").addEventListener("change",load);
 // Toggle: 1st click draws resistance for the visible window, 2nd click removes.
 $("apply").onclick=function(){
@@ -575,16 +1134,142 @@ $("apply").onclick=function(){
   if(S.zones.length){ $("apply").classList.add("on"); $("apply").textContent="✕ Remove Resistance"; }
 };
 $("setups").onclick=function(){ detectSetups(); };
+$("cons").onclick=function(){ detectConsolidationSetups(); };
 $("vwap").onclick=function(){ vwapOn=!vwapOn; $("vwap").classList.toggle("on",vwapOn); drawVWAP();
   $("title").textContent="VWAP "+(vwapOn?("on · "+(S.tf==="1d"?"cumulative anchor":"daily-session reset")):"off"); };
 $("clear").onclick=function(){clearMarks(); $("title").textContent="cleared";};
 $("info").onclick=function(){ const on=$("logic").classList.toggle("on"); $("info").classList.toggle("on",on); };
+
+// ── universe scan: run BOTH detectors server-side across all stocks and list
+//    the ones whose trigger is fresh (within N bars of the last bar) ──────────
+async function runScan(){
+  const kind=$("scanKind").value, fresh=$("scanFresh").value, k=$("k").value;
+  $("scanMeta").innerHTML='<span>scanning the universe on '+S.tf.toUpperCase()+'…</span>';
+  $("scanRes").innerHTML="";
+  let j;
+  try{ j=await(await fetch(api("/api/scan?tf="+S.tf+"&kind="+kind+"&fresh="+fresh+"&pivot="+k))).json(); }
+  catch(e){ $("scanMeta").textContent="scan failed — is the server running?"; return; }
+  renderScan(j);
+}
+
+function renderScan(j){
+  $("scanMeta").innerHTML="Scanned <b>"+j.universe+"</b> stocks · "+j.tf.toUpperCase()
+    +" · pivot "+j.pivot+" · fresh ≤ "+j.fresh+" bars — <b>"+j.count+"</b> fresh setup(s)"
+    +(j.tf==="1d" ? " &nbsp;<span style='color:#ef5350'>(VWAP setups need an INTRADAY TF — pick 15m/30m/1h)</span>" : "");
+  if(!j.count){
+    $("scanRes").innerHTML='<div class="muted" style="padding:14px 2px">No fresh setups right now. '
+      +'Widen the fresh window, switch timeframe, or check during market hours (the scan needs live data).</div>';
+    return;
+  }
+  const rows=j.rows.map(function(r){
+    const ico=r.setup==="liftoff"?"🎯":"📊";
+    const fr=r.bars_ago===0?'<span class="fresh0">now</span>':(r.bars_ago+"b ago");
+    const sl=(r.slope>0?"+":"")+r.slope+"%";
+    return '<tr data-sym="'+r.symbol+'" data-setup="'+r.setup+'">'
+      +'<td class="ssym">'+r.symbol+'</td>'
+      +'<td>'+ico+'</td>'
+      +'<td>'+fr+'</td>'
+      +'<td class="muted">'+r.trig_time+'</td>'
+      +'<td>'+r.resistance+'</td>'
+      +'<td>'+r.trig_close+'</td>'
+      +'<td class="'+(r.slope>=0?"pos":"neg")+'">'+sl+'</td>'
+      +'<td>'+r.n_cand+'</td></tr>';
+  }).join("");
+  $("scanRes").innerHTML='<table class="stbl"><thead><tr>'
+    +'<th>Symbol</th><th>Setup</th><th>Fresh</th><th>Trigger time</th>'
+    +'<th>Resist.</th><th>Close</th><th>VWAP slope</th><th>Bars</th>'
+    +'</tr></thead><tbody>'+rows+'</tbody></table>';
+  [].slice.call(document.querySelectorAll("#scanRes tr[data-sym]")).forEach(function(tr){
+    tr.onclick=function(){ loadAndShow(tr.dataset.sym, tr.dataset.setup); };
+  });
+}
+
+async function loadAndShow(sym, setup, tf){
+  $("scanpanel").classList.remove("on"); $("scan").classList.remove("on");
+  $("foundpanel").classList.remove("on"); $("found").classList.remove("on");
+  stopFoundAuto();
+  if(tf && tf!==S.tf) setTf(tf);                 // jump to the TF the setup was found on
+  $("sym").value=sym;
+  await load();                                  // load() resets marks for the new symbol
+  if(setup==="consolidation") detectConsolidationSetups(); else detectSetups();
+}
+
+$("scan").onclick=function(){
+  const on=$("scanpanel").classList.toggle("on"); $("scan").classList.toggle("on",on);
+  if(on){ $("logic").classList.remove("on"); $("info").classList.remove("on");
+          $("foundpanel").classList.remove("on"); $("found").classList.remove("on"); stopFoundAuto();
+          runScan(); }
+};
+$("scanRun").onclick=runScan;
+
+// ── Found Today: the live monitor's accumulated daily list (auto-refreshing) ──
+let foundTimer=null;
+function stopFoundAuto(){ if(foundTimer){ clearInterval(foundTimer); foundTimer=null; } }
+
+async function loadFound(){
+  const date=$("foundDate").value || "";
+  $("foundMeta").textContent="loading…";
+  let j;
+  try{ j=await(await fetch(api("/api/found"+(date?("?date="+date):"")))).json(); }
+  catch(e){ $("foundMeta").textContent="failed to load found list"; return; }
+  // (re)populate date picker, preserving selection
+  if(j.dates && j.dates.length){
+    const cur=$("foundDate").value || j.date;
+    $("foundDate").innerHTML=j.dates.map(function(d){
+      return "<option"+(d===cur?" selected":"")+">"+d+"</option>";}).join("");
+  } else if(!$("foundDate").options.length){
+    $("foundDate").innerHTML="<option>"+j.date+"</option>";
+  }
+  const lb=j.last_bar||{};
+  const checked=["15m","30m","1h"].map(function(t){return t+" "+(lb[t]?("✓"+lb[t].slice(11)):"—");}).join(" · ");
+  $("foundMeta").innerHTML="Monitor <b>"+(j.status||"?")+"</b> · last run <b>"+(j.last_run||"—")
+    +"</b> · bars checked: "+checked+" — <b>"+j.count+"</b> setup(s) today";
+  if(!j.count){
+    $("foundRes").innerHTML='<div class="muted" style="padding:14px 2px">Nothing caught yet for this day. '
+      +'The monitor scans 15m every 15 min, 30m every 30 min and 1h hourly during market hours (09:15–15:30 IST).</div>';
+    return;
+  }
+  const rows=j.items.map(function(r){
+    const ico=r.setup==="liftoff"?"🎯":"📊";
+    const sl=(r.slope>0?"+":"")+r.slope+"%";
+    return '<tr data-sym="'+r.symbol+'" data-setup="'+r.setup+'" data-tf="'+r.tf+'">'
+      +'<td class="muted">'+(r.found_at||"")+'</td>'
+      +'<td class="ssym">'+r.symbol+'</td>'
+      +'<td>'+ico+'</td>'
+      +'<td><span class="tfbadge">'+r.tf+'</span></td>'
+      +'<td class="muted">'+r.trig_time+'</td>'
+      +'<td>'+r.resistance+'</td>'
+      +'<td>'+r.trig_close+'</td>'
+      +'<td class="'+(r.slope>=0?"pos":"neg")+'">'+sl+'</td>'
+      +'<td>'+r.n_cand+'</td></tr>';
+  }).join("");
+  $("foundRes").innerHTML='<table class="stbl"><thead><tr>'
+    +'<th>Found</th><th>Symbol</th><th>Setup</th><th>TF</th><th>Trigger time</th>'
+    +'<th>Resist.</th><th>Close</th><th>VWAP slope</th><th>Bars</th>'
+    +'</tr></thead><tbody>'+rows+'</tbody></table>';
+  [].slice.call(document.querySelectorAll("#foundRes tr[data-sym]")).forEach(function(tr){
+    tr.onclick=function(){ loadAndShow(tr.dataset.sym, tr.dataset.setup, tr.dataset.tf); };
+  });
+}
+
+$("found").onclick=function(){
+  const on=$("foundpanel").classList.toggle("on"); $("found").classList.toggle("on",on);
+  if(on){
+    $("logic").classList.remove("on"); $("info").classList.remove("on");
+    $("scanpanel").classList.remove("on"); $("scan").classList.remove("on");
+    loadFound();
+    stopFoundAuto(); foundTimer=setInterval(loadFound, 60000);   // refresh every minute
+  } else { stopFoundAuto(); }
+};
+$("foundRefresh").onclick=loadFound;
+$("foundDate").onchange=loadFound;
 
 // ── boot ─────────────────────────────────────────────────────────────
 (async function(){
   const m=await(await fetch(api("/api/meta"))).json();
   $("sym").innerHTML=(m.symbols||[]).map(function(s){
     return "<option"+(s===m.default?" selected":"")+">"+s+"</option>";}).join("");
+  $("scanTf").textContent=S.tf;
   await load();
 })();
 </script>

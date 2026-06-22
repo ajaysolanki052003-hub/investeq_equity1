@@ -90,3 +90,6 @@ trail_variants_results.csv
 # Expiry Blast — keep canonical output/, ignore parameter-sweep scratch dirs
 expiry_blast/output_*/
 expiry_blast/sweep/
+
+# Resistance Marker — live-monitor accumulated daily setup lists (runtime output)
+stock_resistance/found/
