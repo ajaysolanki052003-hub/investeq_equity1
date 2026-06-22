@@ -260,22 +260,16 @@ def _detect_liftoff(cs, vw, z) -> list[dict]:
     return out
 
 
-_scan_cache: dict[str, tuple] = {}
+SCAN_DIR = Path(__file__).resolve().parent / "scan_cache"
+SCAN_NDAYS = 30
+_days_cache: dict[tuple, tuple] = {}     # (tf, pivot) -> (sig, data)
 
 
-def _scan(tf: str, pivot_k: int, days: int = 2) -> list[dict]:
-    """Run the 🎯 Lift-off detector over the whole universe; keep, per symbol,
-    the freshest setup whose TRIGGER falls within the last `days` trading days of
-    that symbol's data. Cached on the max CSV mtime so repeat calls are free."""
-    src_tf = "15m" if tf == "30m" else tf
-    files = glob.glob(str(DATA_DIR / src_tf / "*_historical.csv"))
-    sig = (tf, pivot_k, days,
-           max((os.path.getmtime(f) for f in files), default=0.0))
-    hit = _scan_cache.get("last")
-    if hit and hit[0] == sig:
-        return hit[1]
-
-    best: dict[str, dict] = {}
+def _compute_scan_days(tf: str, pivot_k: int, ndays: int) -> dict:
+    """Scan the universe and bucket every lift-off setup by its TRIGGER date,
+    keeping the last `ndays` trading days. Returns {dates:[...desc], by_date:{}}.
+    One run serves all days, so day-switching in the UI needs no rescan."""
+    buckets: dict[str, dict] = {}                 # date -> {symbol -> row}
     for sym in _symbols():
         try:
             cs, arr, zones = _zones(sym, tf, pivot_k)
@@ -285,46 +279,89 @@ def _scan(tf: str, pivot_k: int, days: int = 2) -> list[dict]:
         if n < 2 * pivot_k + 12 or not zones:
             continue
         vw = arr["vwap"]
-        # First bar index of the trailing `days` trading days = the freshness
-        # window. A trigger qualifies only if ri >= cutoff_idx.
         daynums = sorted({c["time"] // 86400 for c in cs})
-        cutoff_day = daynums[-days] if len(daynums) >= days else daynums[0]
+        cutoff_day = daynums[-ndays] if len(daynums) >= ndays else daynums[0]
         cutoff_idx = next((i for i, c in enumerate(cs)
                            if c["time"] // 86400 >= cutoff_day), n)
-        # A setup triggers at ri <= secondTouch + 80, so a zone whose 2nd touch
-        # is >80 bars before the window can't host one — skip before the O(n) work.
         for z in zones:
             touches = sorted(p["i"] for p in z["pts"])
-            if touches[1] < cutoff_idx - 80:
+            if touches[1] < cutoff_idx - 80:          # 2nd touch too old to trigger in window
                 continue
             for st in _detect_liftoff(cs, vw, z):
-                if st["ri"] < cutoff_idx:             # trigger older than `days` days
+                if st["ri"] < cutoff_idx:
                     continue
                 bars_ago = (n - 1) - st["ri"]
-                prev = best.get(sym)
+                date = time.strftime("%Y-%m-%d", time.gmtime(st["trigTime"]))
+                day = buckets.setdefault(date, {})
+                prev = day.get(sym)                   # one row per symbol per day (freshest)
                 if prev and prev["bars_ago"] <= bars_ago:
                     continue
-                best[sym] = {
-                    "symbol": sym, "setup": "liftoff", "bars_ago": bars_ago,
+                day[sym] = {
+                    "symbol": sym, "bars_ago": bars_ago,
                     "trig_time": time.strftime("%Y-%m-%d %H:%M",
                                                time.gmtime(st["trigTime"])),
                     "trig_close": round(st["trigClose"], 2),
                     "resistance": round(st["top"], 2),
                     "slope": st["slope"], "n_cand": st["nCand"],
                 }
-    rows = sorted(best.values(), key=lambda r: (r["bars_ago"], r["symbol"]))
-    _scan_cache["last"] = (sig, rows)
-    return rows
+    dates = sorted(buckets.keys(), reverse=True)[:ndays]
+    by_date = {d: sorted(buckets[d].values(),
+                         key=lambda r: (r["bars_ago"], r["symbol"])) for d in dates}
+    return {"dates": dates, "by_date": by_date}
+
+
+def _days_snap_path(tf: str, pivot_k: int) -> Path:
+    return SCAN_DIR / f"{tf}_p{pivot_k}.json"
+
+
+def _load_days_snapshot(tf: str, pivot_k: int):
+    p = _days_snap_path(tf, pivot_k)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def _save_days_snapshot(tf: str, pivot_k: int, sig: tuple, data: dict) -> None:
+    try:
+        SCAN_DIR.mkdir(exist_ok=True)
+        _days_snap_path(tf, pivot_k).write_text(
+            json.dumps({"sig": list(sig), "data": data}))
+    except Exception:
+        pass
+
+
+def _scan_days(tf: str, pivot_k: int, ndays: int = SCAN_NDAYS) -> dict:
+    """Day-bucketed universe scan, cached in memory AND on disk keyed by the data
+    mtime — so the heavy scan runs once per data version, restarts reload from
+    disk instantly, and the UI can browse any of the last `ndays` days for free."""
+    src_tf = "15m" if tf == "30m" else tf
+    files = glob.glob(str(DATA_DIR / src_tf / "*_historical.csv"))
+    sig = (tf, pivot_k, ndays,
+           round(max((os.path.getmtime(f) for f in files), default=0.0), 3))
+    key = (tf, pivot_k)
+    hit = _days_cache.get(key)
+    if hit and hit[0] == sig:
+        return hit[1]
+    snap = _load_days_snapshot(tf, pivot_k)
+    if snap and tuple(snap.get("sig", [])) == sig:
+        _days_cache[key] = (sig, snap["data"])
+        return snap["data"]
+    data = _compute_scan_days(tf, pivot_k, ndays)
+    _days_cache[key] = (sig, data)
+    _save_days_snapshot(tf, pivot_k, sig, data)
+    return data
 
 
 @app.get("/api/scan")
-def scan(tf: str = Query("15m"), pivot: int = Query(8), days: int = Query(2)):
+def scan(tf: str = Query("15m"), pivot: int = Query(8)):
     tf = tf if tf in ("1d", "1h", "30m", "15m") else "15m"
     pivot = max(2, min(int(pivot), 60))      # any input, clamped to a sane range
-    days = max(1, min(int(days), 10))
-    rows = _scan(tf, pivot, days)
-    return {"count": len(rows), "universe": len(_symbols()), "tf": tf,
-            "pivot": pivot, "days": days, "rows": rows}
+    data = _scan_days(tf, pivot, SCAN_NDAYS)
+    return {"tf": tf, "pivot": pivot, "universe": len(_symbols()),
+            "dates": data["dates"], "by_date": data["by_date"]}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -404,18 +441,17 @@ def _append_found(tf: str, rows: list[dict]) -> int:
 
 
 def _run_due_scans() -> None:
-    """For each TF whose bar has newly closed, scan it and accumulate hits.
-    fresh=1 → only setups triggering on the just-closed bar (allowing a 1-bar
-    forming-bar offset). Dedup keeps the list clean across repeated cycles."""
+    """For each TF whose bar has newly closed, refresh + persist the 30-day
+    scan cache so the UI never waits for a scan during/after market hours."""
     for tf in SCAN_TFS:
         lt = _latest_bar_time(tf)
         if lt and lt > _last_scanned[tf]:
-            rows = _scan(tf, 8, 2)
-            n = _append_found(tf, rows)
+            data = _scan_days(tf, 8, SCAN_NDAYS)        # compute + persist to disk
             _last_scanned[tf] = lt
             _monitor["last_run"] = _ist_now().strftime("%Y-%m-%d %H:%M:%S")
-            if n:
-                print(f"[resistance monitor] {tf}: +{n} new setup(s)")
+            latest = data["dates"][0] if data["dates"] else "—"
+            cnt = len(data["by_date"].get(latest, [])) if data["dates"] else 0
+            print(f"[resistance scanner] {tf}: 30d cache warmed — {latest}: {cnt} setup(s)")
 
 
 async def _scheduler() -> None:
@@ -439,6 +475,7 @@ async def _scheduler() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     FOUND_DIR.mkdir(exist_ok=True)
+    SCAN_DIR.mkdir(exist_ok=True)
     asyncio.create_task(_scheduler())
 
 
@@ -527,7 +564,8 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
   <span class="seg" id="tf"><button data-tf="1d">Daily</button><button data-tf="1h">Hourly</button><button data-tf="30m">30m</button><button data-tf="15m" class="on">15m</button></span>
   <span><label>Pivot</label><input id="k" type="number" min="2" max="60" step="1" value="8"></span>
   <button id="scan">🔭 Scan</button>
-  <span class="hint">Scans all stocks for the 🎯 lift-off setup triggered in the last 2 days · click a stock (or “See chart”) to view it below.</span>
+  <span><label>Day</label><select id="day" style="min-width:118px"><option>—</option></select></span>
+  <span class="hint">🎯 lift-off setups across all stocks · last 30 days stored · pick a Day · click a stock (or “See chart”) to view it below.</span>
   <span id="title"></span>
 </div>
 
@@ -888,26 +926,39 @@ async function showStock(sym){
 }
 $("chartclose").onclick=function(){ $("chartwrap").classList.remove("show"); };
 
-// ── scan: lift-off setups triggered across the universe in the last 2 days ──
+// ── scan: lift-off setups bucketed by trigger day (last 30 days, cached) ──
+let LAST=null;   // last /api/scan response: {tf,pivot,universe,dates,by_date}
+
 async function runScan(){
   const k=$("k").value||8;
-  $("scanMeta").innerHTML="Scanning all stocks on "+S.tf.toUpperCase()+"…";
+  $("scanMeta").innerHTML="Scanning all stocks on "+S.tf.toUpperCase()+"… (first run builds the 30-day cache)";
   $("scanRes").innerHTML=""; $("chartwrap").classList.remove("show");
   let j;
   try{ j=await(await fetch(api("/api/scan?tf="+S.tf+"&pivot="+k))).json(); }
   catch(e){ $("scanMeta").textContent="scan failed — is the server running?"; return; }
-  renderScan(j);
+  LAST=j;
+  const dd=$("day");
+  if(j.dates && j.dates.length){
+    dd.innerHTML=j.dates.map(function(d,i){ return "<option"+(i===0?" selected":"")+">"+d+"</option>"; }).join("");
+    renderDay(j.dates[0]);                           // default to the most recent day
+  }else{
+    dd.innerHTML="<option>—</option>";
+    $("scanRes").innerHTML="";
+    $("scanMeta").innerHTML="Scanned <b>"+j.universe+"</b> stocks · "+j.tf.toUpperCase()+" · pivot "+j.pivot
+      +" — no lift-off setups in the last 30 days."
+      +(j.tf==="1d" ? " &nbsp;<span style='color:#ef5350'>(intraday recommended — 15m/30m/1h)</span>" : "");
+  }
 }
 
-function renderScan(j){
-  $("scanMeta").innerHTML="Scanned <b>"+j.universe+"</b> stocks · "+j.tf.toUpperCase()+" · pivot "+j.pivot
-    +" · last "+j.days+" days — <b>"+j.count+"</b> stock(s) with a lift-off setup"
-    +(j.tf==="1d" ? " &nbsp;<span style='color:#ef5350'>(intraday recommended — pick 15m/30m/1h)</span>" : "");
-  if(!j.count){
-    $("scanRes").innerHTML='<div class="muted" style="padding:16px 2px">No lift-off setups triggered in the last 2 days. Try a different timeframe or pivot.</div>';
-    return;
-  }
-  const rows=j.rows.map(function(r){
+function renderDay(date){
+  if(!LAST) return;
+  const rows=(LAST.by_date && LAST.by_date[date]) || [];
+  $("scanMeta").innerHTML="<b>"+LAST.universe+"</b> stocks · "+LAST.tf.toUpperCase()+" · pivot "+LAST.pivot
+    +" · <b>"+date+"</b> — <b>"+rows.length+"</b> stock(s) with a lift-off setup"
+    +(LAST.tf==="1d" ? " &nbsp;<span style='color:#ef5350'>(intraday recommended — 15m/30m/1h)</span>" : "");
+  $("chartwrap").classList.remove("show");
+  if(!rows.length){ $("scanRes").innerHTML='<div class="muted" style="padding:16px 2px">No lift-off setups triggered on '+date+'.</div>'; return; }
+  const body=rows.map(function(r){
     const sl=(r.slope>0?"+":"")+r.slope+"%";
     return '<tr data-sym="'+r.symbol+'">'
       +'<td class="ssym">🎯 '+r.symbol+'</td>'
@@ -920,12 +971,13 @@ function renderScan(j){
   }).join("");
   $("scanRes").innerHTML='<table class="stbl"><thead><tr>'
     +'<th>Symbol</th><th>Trigger time</th><th>Resistance</th><th>Close</th><th>VWAP slope</th><th>Hug bars</th><th></th>'
-    +'</tr></thead><tbody>'+rows+'</tbody></table>';
+    +'</tr></thead><tbody>'+body+'</tbody></table>';
   [].slice.call(document.querySelectorAll("#scanRes tr[data-sym]")).forEach(function(tr){
     tr.onclick=function(){ showStock(tr.dataset.sym); };
   });
 }
 
 $("scan").onclick=runScan;
+$("day").onchange=function(){ if(LAST) renderDay($("day").value); };   // instant day-switch (no rescan)
 </script>
 </body></html>"""

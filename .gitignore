@@ -93,6 +93,8 @@ expiry_blast/sweep/
 
 # Resistance Marker — live-monitor accumulated daily setup lists (runtime output)
 stock_resistance/found/
+# Resistance Scanner — persisted 30-day scan snapshots (runtime cache)
+stock_resistance/scan_cache/
 
 # Scratch / dev-only scripts — kept locally, not part of the deployed server set.
 # (_regen_straddle_pnl.py is the deprecated dup of regen_straddle_pnl.py and is
