@@ -1,0 +1,12 @@
+[Unit]
+Description=Investeq 15-minute candle refresh (one-shot, triggered by .timer)
+
+[Service]
+Type=oneshot
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs/ema_scanner
+EnvironmentFile=/etc/investeq.env
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python live_workers.py candles --interval 15m
+StandardOutput=journal
+StandardError=journal

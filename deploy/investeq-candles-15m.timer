@@ -1,0 +1,15 @@
+[Unit]
+Description=Investeq 15-minute candle refresh — one minute after each 15m bar closes (IST)
+
+[Timer]
+# NSE 15m bars are :15-aligned and close at :30, :45, :00, :15
+# (09:15-09:30 closes 09:30, ... 15:15-15:30 closes 15:30). Trigger one minute
+# after each close to let the broker data settle. First useful close is 09:30,
+# so we start at 09:31; the 15:15-15:30 bar is picked up at 15:31.
+OnCalendar=Mon..Fri 09:31,46 Asia/Kolkata
+OnCalendar=Mon..Fri 10..15:01,16,31,46 Asia/Kolkata
+Persistent=false
+Unit=investeq-candles-15m.service
+
+[Install]
+WantedBy=timers.target

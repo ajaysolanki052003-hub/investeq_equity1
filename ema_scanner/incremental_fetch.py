@@ -48,8 +48,8 @@ def default_end_time() -> str:
 
 
 END_TIME = default_end_time()
-INTERVAL_FOLDER = {'1d': 'data/1d', '1h': 'data/1h'}
-INTERVAL_STEP = {'1d': timedelta(days=1), '1h': timedelta(hours=1)}
+INTERVAL_FOLDER = {'1d': 'data/1d', '1h': 'data/1h', '15m': 'data/15m'}
+INTERVAL_STEP = {'1d': timedelta(days=1), '1h': timedelta(hours=1), '15m': timedelta(minutes=15)}
 DELAY_BETWEEN_CHUNKS = 0.15
 # Groww historical-candles per-token budget is ~5 req/sec. 0.05 (20 req/sec)
 # was running 4x over the cap, which produced 30-40% 429 failure on the 523-
@@ -231,6 +231,22 @@ def update_one(path, symbol, interval, token, end_dt):
         bucket_close = bucket_close.where(~is_stub,
                                           df['datetime'] + timedelta(minutes=15))
         df = df[bucket_close <= end_dt]
+        if df.empty:
+            return 'no_new', 0
+        n = append_csv(path, df, interval)
+        return 'ok', n
+    if interval == '15m':
+        # Native Groww 15-minute candles already align to the NSE :15 grid
+        # (09:15, 09:30, ...), so no resampling is needed — but default_end_time
+        # is "now" during a session, so drop the still-forming bucket: keep only
+        # bars whose 15-min window has fully closed at/under end_dt.
+        start_str = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+        df = fetch_candles(symbol, '15m', start_str, end_str, token,
+                           delay_s=DELAY_BETWEEN_CHUNKS, verbose=False)
+        if df.empty:
+            return 'empty', 0
+        df = df[df['datetime'] > last_dt]
+        df = df[df['datetime'] + timedelta(minutes=15) <= end_dt]
         if df.empty:
             return 'no_new', 0
         n = append_csv(path, df, interval)

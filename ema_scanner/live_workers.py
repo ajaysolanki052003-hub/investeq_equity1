@@ -259,8 +259,8 @@ def run_ltp_loop() -> None:
 def run_candle_refresh(interval: str) -> None:
     """Append new bars to every CSV in data/{interval}. Reuses incremental_fetch
     logic but with a dynamic end-time (now, clamped to today's NSE close)."""
-    if interval not in ("1d", "1h"):
-        raise SystemExit(f"interval must be 1d or 1h, got {interval}")
+    if interval not in ("1d", "1h", "15m"):
+        raise SystemExit(f"interval must be 1d, 1h or 15m, got {interval}")
     jwt    = os.environ["GROWW_TOTP_JWT"]
     secret = os.environ["GROWW_TOTP_SECRET"]
     from incremental_fetch import (
@@ -332,7 +332,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ltp")
     cp = sub.add_parser("candles")
-    cp.add_argument("--interval", choices=["1d", "1h"], required=True)
+    cp.add_argument("--interval", choices=["1d", "1h", "15m"], required=True)
     args = ap.parse_args()
     if args.cmd == "ltp":
         run_ltp_loop()
