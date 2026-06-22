@@ -586,21 +586,28 @@ const $=function(id){return document.getElementById(id);};
 const S={candles:[], tf:"15m", zones:[], setups:[]};  // zones=resistance lines · setups=lift-off boxes
 let vwapSeries=null;
 
-const chart=LightweightCharts.createChart($("chart"),{autoSize:true,
-  layout:{background:{color:"#0b0d11"},textColor:"#cfd6e4"},
-  grid:{vertLines:{color:"#161b27"},horzLines:{color:"#161b27"}},
-  timeScale:{borderColor:"#222838",rightOffset:6,timeVisible:false,secondsVisible:false},
-  rightPriceScale:{borderColor:"#222838"},crosshair:{mode:0}});
-const candle=chart.addCandlestickSeries({upColor:"#26a69a",downColor:"#ef5350",
-  borderUpColor:"#26a69a",borderDownColor:"#ef5350",wickUpColor:"#26a69a",wickDownColor:"#ef5350"});
-
-// ── overlay canvas: resistance is drawn as shaded BLOCKS, not lines ──
-$("chart").style.position="relative";
-const ov=document.createElement("canvas");
-ov.style.cssText="position:absolute;left:0;top:0;pointer-events:none;z-index:2;";
-$("chart").appendChild(ov);
+// The chart lives inside #chartwrap which is display:none until a stock is
+// opened. Creating it while hidden gives it a 0×0 box and broken scales, so we
+// create it LAZILY on first reveal (when the container has real dimensions).
+let chart=null, candle=null, ov=null;
+function ensureChart(){
+  if(chart) return;
+  chart=LightweightCharts.createChart($("chart"),{autoSize:true,
+    layout:{background:{color:"#0b0d11"},textColor:"#cfd6e4"},
+    grid:{vertLines:{color:"#161b27"},horzLines:{color:"#161b27"}},
+    timeScale:{borderColor:"#222838",rightOffset:6,timeVisible:true,secondsVisible:false},
+    rightPriceScale:{borderColor:"#222838"},crosshair:{mode:0}});
+  candle=chart.addCandlestickSeries({upColor:"#26a69a",downColor:"#ef5350",
+    borderUpColor:"#26a69a",borderDownColor:"#ef5350",wickUpColor:"#26a69a",wickDownColor:"#ef5350"});
+  // ── overlay canvas: resistance is drawn as shaded BLOCKS, not lines ──
+  $("chart").style.position="relative";
+  ov=document.createElement("canvas");
+  ov.style.cssText="position:absolute;left:0;top:0;pointer-events:none;z-index:2;";
+  $("chart").appendChild(ov);
+}
 
 function drawBlocks(){
+  if(!chart||!candle||!ov) return;
   const w=$("chart").clientWidth, h=$("chart").clientHeight;
   const dpr=window.devicePixelRatio||1;
   if(ov.width!==w*dpr||ov.height!==h*dpr){ ov.width=w*dpr; ov.height=h*dpr; ov.style.width=w+"px"; ov.style.height=h+"px"; }
@@ -738,6 +745,7 @@ function computeVWAP(candles, resetDaily){
 }
 
 function drawVWAP(){
+  if(!chart) return;
   if(vwapSeries){ try{chart.removeSeries(vwapSeries)}catch(e){} vwapSeries=null; }
   if(!S.candles.length) return;
   vwapSeries=chart.addLineSeries({color:"#a855f7", lineWidth:2, lineStyle:0,
@@ -917,7 +925,8 @@ function findAndDraw(){
 
 // open a stock's chart BELOW the list and draw its lift-off setups
 async function showStock(sym){
-  $("chartwrap").classList.add("show");
+  $("chartwrap").classList.add("show");      // container must be visible BEFORE the chart is created
+  ensureChart();
   $("chartsym").textContent=sym+" · "+S.tf.toUpperCase()+" — loading…";
   const ok=await load(sym);
   const n = ok ? findAndDraw() : 0;
