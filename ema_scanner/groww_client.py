@@ -19,8 +19,13 @@ Usage:
     df = fetch_candles('RELIANCE', '1h', '2020-01-01 09:15:00', '2026-05-08 15:30:00', token)
 """
 
+import json
+import os
+import tempfile
+import threading
 import time
 from datetime import timedelta
+from pathlib import Path
 from typing import Iterable, Optional
 
 import pandas as pd
@@ -29,6 +34,62 @@ import requests
 
 GROWW_TOKEN_URL   = 'https://api.groww.in/v1/token/api/access'
 GROWW_CANDLES_URL = 'https://api.groww.in/v1/historical/candles'
+
+# ───────────────────────── shared access-token cache ────────────────────────
+# Every service on the VM (scanner, candle workers, optlab, live strategy, …)
+# calls get_access_token(). Minting is itself rate-limited by Groww on
+# /v1/token/api/access, and a fresh mint per request quickly trips a 429 that
+# then starves EVERY other worker of a token (observed 2026-06-23: optlab's
+# retry storm 429'd the token endpoint and crashed the 15m candle refresh).
+#
+# Fix: persist one token to a file all processes share, refresh it at most once
+# per _TOKEN_TTL, and on a 429 enter a cooldown (serving the last good token)
+# instead of hammering. This collapses VM-wide token mints to ~1 per 50 min.
+_TOKEN_TTL     = 3000.0   # reuse a healthy token for ~50 min before refreshing
+_MINT_COOLDOWN = 300.0    # after a 429, wait this long before re-minting. Kept
+                          # high (≤12 mints/hr VM-wide) so a stuck token can
+                          # never re-trip Groww's extended token rate-limit.
+_token_lock = threading.Lock()
+
+
+def _token_cache_path() -> Path:
+    base = os.environ.get("INVESTEQ_DATA") or tempfile.gettempdir()
+    return Path(base) / ".groww_token.json"
+
+
+def _read_token_cache() -> dict:
+    try:
+        return json.loads(_token_cache_path().read_text())
+    except Exception:
+        return {}
+
+
+def _write_token_cache(d: dict) -> None:
+    try:
+        _token_cache_path().write_text(json.dumps(d))
+    except Exception:
+        pass   # cache is an optimization; never fail the caller on a write error
+
+
+def _mint_access_token(totp_jwt: str, totp_secret: str, timeout: int = 30) -> str:
+    """Raw token mint — one POST to Groww's token endpoint. Rate-limited; call
+    via get_access_token(), which caches + backs off, not directly."""
+    live_totp = pyotp.TOTP(totp_secret).now()
+    r = requests.post(
+        GROWW_TOKEN_URL,
+        headers={
+            'Authorization': f'Bearer {totp_jwt}',
+            'Content-Type':  'application/json',
+        },
+        json={'key_type': 'totp', 'totp': live_totp},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    data = r.json()
+    token = data.get('token') or data.get('access_token')
+    if not token:
+        raise RuntimeError(f'No token in response: {data}')
+    return token
 
 # Map our short keys to the names Groww's API expects in `candle_interval`.
 INTERVAL_MAP = {
@@ -71,23 +132,37 @@ CHUNK_DAYS = {
 
 
 def get_access_token(totp_jwt: str, totp_secret: str, timeout: int = 30) -> str:
-    """Exchange the long-lived TOTP JWT + a live TOTP for a short-lived access token."""
-    live_totp = pyotp.TOTP(totp_secret).now()
-    r = requests.post(
-        GROWW_TOKEN_URL,
-        headers={
-            'Authorization': f'Bearer {totp_jwt}',
-            'Content-Type':  'application/json',
-        },
-        json={'key_type': 'totp', 'totp': live_totp},
-        timeout=timeout,
-    )
-    r.raise_for_status()
-    data = r.json()
-    token = data.get('token') or data.get('access_token')
-    if not token:
-        raise RuntimeError(f'No token in response: {data}')
-    return token
+    """Return a Groww access token, shared across all processes via an on-disk
+    cache. Refreshes at most once per ~50 min; on a 429 it backs off and serves
+    the last good token rather than re-hammering the rate-limited endpoint."""
+    now = time.time()
+    with _token_lock:
+        cache = _read_token_cache()
+        tok    = cache.get("token")
+        minted = cache.get("minted_at", 0.0)
+        # 1. Healthy cached token (possibly minted by another process) → reuse.
+        if tok and now - minted < _TOKEN_TTL:
+            return tok
+        # 2. In post-429 cooldown → don't mint; serve stale token if we have one.
+        if now - cache.get("last_fail", 0.0) < _MINT_COOLDOWN:
+            if tok:
+                return tok
+            raise RuntimeError(
+                f"Groww token endpoint in 429 cooldown ({_MINT_COOLDOWN:.0f}s) "
+                "and no cached token available")
+        # 3. Mint a fresh one.
+        try:
+            new = _mint_access_token(totp_jwt, totp_secret, timeout)
+        except requests.exceptions.HTTPError as e:
+            resp = getattr(e, "response", None)
+            if resp is not None and resp.status_code == 429:
+                cache["last_fail"] = now
+                _write_token_cache(cache)
+                if tok:
+                    return tok   # serve stale rather than fail the caller
+            raise
+        _write_token_cache({"token": new, "minted_at": now, "last_fail": 0.0})
+        return new
 
 
 def _groww_symbol(symbol: str, exchange: str = 'NSE') -> str:
