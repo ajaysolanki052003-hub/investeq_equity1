@@ -731,6 +731,10 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
                           description="MULTI-STEP trail SL: once in profit by trail_pct points, SL ratchets up with the close — keeps a `trail_distance`-point trail behind the price and never moves against the trade. Default ON."),
                       trail_pct: float = Query(0.135,
                           description="Trail distance as % of entry spot. Default 0.135% ≈ 30 NIFTY pts at 22k spot. Decoupled from sl_pct so the initial stop can be wider than the trail."),
+                      time_stop_min: int = Query(75,
+                          description="Time-stop: once this many minutes have elapsed since entry, if the trade is not in profit by more than time_stop_pct (i.e. price is at/below the entry/buying price), exit at that bar's close. 0 = disabled. Default 75 — the least-damaging setting from the sweep (matches baseline PF 1.38)."),
+                      time_stop_pct: float = Query(0.0,
+                          description="Profit cushion for the time-stop, as % of entry spot. After time_stop_min minutes, a trade whose profit is <= this is bailed out. Default 0.0% = below-buy-only (only cut genuine losers, not breakeven trades that may still trail green)."),
                       position_mode: str = Query("opposite_ok",
                           description="opposite_ok = block same-side only while in trade (opposite-side signals allowed). single = block ALL signals while any position is open.")):
     """Live-trades endpoint backing the simplified VIEW panel.
@@ -798,8 +802,11 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
         seg_cl = cl_arr[idx:]
         seg_hi = hi_arr[idx:]
         seg_lo = lo_arr[idx:]
+        # Minutes elapsed since entry for the time-stop rule below.
+        elapsed_min = (seg_ts - ent) / np.timedelta64(1, "m")
         spot = float(e["entry_spot"])
         side = e["side"]
+        time_cushion = spot * (time_stop_pct / 100.0)   # profit pts needed to survive the time-stop
         sl_distance    = spot * sl_frac       # initial SL distance in pts
         trail_distance = spot * (trail_pct / 100.0)   # trail step in pts (decoupled)
         if side == "LONG":
@@ -846,6 +853,18 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
                     exit_t = seg_ts[i]
                     exit_p = float(sl_current)
                     reason = "TRAIL" if trail_active else "SL"
+                    break
+            # Time-stop floor: once `time_stop_min` minutes have passed since
+            # entry, if the trade is not in profit by more than the cushion
+            # (default 0% = price at/below the buying price), bail out at this
+            # close. By user request 2026-06-23; locked to 75 min / below-buy
+            # after a sweep (the least-damaging setting — see PF/total tradeoff).
+            # Checked AFTER TGT/SL/trail so a clean win/stop on the same bar
+            # keeps its native reason.
+            if time_stop_min > 0 and elapsed_min[i] >= time_stop_min:
+                pnl_now = (c - spot) if side == "LONG" else (spot - c)
+                if pnl_now <= time_cushion:
+                    exit_t, exit_p, reason = seg_ts[i], float(c), "TIME"
                     break
         if exit_t is None:
             exit_t = seg_ts[-1]; exit_p = float(seg_cl[-1]); reason = "EOD"
@@ -896,7 +915,7 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
     if not trades:
         stats = {"n":0,"win_rate":0.0,"total_pnl":0.0,"avg_pnl":0.0,"pf":None,
                  "long_n":0,"short_n":0,"sl_hits":0,"tgt_hits":0,"eod_exits":0,
-                 "trail_hits":0,"sigma10_n":0,"sigma_oi_n":0,
+                 "trail_hits":0,"time_exits":0,"sigma10_n":0,"sigma_oi_n":0,
                  "n_days":0,"avg_per_day":0.0}
     else:
         arr = np.array([t["pnl_pts"] for t in trades])
@@ -921,6 +940,7 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
             "tgt_hits":   reasons.count("TGT"),
             "eod_exits":  reasons.count("EOD"),
             "trail_hits": reasons.count("TRAIL"),
+            "time_exits": reasons.count("TIME"),
             "sigma10_n":  sources.count("sigma10"),
             "sigma_oi_n": sources.count("sigma_oi"),
             "n_days":     len({str(t["day"]) for t in trades}),
@@ -928,6 +948,7 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
         }
     return JSONResponse({
         "mode": mode, "sl_pct": sl_pct, "tgt_pct": tgt_pct,
+        "time_stop_min": time_stop_min, "time_stop_pct": time_stop_pct,
         "trades": trades, "stats": stats,
     })
 
@@ -1147,14 +1168,14 @@ HTML = """<!doctype html>
 
 <!-- TRADES PANEL — every parameter is now locked to the winning config:
      view=Both, SL=0.18%, TGT=0.50%, Trail=MULTI 0.135% (≈30 pts),
-     position_mode=Single. Only the stats strip is rendered. -->
+     TimeStop=75min/below-buy, position_mode=Single. Only the stats strip is rendered. -->
 <div id="v-panel" style="
      display:flex; align-items:center; gap:14px; padding:10px 18px; flex-wrap:wrap;
      background:linear-gradient(180deg,#0d1018 0%, #10131a 100%);
      border-bottom:1px solid var(--border);">
   <span style="color:var(--accent); font-weight:700; letter-spacing:0.5px;">▶ TRADES</span>
   <span style="color:var(--muted); font-size:11px;"
-        title="Both methods merged with same-side dedup-7. Single position at a time. Exit rules (SL / target / multi-step trail) are tuned defaults — values intentionally not surfaced in the header.">
+        title="Both methods merged with same-side dedup-7. Single position at a time. Exit rules (SL / target / multi-step trail + 75-min time-stop: bail if price is at/below the entry/buying price after 75 minutes) are tuned defaults — values intentionally not surfaced in the header.">
     Both · Single
   </span>
 
@@ -1173,7 +1194,8 @@ HTML = """<!doctype html>
     <b id="v-sl-hits"  style="color:#ef4444;">—</b> SL ·
     <b id="v-tgt-hits" style="color:#22c55e;">—</b> TGT ·
     <b id="v-eod"      style="color:var(--muted);">—</b> EOD ·
-    <b id="v-trail-hits" style="color:#fbbf24;">—</b> TRAIL &nbsp;·&nbsp;
+    <b id="v-trail-hits" style="color:#fbbf24;">—</b> TRAIL ·
+    <b id="v-time"     style="color:#f97316;">—</b> TIME &nbsp;·&nbsp;
     <b id="v-per-day"  style="color:#a78bfa;">—</b> /day &nbsp;·&nbsp;
     L <b id="v-long"   style="color:#06b6d4;">—</b> ·
     S <b id="v-short"  style="color:#f59e0b;">—</b> &nbsp;|&nbsp;
@@ -1730,6 +1752,7 @@ function applyAllMarkers() {
                        : tr.reason === 'TGT'   ? '#16a34a'
                        : tr.reason === 'SL'    ? '#b91c1c'
                        : tr.reason === 'TRAIL' ? '#fbbf24'
+                       : tr.reason === 'TIME'  ? '#f97316'
                        :                          '#9ca3af';   // EOD
       const shape  = tr.side === 'LONG' ? 'arrowUp' : 'arrowDown';
       const pos    = tr.side === 'LONG' ? 'belowBar' : 'aboveBar';
@@ -1884,6 +1907,7 @@ function renderTradeTooltip(tip, trades, pt) {
                   : tr.reason === 'TGT'   ? '#22c55e'
                   : tr.reason === 'SL'    ? '#ef4444'
                   : tr.reason === 'TRAIL' ? '#fbbf24'
+                  : tr.reason === 'TIME'  ? '#f97316'
                   :                          '#9ca3af';
   const sideCol = tr.side === 'LONG' ? '#22c55e' : '#ef4444';
   const srcLabel = tr.source === 'sigma10' ? 'Σ·10'
@@ -2078,6 +2102,7 @@ function renderViewStats() {
   $('v-tgt-hits').textContent = fmt(s.tgt_hits, 0);
   $('v-eod').textContent      = fmt(s.eod_exits, 0);
   $('v-trail-hits').textContent = fmt(s.trail_hits || 0, 0);
+  $('v-time').textContent     = fmt(s.time_exits || 0, 0);
   $('v-per-day').textContent  = fmt(s.avg_per_day || 0, 2);
   $('v-long').textContent     = fmt(s.long_n, 0);
   $('v-short').textContent    = fmt(s.short_n, 0);
