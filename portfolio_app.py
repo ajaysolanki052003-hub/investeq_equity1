@@ -211,6 +211,23 @@ PROJECTS = [
         "metrics": [],
         "accent": "#f59e0b",
     },
+    {
+        "id": "poc-touch",
+        "name": "POC Touch Screener",
+        "instrument": "Equities",
+        "tag": "LIVE",
+        "category": "EQUITIES",
+        "thesis": "Pick any trading day and list every NSE stock whose daily candle "
+                  "touched a Daily / Weekly / Monthly Volume-Profile POC line — the "
+                  "busiest-volume price of the period falling inside that day's "
+                  "high–low. Click a stock to see the candle cut the POC line.",
+        "stack": [],
+        "port": 8711,
+        "url": "/vwap/",
+        "path": "",
+        "metrics": [],
+        "accent": "#818cf8",
+    },
 ]
 
 

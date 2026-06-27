@@ -225,16 +225,24 @@ def _active_window(cs, vw, z):
     return first, second, brk
 
 
-def _detect_liftoff(cs, vw, z) -> list[dict]:
-    """🎯 Lift-off: level tested ≥2× → price holds below → ≥4 closes hug a flat
-    VWAP → next GREEN candle closes clearly above the VWAP, still below the
-    level. Returns ALL such setups in the active window (not just the first)."""
+def _detect_liftoff(cs, vw, z, min_hug: int = 4, green_only: bool = True) -> list[dict]:
+    """🎯 Lift-off: level tested ≥2× → price holds below → ≥`min_hug` closes hug a
+    flat VWAP → next candle closes clearly above the VWAP, still below the level.
+
+    Two sweepable variations (exposed in the UI):
+      • min_hug    : hug run length. 4 (default/strict) or 3 (looser — catches
+                     3- and 4-candle coils).
+      • green_only : if True (default) the lift-off candle must be GREEN
+                     (close>open). If False, ANY colour qualifies as long as it
+                     closes clearly above the VWAP.
+    Returns ALL such setups in the active window (not just the first)."""
     win = _active_window(cs, vw, z)
     if not win:
         return []
     first, a, brk = win
     n, top = len(cs), z["top"]
-    HUG, FLAT, MINHUG = 0.004, 0.004, 4
+    HUG, FLAT = 0.004, 0.004
+    MINHUG = min_hug
     cap = min(brk - 1, n - 1, a + 80)
     below = lambda i: cs[i]["close"] < top * (1.0015)
     out, i = [], a + 1
@@ -247,7 +255,8 @@ def _detect_liftoff(cs, vw, z) -> list[dict]:
             L = j
             if flat and L <= cap:
                 c = cs[L]
-                if c["close"] > c["open"] and c["close"] > vw[L] * (1 + HUG) and below(L):
+                is_green = c["close"] > c["open"]
+                if (is_green or not green_only) and c["close"] > vw[L] * (1 + HUG) and below(L):
                     out.append({"kind": 3, "li": first, "ri": L, "top": top,
                                 "slope": round((vw[h1] - vw[h0]) / vw[h0] * 100, 2),
                                 "nCand": h1 - h0 + 1,
@@ -265,10 +274,12 @@ SCAN_NDAYS = 30
 _days_cache: dict[tuple, tuple] = {}     # (tf, pivot) -> (sig, data)
 
 
-def _compute_scan_days(tf: str, pivot_k: int, ndays: int) -> dict:
+def _compute_scan_days(tf: str, pivot_k: int, ndays: int,
+                       min_hug: int = 4, green_only: bool = True) -> dict:
     """Scan the universe and bucket every lift-off setup by its TRIGGER date,
     keeping the last `ndays` trading days. Returns {dates:[...desc], by_date:{}}.
-    One run serves all days, so day-switching in the UI needs no rescan."""
+    One run serves all days, so day-switching in the UI needs no rescan.
+    `min_hug`/`green_only` are the lift-off variation knobs (see _detect_liftoff)."""
     buckets: dict[str, dict] = {}                 # date -> {symbol -> row}
     for sym in _symbols():
         try:
@@ -287,7 +298,7 @@ def _compute_scan_days(tf: str, pivot_k: int, ndays: int) -> dict:
             touches = sorted(p["i"] for p in z["pts"])
             if touches[1] < cutoff_idx - 80:          # 2nd touch too old to trigger in window
                 continue
-            for st in _detect_liftoff(cs, vw, z):
+            for st in _detect_liftoff(cs, vw, z, min_hug, green_only):
                 if st["ri"] < cutoff_idx:
                     continue
                 bars_ago = (n - 1) - st["ri"]
@@ -310,12 +321,20 @@ def _compute_scan_days(tf: str, pivot_k: int, ndays: int) -> dict:
     return {"dates": dates, "by_date": by_date}
 
 
-def _days_snap_path(tf: str, pivot_k: int) -> Path:
-    return SCAN_DIR / f"{tf}_p{pivot_k}.json"
+def _variation_suffix(min_hug: int, green_only: bool) -> str:
+    """File/cache-key suffix for a lift-off variation. Empty for the default
+    (4-bar hug / green-only) so existing default snapshots stay valid."""
+    if min_hug == 4 and green_only:
+        return ""
+    return f"_h{min_hug}_g{1 if green_only else 0}"
 
 
-def _load_days_snapshot(tf: str, pivot_k: int):
-    p = _days_snap_path(tf, pivot_k)
+def _days_snap_path(tf: str, pivot_k: int, min_hug: int = 4, green_only: bool = True) -> Path:
+    return SCAN_DIR / f"{tf}_p{pivot_k}{_variation_suffix(min_hug, green_only)}.json"
+
+
+def _load_days_snapshot(tf: str, pivot_k: int, min_hug: int = 4, green_only: bool = True):
+    p = _days_snap_path(tf, pivot_k, min_hug, green_only)
     if not p.exists():
         return None
     try:
@@ -324,43 +343,51 @@ def _load_days_snapshot(tf: str, pivot_k: int):
         return None
 
 
-def _save_days_snapshot(tf: str, pivot_k: int, sig: tuple, data: dict) -> None:
+def _save_days_snapshot(tf: str, pivot_k: int, sig: tuple, data: dict,
+                        min_hug: int = 4, green_only: bool = True) -> None:
     try:
         SCAN_DIR.mkdir(exist_ok=True)
-        _days_snap_path(tf, pivot_k).write_text(
+        _days_snap_path(tf, pivot_k, min_hug, green_only).write_text(
             json.dumps({"sig": list(sig), "data": data}))
     except Exception:
         pass
 
 
-def _scan_days(tf: str, pivot_k: int, ndays: int = SCAN_NDAYS) -> dict:
+def _scan_days(tf: str, pivot_k: int, ndays: int = SCAN_NDAYS,
+               min_hug: int = 4, green_only: bool = True) -> dict:
     """Day-bucketed universe scan, cached in memory AND on disk keyed by the data
-    mtime — so the heavy scan runs once per data version, restarts reload from
-    disk instantly, and the UI can browse any of the last `ndays` days for free."""
+    mtime AND the lift-off variation — so the heavy scan runs once per
+    (data version, variation), restarts reload from disk instantly, and the UI
+    can browse any of the last `ndays` days for free."""
     src_tf = "15m" if tf == "30m" else tf
     files = glob.glob(str(DATA_DIR / src_tf / "*_historical.csv"))
-    sig = (tf, pivot_k, ndays,
+    sig = (tf, pivot_k, ndays, min_hug, green_only,
            round(max((os.path.getmtime(f) for f in files), default=0.0), 3))
-    key = (tf, pivot_k)
+    key = (tf, pivot_k, min_hug, green_only)
     hit = _days_cache.get(key)
     if hit and hit[0] == sig:
         return hit[1]
-    snap = _load_days_snapshot(tf, pivot_k)
+    snap = _load_days_snapshot(tf, pivot_k, min_hug, green_only)
     if snap and tuple(snap.get("sig", [])) == sig:
         _days_cache[key] = (sig, snap["data"])
         return snap["data"]
-    data = _compute_scan_days(tf, pivot_k, ndays)
+    data = _compute_scan_days(tf, pivot_k, ndays, min_hug, green_only)
     _days_cache[key] = (sig, data)
-    _save_days_snapshot(tf, pivot_k, sig, data)
+    _save_days_snapshot(tf, pivot_k, sig, data, min_hug, green_only)
     return data
 
 
 @app.get("/api/scan")
-def scan(tf: str = Query("15m"), pivot: int = Query(8)):
+def scan(tf: str = Query("15m"), pivot: int = Query(8),
+         min_hug: int = Query(4, description="Minimum hug run length (≥N candles). UI offers 1..5; the '>5' option sends 6 (≥6 catches 6+). Default 4."),
+         green: int = Query(1, description="Lift-off candle colour gate: 1=green-only (default), 0=any colour (just close above VWAP).")):
     tf = tf if tf in ("1d", "1h", "30m", "15m") else "15m"
     pivot = max(2, min(int(pivot), 60))      # any input, clamped to a sane range
-    data = _scan_days(tf, pivot, SCAN_NDAYS)
+    min_hug = max(1, min(int(min_hug), 60))  # 1..5 from the UI; '>5' sends 6 (≥6 = 6+); bounded for safety
+    green_only = bool(int(green))
+    data = _scan_days(tf, pivot, SCAN_NDAYS, min_hug, green_only)
     return {"tf": tf, "pivot": pivot, "universe": len(_symbols()),
+            "min_hug": min_hug, "green": int(green_only),
             "dates": data["dates"], "by_date": data["by_date"]}
 
 
@@ -551,6 +578,11 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
 .stbl .pos{color:#34d399}.stbl .neg{color:#ef5350}
 .seebtn{padding:4px 10px;font-size:12px;background:#172033;border:1px solid var(--border);color:#cfd6e4;border-radius:6px}
 .seebtn:hover{border-color:var(--accent);color:var(--accent)}
+.sesshd{margin:18px 0 6px;font-size:13px;font-weight:700;color:var(--text);border-left:3px solid var(--accent);padding-left:9px}
+.sesshd:first-child{margin-top:4px}
+.sesshd .span{font-weight:400;font-size:11px;color:var(--muted)}
+.sesshd .cnt{color:var(--accent)}
+.sessempty{color:var(--muted);font-size:12px;padding:4px 2px 6px 11px}
 #chartwrap{display:none;margin-top:18px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
 #chartwrap.show{display:block}
 #charthead{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:#10131a;border-bottom:1px solid var(--border)}
@@ -563,6 +595,8 @@ button.on{background:linear-gradient(135deg,#f59e0b,#b45309);color:#1a1206;borde
   <span class="tag">RESISTANCE SCANNER</span>
   <span class="seg" id="tf"><button data-tf="1d">Daily</button><button data-tf="1h">Hourly</button><button data-tf="30m">30m</button><button data-tf="15m" class="on">15m</button></span>
   <span><label>Pivot</label><input id="k" type="number" min="2" max="60" step="1" value="8"></span>
+  <span><label>Hug</label><select id="hug" title="Minimum candles that must hug the flat VWAP before the lift-off"><option value="1">≥1</option><option value="2">≥2</option><option value="3">≥3</option><option value="4" selected>≥4</option><option value="5">≥5</option><option value="6">&gt;5 (6+)</option></select></span>
+  <span><label>Lift-off</label><select id="lift" title="The candle that pops off the VWAP"><option value="1">Green only</option><option value="0">Any colour (close &gt; VWAP)</option></select></span>
   <button id="scan">🔭 Scan</button>
   <span><label>Day</label><select id="day" style="min-width:118px"><option>—</option></select></span>
   <span class="hint">🎯 lift-off setups across all stocks · last 30 days stored · pick a Day · click a stock (or “See chart”) to view it below.</span>
@@ -583,7 +617,7 @@ const APP_BASE="__APP_BASE__";
 const api=function(p){return (APP_BASE||"")+p;};
 const $=function(id){return document.getElementById(id);};
 
-const S={candles:[], tf:"15m", zones:[], setups:[]};  // zones=resistance lines · setups=lift-off boxes
+const S={candles:[], tf:"15m", zones:[], setups:[], minHug:4, greenOnly:true, sym:""};  // zones=resistance lines · setups=lift-off boxes · minHug/greenOnly = lift-off variation knobs · sym = open chart symbol
 let vwapSeries=null;
 
 // The chart lives inside #chartwrap which is display:none until a stock is
@@ -725,6 +759,12 @@ async function load(sym){
   } else {
     chart.timeScale().fitContent();
   }
+  // Force the price (vertical) axis to re-fit the NEW symbol. Without this, if
+  // the user dragged/zoomed the price axis on the previous stock, lightweight-
+  // charts leaves autoScale OFF and carries that fixed range over — so a stock
+  // at a different price level renders off-screen or squished. Re-enabling it
+  // on every load makes each chart fit cleanly to its own data.
+  candle.priceScale().applyOptions({autoScale:true});
   drawVWAP();
   $("title").textContent=sym+" · "+S.tf+" · "+S.candles.length+" bars";
   return true;
@@ -825,7 +865,8 @@ function detectScenario(vis, vw, z){
   const out=[], n=vis.length, BREAK=0.0015;
   const HUG=0.004;    // a close within 0.4% of the VWAP = "sitting on the line"
   const FLAT=0.004;   // VWAP slope across the hug must stay within +/-0.4% (flat/slight)
-  const MINHUG=4;     // ...for at least 4 candles
+  const MINHUG=S.minHug||4;       // hug length variation: 4 (strict) or 3 (3 & 4)
+  const GREENONLY=S.greenOnly!==false;  // lift-off candle: green-only (default) or any colour
   const top=z.top;
   const touches=z.pts.map(function(p){return p.i;}).sort(function(a,b){return a-b;});
   if(touches.length<2) return out;                   // MANDATORY: tested >= 2 times
@@ -864,7 +905,8 @@ function detectScenario(vis, vw, z){
       const L=j;                                               // candle that ended the hug = lift-off candidate
       if(flat && L<=cap){
         const c=vis[L];
-        const greenLift = c.close>c.open && c.close > vw[L]*(1+HUG) && belowRes(L);
+        const isGreen = c.close>c.open;
+        const greenLift = (isGreen || !GREENONLY) && c.close > vw[L]*(1+HUG) && belowRes(L);
         if(greenLift){
           const slopePct=+(((vw[h1]-vw[h0])/vw[h0])*100).toFixed(2);
           // OUTER box: the FULL setup — first test through the lift-off, enclosing the resistance line
@@ -877,7 +919,7 @@ function detectScenario(vis, vw, z){
           const vwPts=[]; for(let k=h0;k<=L;k++) vwPts.push({time:vis[k].time, value:vw[k]});
           out.push({kind:3, x0:vis[left].time, x1:vis[right].time, li:left, ri:right,
                     yTop:top*(1+0.004), yBottom:minLow*(1-0.002),
-                    label:"tested ≥2× · hug flat VWAP · green lift-off ↑",
+                    label:"tested ≥2× · hug flat VWAP ≥"+MINHUG+" · "+(GREENONLY?"green":"any")+" lift-off ↑",
                     slope:slopePct, nCand:len, vwPts:vwPts,
                     inner:{x0:vis[h0].time, x1:vis[L].time, yTop:hiH*(1+0.002), yBottom:loL*(1-0.002)},
                     pts:[{time:vis[L].time, value:vis[L].close, star:true}]});  // lift-off candle (triangle)
@@ -921,10 +963,35 @@ function findAndDraw(){
 [].slice.call($("tf").children).forEach(function(b){ b.onclick=function(){
   [].slice.call($("tf").children).forEach(function(x){x.classList.remove("on");});
   b.classList.add("on"); S.tf=b.dataset.tf;
+  // tf change auto-refreshes too (matches Pivot/Hug/Lift-off). Unlike those,
+  // the candles themselves differ per timeframe, so the open chart is RELOADED
+  // for the new TF (showStock re-fetches candles) rather than just re-detected.
+  if(LAST) runScan();
+  if($("chartwrap").classList.contains("show") && S.sym) showStock(S.sym);
 };});
+
+// ── lift-off variation knobs: re-draw the open chart instantly, and re-scan the
+//    whole universe so the table reflects the chosen variation ──
+function applyVariation(){
+  S.minHug    = +$("hug").value || 4;
+  S.greenOnly = $("lift").value !== "0";
+  if($("chartwrap").classList.contains("show") && S.candles.length){
+    const n=findAndDraw();                       // re-detect on the current chart
+    const sym=($("chartsym").textContent||"").split(" ")[0];
+    $("chartsym").textContent=sym+" · "+S.tf.toUpperCase()+" · "+n+" lift-off setup(s)";
+  }
+  if(LAST) runScan();                            // refresh the all-stocks list for the new variation
+}
+$("hug").onchange=applyVariation;
+$("lift").onchange=applyVariation;
+// Pivot is part of the same detection — changing it must refresh the list (and the
+// open chart) WITHOUT waiting for a manual Scan click. onchange (commit/blur/Enter
+// or spinner-arrow) avoids re-scanning on every keystroke while typing a number.
+$("k").onchange=applyVariation;
 
 // open a stock's chart BELOW the list and draw its lift-off setups
 async function showStock(sym){
+  S.sym=sym;                                 // remember the open symbol so a tf switch can reload it
   $("chartwrap").classList.add("show");      // container must be visible BEFORE the chart is created
   ensureChart();
   $("chartsym").textContent=sym+" · "+S.tf.toUpperCase()+" — loading…";
@@ -943,7 +1010,7 @@ async function runScan(){
   $("scanMeta").innerHTML="Scanning all stocks on "+S.tf.toUpperCase()+"… (first run builds the 30-day cache)";
   $("scanRes").innerHTML=""; $("chartwrap").classList.remove("show");
   let j;
-  try{ j=await(await fetch(api("/api/scan?tf="+S.tf+"&pivot="+k))).json(); }
+  try{ j=await(await fetch(api("/api/scan?tf="+S.tf+"&pivot="+k+"&min_hug="+S.minHug+"&green="+(S.greenOnly?1:0)))).json(); }
   catch(e){ $("scanMeta").textContent="scan failed — is the server running?"; return; }
   LAST=j;
   const dd=$("day");
@@ -959,28 +1026,66 @@ async function runScan(){
   }
 }
 
+// Which intraday session a trigger time falls in (IST, NSE 09:15–15:30):
+//   0 = Morning 09:15–11:30 · 1 = After 11:30–13:30 · 2 = Last 13:30–15:30
+function sessionOf(trig){
+  const hm=(trig||"").slice(11,16);            // "HH:MM" out of "YYYY-MM-DD HH:MM"
+  const mins=(+hm.slice(0,2))*60 + (+hm.slice(3,5));
+  if(mins < 11*60+30) return 0;                // before 11:30
+  if(mins < 13*60+30) return 1;                // 11:30–13:30
+  return 2;                                     // 13:30 onward
+}
+const SESSIONS=[
+  {name:"🌅 Morning", span:"09:15–11:30"},
+  {name:"☀️ After",   span:"11:30–13:30"},
+  {name:"🌆 Last",    span:"13:30–15:30"},
+];
+const TBL_HEAD='<thead><tr><th>Symbol</th><th>Trigger time</th><th>Resistance</th>'
+  +'<th>Close</th><th>VWAP slope</th><th>Hug bars</th><th></th></tr></thead>';
+
+function rowHtml(r){
+  const sl=(r.slope>0?"+":"")+r.slope+"%";
+  return '<tr data-sym="'+r.symbol+'">'
+    +'<td class="ssym">🎯 '+r.symbol+'</td>'
+    +'<td class="muted">'+r.trig_time+'</td>'
+    +'<td>'+r.resistance+'</td>'
+    +'<td>'+r.trig_close+'</td>'
+    +'<td class="'+(r.slope>=0?"pos":"neg")+'">'+sl+'</td>'
+    +'<td>'+r.n_cand+'</td>'
+    +'<td><button class="seebtn">📈 See chart</button></td></tr>';
+}
+
 function renderDay(date){
   if(!LAST) return;
   const rows=(LAST.by_date && LAST.by_date[date]) || [];
+  // Split the day's setups into the three intraday sessions (intraday TFs only;
+  // Daily has no meaningful session, so it keeps a single flat table).
+  const isIntraday = LAST.tf!=="1d";
+  const buckets=[[],[],[]];
+  if(isIntraday) rows.forEach(function(r){ buckets[sessionOf(r.trig_time)].push(r); });
+  const sessCounts = isIntraday
+    ? " &nbsp;<span class='muted'>("+SESSIONS.map(function(s,i){return s.name.split(" ")[0]+" "+buckets[i].length;}).join(" · ")+")</span>"
+    : "";
   $("scanMeta").innerHTML="<b>"+LAST.universe+"</b> stocks · "+LAST.tf.toUpperCase()+" · pivot "+LAST.pivot
-    +" · <b>"+date+"</b> — <b>"+rows.length+"</b> stock(s) with a lift-off setup"
+    +" · hug ≥"+(LAST.min_hug||4)+" · "+(LAST.green?"green":"any")+" lift-off"
+    +" · <b>"+date+"</b> — <b>"+rows.length+"</b> stock(s) with a lift-off setup"+sessCounts
     +(LAST.tf==="1d" ? " &nbsp;<span style='color:#ef5350'>(intraday recommended — 15m/30m/1h)</span>" : "");
   $("chartwrap").classList.remove("show");
   if(!rows.length){ $("scanRes").innerHTML='<div class="muted" style="padding:16px 2px">No lift-off setups triggered on '+date+'.</div>'; return; }
-  const body=rows.map(function(r){
-    const sl=(r.slope>0?"+":"")+r.slope+"%";
-    return '<tr data-sym="'+r.symbol+'">'
-      +'<td class="ssym">🎯 '+r.symbol+'</td>'
-      +'<td class="muted">'+r.trig_time+'</td>'
-      +'<td>'+r.resistance+'</td>'
-      +'<td>'+r.trig_close+'</td>'
-      +'<td class="'+(r.slope>=0?"pos":"neg")+'">'+sl+'</td>'
-      +'<td>'+r.n_cand+'</td>'
-      +'<td><button class="seebtn">📈 See chart</button></td></tr>';
-  }).join("");
-  $("scanRes").innerHTML='<table class="stbl"><thead><tr>'
-    +'<th>Symbol</th><th>Trigger time</th><th>Resistance</th><th>Close</th><th>VWAP slope</th><th>Hug bars</th><th></th>'
-    +'</tr></thead><tbody>'+body+'</tbody></table>';
+
+  let html;
+  if(!isIntraday){
+    html='<table class="stbl">'+TBL_HEAD+'<tbody>'+rows.map(rowHtml).join("")+'</tbody></table>';
+  } else {
+    html=SESSIONS.map(function(s,i){
+      const list=buckets[i];
+      const head='<div class="sesshd">'+s.name+' <span class="span">'+s.span+'</span> · '
+        +'<span class="cnt">'+list.length+'</span></div>';
+      if(!list.length) return head+'<div class="sessempty">— no setups in this session —</div>';
+      return head+'<table class="stbl">'+TBL_HEAD+'<tbody>'+list.map(rowHtml).join("")+'</tbody></table>';
+    }).join("");
+  }
+  $("scanRes").innerHTML=html;
   [].slice.call(document.querySelectorAll("#scanRes tr[data-sym]")).forEach(function(tr){
     tr.onclick=function(){ showStock(tr.dataset.sym); };
   });
