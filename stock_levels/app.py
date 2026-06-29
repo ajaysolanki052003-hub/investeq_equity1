@@ -13,10 +13,12 @@ grid line — i.e. a multiple of the step falls inside that day's high–low ran
   • Touched (inside candle) — a grid line lies within [low, high].
   • Within %                — the nearest grid line sits within `tol`% of close.
 
-Reads ema_scanner/data/1h/*.csv (hourly OHLCV, kept current by the candles
-timers); the daily candle is aggregated from the hourly bars. The level grids
-are pure arithmetic on price, so no volume / profile is needed and the steps can
-be changed at screen-time without rebuilding the snapshot.
+Reads ema_scanner/data/1d/*.csv (daily OHLC, one row per session). This feed is
+refreshed ONCE per day AFTER the NSE close (investeq-candles-1d.timer at 15:35
+IST, Mon-Fri) and never during market hours, so the screener always reflects the
+last settled session — not a partial intraday candle. The level grids are pure
+arithmetic on price, so no volume / profile is needed and the steps can be
+changed at screen-time without rebuilding the snapshot.
 
 Run:
     APP_BASE=/levels python -m uvicorn stock_levels.app:app --host 127.0.0.1 --port 8712
@@ -39,9 +41,12 @@ from pydantic import BaseModel
 APP_BASE = os.environ.get("APP_BASE", "").rstrip("/")
 
 ROOT     = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT / "ema_scanner" / "data" / "1h"   # finest server feed; daily candle aggregated from it
-SNAP_TAIL  = 2200       # hourly bars per symbol for the universe snapshot (~1.4y)
-CHART_TAIL = 1100       # hourly bars for a single-stock chart
+# Daily candles, refreshed ONCE after the NSE close (investeq-candles-1d.timer @
+# 15:35 IST, Mon-Fri) — never intraday. A daily screener only needs the settled
+# daily candle, so we read this post-close feed rather than the intraday 1h one.
+DATA_DIR = ROOT / "ema_scanner" / "data" / "1d"
+SNAP_TAIL  = 1200       # daily bars per symbol for the universe snapshot (~4.7y)
+CHART_TAIL = 800        # daily bars for a single-stock chart
 CHART_MAX_LINES = 18    # cap grid lines drawn per period so the chart stays readable
 
 # Level grids (key, label, default step) — each is a set of round-number lines.
@@ -58,7 +63,9 @@ GSTEP    = {g["key"]: g["step"]  for g in GRIDS}
 
 # ─────────────────────────── daily candles per symbol ───────────────────────
 def _per_symbol(df: pd.DataFrame) -> pd.DataFrame | None:
-    """One row per trading DATE: that day's daily candle aggregated from hourly."""
+    """One row per trading DATE. The 1d feed is already one row per session, so
+    the groupby is a harmless no-op that also collapses any stray duplicate
+    dates (and still works if ever pointed back at an intraday feed)."""
     if len(df) < 8 or "datetime" not in df.columns:
         return None
     dt = pd.to_datetime(df["datetime"], errors="coerce")
