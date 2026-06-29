@@ -228,6 +228,23 @@ PROJECTS = [
         "metrics": [],
         "accent": "#818cf8",
     },
+    {
+        "id": "round-levels",
+        "name": "Round-Level Screener",
+        "instrument": "Equities",
+        "tag": "TOOL",
+        "category": "EQUITIES",
+        "thesis": "Pick any trading day and list every NSE stock whose daily candle "
+                  "touched a round-number level — Daily (every 100), Weekly (every 300) "
+                  "and Monthly (every 200) grids, with editable spacing. Each level is "
+                  "one horizontal line; click a stock to see its candles cut the grid.",
+        "stack": [],
+        "port": 8712,
+        "url": "/levels/",
+        "path": "",
+        "metrics": [],
+        "accent": "#22d3ee",
+    },
 ]
 
 

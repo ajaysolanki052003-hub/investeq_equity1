@@ -1,0 +1,19 @@
+[Unit]
+Description=Investeq Round-Level Screener — which stocks touched a Daily/Weekly/Monthly round-number level on a day (FastAPI on 8712, served at /levels)
+After=network.target
+
+[Service]
+Type=simple
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+Environment=APP_BASE=/levels
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python -m uvicorn stock_levels.app:app --host 127.0.0.1 --port 8712
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
