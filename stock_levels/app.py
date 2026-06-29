@@ -1,4 +1,4 @@
-"""Round-Level Screener — which stocks' daily candle touched a Daily / Weekly /
+"""Level Screener — which stocks' daily candle touched a Daily / Weekly /
 Monthly round-number price level on a chosen day.
 
 Three level grids, each a set of evenly-spaced horizontal price lines:
@@ -134,7 +134,7 @@ def _snapshot() -> tuple[pd.DataFrame, list[str]]:
 
 
 # ─────────────────────────────────── API ───────────────────────────────────
-app = FastAPI(title="Round-Level Screener")
+app = FastAPI(title="Level Screener")
 
 
 class ScreenReq(BaseModel):
@@ -319,7 +319,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Round-Level Screener</title>
+<title>Level Screener</title>
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   :root{
@@ -416,7 +416,7 @@ HTML = r"""<!DOCTYPE html>
 <div class="wrap">
   <header>
     <div>
-      <div class="title"><span class="dot"></span>Round-Level Screener</div>
+      <div class="title"><span class="dot"></span>Level Screener</div>
       <div class="sub">Stocks whose daily candle touched a round-number level — Daily / Weekly / Monthly grids at your chosen spacing.</div>
     </div>
     <div class="asof" id="asof"></div>

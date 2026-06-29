@@ -230,7 +230,7 @@ PROJECTS = [
     },
     {
         "id": "round-levels",
-        "name": "Round-Level Screener",
+        "name": "Level Screener",
         "instrument": "Equities",
         "tag": "TOOL",
         "category": "EQUITIES",

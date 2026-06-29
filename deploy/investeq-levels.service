@@ -1,5 +1,5 @@
 [Unit]
-Description=Investeq Round-Level Screener — which stocks touched a Daily/Weekly/Monthly round-number level on a day (FastAPI on 8712, served at /levels)
+Description=Investeq Level Screener — which stocks touched a Daily/Weekly/Monthly round-number level on a day (FastAPI on 8712, served at /levels)
 After=network.target
 
 [Service]
