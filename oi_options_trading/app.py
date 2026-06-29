@@ -872,6 +872,7 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
         trades.append({
             "day": e["day"], "side": side,
             "entry_time": e["entry_time"], "entry_spot": spot,
+            "entry_atm":  e.get("entry_atm"),
             "exit_time":  pd.Timestamp(exit_t).isoformat(),
             "exit_spot":  exit_p, "reason": reason,
             "pnl_pts":    float(pnl_pts),
