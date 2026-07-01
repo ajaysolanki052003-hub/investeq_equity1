@@ -1,0 +1,19 @@
+[Unit]
+Description=Investeq Sector Analysis — sector-wise performance & rotation across Nifty/Sensex constituents (FastAPI on 8713, served at /sector)
+After=network.target
+
+[Service]
+Type=simple
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+Environment=APP_BASE=/sector
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python -m uvicorn sector_analysis.app:app --host 127.0.0.1 --port 8713
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

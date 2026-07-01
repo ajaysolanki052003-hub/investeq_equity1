@@ -245,6 +245,42 @@ PROJECTS = [
         "metrics": [],
         "accent": "#22d3ee",
     },
+    {
+        "id": "sector-analysis",
+        "name": "Sector Analysis",
+        "instrument": "Equities",
+        "tag": "TOOL",
+        "category": "EQUITIES",
+        "thesis": "Sector-wise performance and rotation across Nifty 50, Sensex 30 "
+                  "and Nifty 500. Every constituent is grouped by its NSE industry, "
+                  "with equal-weight returns over 1D–1Y, a ranked sector bar, a "
+                  "normalised rotation chart vs the scope average, and drill-down "
+                  "into each sector's stocks and candles.",
+        "stack": [],
+        "port": 8713,
+        "url": "/sector/",
+        "path": "",
+        "metrics": [],
+        "accent": "#a78bfa",
+    },
+    {
+        "id": "straddle-basket",
+        "name": "Straddle Basket",
+        "instrument": "NIFTY · options",
+        "tag": "RESEARCH",
+        "category": "OPTIONS",
+        "thesis": "Short a NIFTY straddle or strangle and replay the combined "
+                  "premium through the day. ATM is taken from the session's "
+                  "opening spot; nudge the Call/Put offsets to build an OTM "
+                  "strangle. Shows credit collected, live short MTM, session "
+                  "high/low and the break-evens.",
+        "stack": [],
+        "port": 8714,
+        "url": "/basket/",
+        "path": "",
+        "metrics": [],
+        "accent": "#fb923c",
+    },
 ]
 
 

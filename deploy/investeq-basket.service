@@ -1,0 +1,19 @@
+[Unit]
+Description=Investeq Straddle Basket — NIFTY short straddle/strangle combined-premium replay (FastAPI on 8714, served at /basket)
+After=network.target
+
+[Service]
+Type=simple
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+Environment=APP_BASE=/basket
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python -m uvicorn option_basket.app:app --host 127.0.0.1 --port 8714
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
