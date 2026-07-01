@@ -1,0 +1,25 @@
+[Unit]
+Description=Investeq 1-minute candle refresh for the Level Screener (OB+VP) — extend 1m feed, rebuild POC cache, reload /levels (one-shot, triggered by .timer)
+
+[Service]
+Type=oneshot
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+# fetch_1m_history.py does `from groww_client import ...` (lives in ema_scanner),
+# so put ema_scanner on the path while keeping cwd at the repo root for the
+# `stock_levels` package rebuild below.
+Environment=PYTHONPATH=/home/ajay/investeq_ajs/ema_scanner
+# 1. Append only the newly-closed session(s) to each 1m file (post-close; a
+#    mid-session run adds nothing for today).
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python /home/ajay/investeq_ajs/ema_scanner/fetch_1m_history.py --extend
+# 2. Invalidate the POC cache (its sig is file-count+config, so appended rows
+#    don't change it — must drop it explicitly).
+ExecStart=/bin/rm -f /home/ajay/investeq_ajs/ema_scanner/data/_levels_poc/candles.parquet /home/ajay/investeq_ajs/ema_scanner/data/_levels_poc/poc.parquet /home/ajay/investeq_ajs/ema_scanner/data/_levels_poc/sig.txt
+# 3. Rebuild the cache so the restart below is instant (not a lazy 4-min block).
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python -c "from stock_levels import app; b,p,d=app._snapshot(); print('rebuilt', len(b), len(p), len(d))"
+# 4. Reload the live app so it picks up the fresh cache (+ runs as root).
+ExecStart=+/bin/systemctl restart investeq-levels.service
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,13 @@
+[Unit]
+Description=Investeq 1-minute candle refresh — once after NSE close (Mon-Fri), for the Level Screener OB+VP volume profiles
+
+[Timer]
+# Run at 16:00 IST — after the 15:30 close (and after the 1d timer at 15:35), so
+# the broker's 1m data for the session has settled. The Level Screener is a
+# post-close tool, never updated during market hours (user's spec).
+OnCalendar=Mon..Fri 16:00 Asia/Kolkata
+Persistent=false
+Unit=investeq-candles-1m.service
+
+[Install]
+WantedBy=timers.target
