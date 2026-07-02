@@ -14,15 +14,19 @@ Mounted behind nginx at /strategy/ (set APP_BASE=/strategy via env).
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
+import time as _time
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
 
 ROOT = Path(os.environ.get(
@@ -32,7 +36,12 @@ ROOT = Path(os.environ.get(
 MASTER     = ROOT / "nifty_1m_master.parquet"
 OI_INTRA   = ROOT / "_atm_oi_intraday.parquet"
 LTP_JSON   = ROOT / "_nifty_ltp.json"
+MANUAL_EXITS = ROOT / "_manual_exits.json"
 APP_BASE   = os.environ.get("APP_BASE", "").rstrip("/")
+# PIN gating the on-chart manual-exit action. Read once at startup from
+# /etc/investeq.env (STRATEGY_EXIT_PIN=...). Empty ⇒ the feature is disabled
+# (the POST returns 503 and the UI hides the exit button).
+EXIT_PIN   = os.environ.get("STRATEGY_EXIT_PIN", "")
 
 
 TF_RULE = {
@@ -408,6 +417,32 @@ def _disk_entries_save(d: dict) -> None:
         tmp.replace(_ENTRIES_DISK)
     except OSError:
         pass
+
+
+# ─── Manual exits ────────────────────────────────────────────────────────────
+# A user can close TODAY's open position early from the chart (PIN-gated). The
+# override is keyed by the trade's stable identity — source|side|entry_time
+# (entry_time already embeds the day) — and merged into /api/merged_trades on
+# every read, so it survives a restart and the 60s live refresh. Unlike the
+# entries cache, this file is NEVER trimmed (every id is an explicit user click).
+_MANUAL_LOCK = __import__("threading").Lock()
+
+
+def _manual_exits_load() -> dict:
+    try:
+        return json.loads(MANUAL_EXITS.read_text())
+    except Exception:
+        return {}
+
+
+def _manual_exits_save(d: dict) -> None:
+    tmp = MANUAL_EXITS.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(d))
+    tmp.replace(MANUAL_EXITS)
+
+
+def _trade_id(source, side, entry_time) -> str:
+    return f"{source}|{side}|{entry_time}"
 
 
 def _entries_live(kind: str, tf: str = "1m", window: int = 10,
@@ -882,6 +917,33 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
             "trail_triggered": bool(trail_active),
         })
 
+    # 2a. Manual-exit overrides — a user can close TODAY's open position early
+    # from the chart (PIN-gated POST /api/manual_exit). Merge BEFORE the overlap
+    # filter so the earlier manual exit_time frees the slot for a later same-side
+    # signal, and BEFORE stats so realized PnL/counters reflect it. Guard: never
+    # override a trade a real SL/TGT/TRAIL/TIME already closed at/before the
+    # manual click — an EOD (still-open) trade is always overridable.
+    _overrides = _manual_exits_load()
+    if _overrides:
+        for t in trades:
+            ov = _overrides.get(_trade_id(t["source"], t["side"], t["entry_time"]))
+            if not ov:
+                continue
+            try:
+                man_t = pd.Timestamp(ov["exit_time"])
+            except Exception:
+                continue
+            if t["reason"] != "EOD" and pd.Timestamp(t["exit_time"]) <= man_t:
+                continue   # a real exit already fired at/before the manual click
+            spot = t["entry_spot"]
+            exit_p = float(ov["exit_price"])
+            pnl = (exit_p - spot) if t["side"] == "LONG" else (spot - exit_p)
+            t["exit_time"] = man_t.isoformat()
+            t["exit_spot"] = exit_p
+            t["reason"] = "MANUAL"
+            t["pnl_pts"] = float(pnl)
+            t["pnl_pct"] = float(pnl / spot * 100.0) if spot else 0.0
+
     # 2b. Position-overlap filter — two modes:
     #   opposite_ok: block only SAME-side re-entries while a trade is open
     #                (a SHORT can still fire while a LONG is still in play).
@@ -916,8 +978,8 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
     if not trades:
         stats = {"n":0,"win_rate":0.0,"total_pnl":0.0,"avg_pnl":0.0,"pf":None,
                  "long_n":0,"short_n":0,"sl_hits":0,"tgt_hits":0,"eod_exits":0,
-                 "trail_hits":0,"time_exits":0,"sigma10_n":0,"sigma_oi_n":0,
-                 "n_days":0,"avg_per_day":0.0}
+                 "trail_hits":0,"time_exits":0,"manual_exits":0,"sigma10_n":0,
+                 "sigma_oi_n":0,"n_days":0,"avg_per_day":0.0}
     else:
         arr = np.array([t["pnl_pts"] for t in trades])
         wins, losses = arr[arr > 0], arr[arr <= 0]
@@ -942,6 +1004,7 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
             "eod_exits":  reasons.count("EOD"),
             "trail_hits": reasons.count("TRAIL"),
             "time_exits": reasons.count("TIME"),
+            "manual_exits": reasons.count("MANUAL"),
             "sigma10_n":  sources.count("sigma10"),
             "sigma_oi_n": sources.count("sigma_oi"),
             "n_days":     len({str(t["day"]) for t in trades}),
@@ -962,6 +1025,102 @@ def live_ltp():
         return JSONResponse(json.loads(LTP_JSON.read_text()))
     except Exception:
         return JSONResponse({"ts": None, "ltp": None})
+
+
+# ─── Manual-exit POST (PIN-gated) ────────────────────────────────────────────
+class ExitReq(BaseModel):
+    pin: str
+    side: str
+    entry_time: str
+    source: str
+    day: str = ""
+    exit_price: Optional[float] = None
+
+
+# In-process attempt lockout. Safe because the strategy unit runs single-worker
+# uvicorn (no --workers); if that ever changes, per-process counters each allow
+# _EXIT_MAX_FAILS, which is acceptable for a single-admin tool.
+_EXIT_FAILS: dict[str, list] = {}     # ip -> [fail_count, locked_until_epoch]
+_EXIT_MAX_FAILS = 5
+_EXIT_LOCK_SEC  = 300
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return (request.headers.get("x-real-ip")
+            or (request.client.host if request.client else "?"))
+
+
+def _check_pin(pin: str, request: Request):
+    """None when the PIN is accepted, else a JSONResponse error to return."""
+    if not EXIT_PIN:
+        return JSONResponse({"error": "manual exit disabled — no PIN configured"},
+                            status_code=503)
+    ip = _client_ip(request)
+    now = _time.time()
+    rec = _EXIT_FAILS.get(ip, [0, 0.0])
+    locked = rec[1] > now
+    ok = hmac.compare_digest((pin or "").encode(), EXIT_PIN.encode())  # always run (flat timing)
+    if locked:
+        return JSONResponse({"error": "too many attempts — locked, try again later",
+                             "retry_in": int(rec[1] - now)}, status_code=429)
+    if not ok:
+        rec[0] += 1
+        if rec[0] >= _EXIT_MAX_FAILS:
+            rec[1] = now + _EXIT_LOCK_SEC
+            rec[0] = 0
+        _EXIT_FAILS[ip] = rec
+        return JSONResponse({"error": "incorrect PIN"}, status_code=403)
+    _EXIT_FAILS.pop(ip, None)         # reset the counter on success
+    return None
+
+
+@app.post("/api/manual_exit")
+def manual_exit(req: ExitReq, request: Request):
+    """Record a manual exit for the currently-running trade (index-points).
+
+    Stamps exit_time = now (IST) and exit_price = the posted price (the UI
+    pre-fills the live NIFTY LTP but the user may edit it), falling back to the
+    latest LTP if none is posted. The override is merged into /api/merged_trades.
+    """
+    err = _check_pin(req.pin, request)
+    if err is not None:
+        return err
+    price = req.exit_price
+    if price is None:
+        try:
+            price = float(json.loads(LTP_JSON.read_text())["ltp"])
+        except Exception:
+            price = None
+    if price is None:
+        return JSONResponse({"error": "no live price available — enter an exit price"},
+                            status_code=422)
+    now_iso = _now_ist().replace(microsecond=0).isoformat()
+    tid = _trade_id(req.source, req.side, req.entry_time)
+    with _MANUAL_LOCK:
+        exits = _manual_exits_load()
+        exits[tid] = {"exit_time": now_iso, "exit_price": float(price), "reason": "MANUAL",
+                      "recorded_at": now_iso, "day": req.day, "side": req.side,
+                      "entry_time": req.entry_time, "source": req.source}
+        _manual_exits_save(exits)
+    return JSONResponse({"ok": True, "exit_time": now_iso, "exit_price": float(price)})
+
+
+@app.post("/api/manual_exit/undo")
+def manual_exit_undo(req: ExitReq, request: Request):
+    """Remove a manual-exit override (re-open the trade). PIN-gated."""
+    err = _check_pin(req.pin, request)
+    if err is not None:
+        return err
+    tid = _trade_id(req.source, req.side, req.entry_time)
+    with _MANUAL_LOCK:
+        exits = _manual_exits_load()
+        removed = exits.pop(tid, None) is not None
+        if removed:
+            _manual_exits_save(exits)
+    return JSONResponse({"ok": True, "removed": removed})
 
 
 @app.get("/api/range")
@@ -1017,6 +1176,38 @@ HTML = """<!doctype html>
     border-radius:6px; padding:6px 14px; cursor:pointer; font:inherit; font-family:inherit;
   }
   .btn:hover { background:var(--panel); }
+  .btn-exit { background:linear-gradient(135deg,#ef4444 0%,#b91c1c 100%); color:#fff;
+              border-color:#ef4444; font-weight:700; }
+  .btn-exit:hover { background:linear-gradient(135deg,#f87171 0%,#dc2626 100%); }
+  /* Manual-exit confirm modal */
+  #exit-overlay { position:fixed; inset:0; background:rgba(3,5,10,0.72);
+                  z-index:5000; display:none; align-items:center; justify-content:center; }
+  #exit-modal { width:372px; max-width:92vw; background:linear-gradient(180deg,#141926 0%,#0f131c 100%);
+                border:1px solid var(--border-hi); border-radius:14px; overflow:hidden;
+                box-shadow:0 24px 70px rgba(0,0,0,0.65); }
+  #exit-modal .hd { padding:15px 20px 12px; border-bottom:1px solid var(--border);
+                    display:flex; align-items:center; gap:10px; }
+  #exit-modal .hd .dot { width:9px; height:9px; border-radius:50%; background:#ef4444;
+                         box-shadow:0 0 12px 2px #ef4444; flex:none; }
+  #exit-modal .hd h3 { margin:0; font-size:14.5px; font-weight:800; letter-spacing:0.3px; }
+  #exit-modal .bd { padding:14px 20px 4px; }
+  #exit-modal .row { display:flex; justify-content:space-between; gap:12px; font-size:12px;
+                     padding:3px 0; color:var(--muted); }
+  #exit-modal .row b { color:var(--text); font-weight:700; font-variant-numeric:tabular-nums; }
+  #exit-modal label.fld { display:block; font-size:10px; text-transform:uppercase; letter-spacing:0.12em;
+                          color:var(--muted); margin:13px 0 5px; }
+  #exit-modal input { width:100%; background:var(--bg); border:1px solid var(--border-hi); color:var(--text);
+                      border-radius:8px; padding:9px 11px; font:inherit; font-family:inherit; outline:none; }
+  #exit-modal input:focus { border-color:var(--accent); }
+  #exit-modal .pinbox { letter-spacing:6px; font-size:17px; text-align:center; }
+  #exit-modal .err { color:#f87171; font-size:11.5px; min-height:15px; margin:9px 0 2px; }
+  #exit-modal .ft { display:flex; gap:10px; padding:6px 20px 18px; }
+  #exit-modal .ft button { flex:1; padding:10px; border-radius:8px; cursor:pointer; font:inherit;
+                           font-family:inherit; font-weight:700; border:1px solid var(--border-hi); }
+  #exit-modal .ft .cancel  { background:var(--panel-2); color:var(--text); }
+  #exit-modal .ft .confirm { background:linear-gradient(135deg,#ef4444 0%,#b91c1c 100%); color:#fff; border-color:#ef4444; }
+  #exit-modal .ft .confirm.undo { background:linear-gradient(135deg,#a855f7 0%,#7c3aed 100%); border-color:#a855f7; }
+  #exit-modal .ft button:disabled { opacity:0.5; cursor:not-allowed; }
   .spot {
     display:flex; align-items:baseline; gap:8px; padding:5px 12px;
     background:var(--panel-2); border:1px solid var(--border-hi); border-radius:6px;
@@ -1186,6 +1377,9 @@ HTML = """<!doctype html>
     <button data-pm="single" class="on"></button>
   </span>
 
+  <button id="v-exit-btn" class="btn btn-exit" style="display:none;"
+          title="Close the running position now (PIN required)">&#8853; Exit position</button>
+
   <span id="v-stats" style="display:none; margin-left:auto; color:var(--muted); font-size:11px; line-height:1.5;
                               padding:6px 12px; background:var(--panel-2); border:1px solid var(--border-hi); border-radius:6px;">
     <b id="v-n"        style="color:var(--text); font-weight:700;">—</b> trades &nbsp;·&nbsp;
@@ -1196,7 +1390,8 @@ HTML = """<!doctype html>
     <b id="v-tgt-hits" style="color:#22c55e;">—</b> TGT ·
     <b id="v-eod"      style="color:var(--muted);">—</b> EOD ·
     <b id="v-trail-hits" style="color:#fbbf24;">—</b> TRAIL ·
-    <b id="v-time"     style="color:#f97316;">—</b> TIME &nbsp;·&nbsp;
+    <b id="v-time"     style="color:#f97316;">—</b> TIME ·
+    <b id="v-manual"   style="color:#a855f7;">—</b> MAN &nbsp;·&nbsp;
     <b id="v-per-day"  style="color:#a78bfa;">—</b> /day &nbsp;·&nbsp;
     L <b id="v-long"   style="color:#06b6d4;">—</b> ·
     S <b id="v-short"  style="color:#f59e0b;">—</b> &nbsp;|&nbsp;
@@ -1250,6 +1445,27 @@ HTML = """<!doctype html>
       <span class="ce">CE <b id="tot-ce-val">—</b></span> &nbsp;·&nbsp;
       <span class="pe">PE <b id="tot-pe-val">—</b></span> &nbsp;·&nbsp;
       <b id="tot-xcount">—</b> ✕
+    </div>
+  </div>
+</div>
+
+<div id="exit-overlay">
+  <div id="exit-modal" role="dialog" aria-modal="true">
+    <div class="hd"><span class="dot"></span><h3 id="exit-title">Manual Exit</h3></div>
+    <div class="bd">
+      <div id="exit-summary"></div>
+      <div id="exit-price-wrap">
+        <label class="fld">Exit price &middot; NIFTY (editable)</label>
+        <input id="exit-price" type="number" step="0.05" inputmode="decimal"/>
+      </div>
+      <label class="fld">PIN</label>
+      <input id="exit-pin" class="pinbox" type="password" inputmode="numeric"
+             autocomplete="off" maxlength="12" placeholder="&bull;&bull;&bull;&bull;"/>
+      <div class="err" id="exit-err"></div>
+    </div>
+    <div class="ft">
+      <button class="cancel"  id="exit-cancel"  type="button">Cancel</button>
+      <button class="confirm" id="exit-confirm" type="button">Confirm exit</button>
     </div>
   </div>
 </div>
@@ -1326,6 +1542,8 @@ const state = {
   pnlChart: null,
   pnlLine:  null,
   pnlBars:  [],   // [{time, value}]
+  // Latest LTP seen by the tick poll — pre-fills the manual-exit price box.
+  _lastLtp: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1749,8 +1967,9 @@ function applyAllMarkers() {
       const isTrail = tr.reason === 'TRAIL';
       const entryColor = isTrail ? '#fbbf24'
                        : win     ? '#22c55e' : '#ef4444';
-      const exitColor  = _isLiveOpen(tr)       ? '#3b82f6'   // OPEN (live)
-                       : tr.reason === 'TGT'   ? '#16a34a'
+      const exitColor  = _isLiveOpen(tr)        ? '#3b82f6'   // OPEN (live)
+                       : tr.reason === 'MANUAL' ? '#a855f7'   // manual exit
+                       : tr.reason === 'TGT'    ? '#16a34a'
                        : tr.reason === 'SL'    ? '#b91c1c'
                        : tr.reason === 'TRAIL' ? '#fbbf24'
                        : tr.reason === 'TIME'  ? '#f97316'
@@ -1894,6 +2113,116 @@ function _openLiveTrade() {
   const tr = trs[trs.length - 1];
   return _isLiveOpen(tr) ? tr : null;
 }
+// Today's already-manually-exited trade (clickable to UNDO / re-open).
+function _todayManual(tr) {
+  return !!tr && tr.reason === 'MANUAL' && _day(tr.day) === _todayIST();
+}
+function _srcLabel(tr) {
+  return tr.source === 'sigma10' ? 'Σ·10'
+       : tr.source === 'sigma_oi' ? 'ΣOI'
+       : (state.bt.mode || '');
+}
+
+// ── Manual-exit confirm box ────────────────────────────────────────────
+// Only ever acts on the single OPEN (live) trade, or — to reverse a misfire —
+// today's already-manually-exited trade. PIN is verified server-side.
+let _exitCtx = null;   // { tr, mode:'exit'|'undo' }
+
+function openExitModal(tr, mode) {
+  if (!tr) return;
+  _exitCtx = { tr, mode };
+  const sign = tr.pnl_pts >= 0 ? '+' : '';
+  const pnlCol = tr.pnl_pts >= 0 ? '#22c55e' : '#ef4444';
+  const sideCol = tr.side === 'LONG' ? '#22c55e' : '#ef4444';
+  $('exit-summary').innerHTML =
+    `<div class="row"><span>Position</span><b style="color:${sideCol}">${tr.side} · ${_srcLabel(tr)}</b></div>` +
+    `<div class="row"><span>Entry</span><b>${_f(tr.entry_spot)} @ ${_hhmm(tr.entry_time)}</b></div>` +
+    (mode === 'exit'
+      ? `<div class="row"><span>Live now</span><b>${_f(tr.exit_spot)}</b></div>` +
+        `<div class="row"><span>Unrealized</span><b style="color:${pnlCol}">${sign}${_f(tr.pnl_pts, 1)} pts</b></div>`
+      : `<div class="row"><span>Manual exit</span><b style="color:#a855f7">${_f(tr.exit_spot)} @ ${_hhmm(tr.exit_time)}</b></div>` +
+        `<div class="row"><span>Realized</span><b style="color:${pnlCol}">${sign}${_f(tr.pnl_pts, 1)} pts</b></div>`);
+  $('exit-err').textContent = '';
+  $('exit-pin').value = '';
+  const conf = $('exit-confirm');
+  if (mode === 'exit') {
+    $('exit-title').textContent = 'Manual Exit — close position';
+    $('exit-price-wrap').style.display = '';
+    const seed = (state._lastLtp != null ? state._lastLtp : tr.exit_spot);
+    $('exit-price').value = Number(seed).toFixed(2);
+    conf.textContent = 'Confirm exit';
+    conf.classList.remove('undo');
+  } else {
+    $('exit-title').textContent = 'Undo manual exit — re-open';
+    $('exit-price-wrap').style.display = 'none';
+    conf.textContent = 'Re-open position';
+    conf.classList.add('undo');
+  }
+  conf.disabled = false;
+  $('exit-overlay').style.display = 'flex';
+  setTimeout(() => $('exit-pin').focus(), 30);
+}
+
+function closeExitModal() {
+  $('exit-overlay').style.display = 'none';
+  _exitCtx = null;
+}
+
+async function submitExit() {
+  if (!_exitCtx) return;
+  const { tr, mode } = _exitCtx;
+  const pin = ($('exit-pin').value || '').trim();
+  const err = $('exit-err'), conf = $('exit-confirm');
+  if (!pin) { err.textContent = 'Enter the PIN.'; return; }
+  const body = { pin, day: tr.day, side: tr.side, entry_time: tr.entry_time, source: tr.source };
+  let url = '/api/manual_exit';
+  if (mode === 'exit') {
+    const p = parseFloat($('exit-price').value);
+    if (!isFinite(p)) { err.textContent = 'Enter a valid exit price.'; return; }
+    body.exit_price = p;
+  } else {
+    url = '/api/manual_exit/undo';
+  }
+  conf.disabled = true; err.textContent = '';
+  try {
+    const r = await fetch(apiUrl(url), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      err.textContent = (j && j.error) ? j.error : ('Failed (' + r.status + ')');
+      if (r.status === 429 && j.retry_in) err.textContent += ' — ' + j.retry_in + 's';
+      conf.disabled = false;
+      return;
+    }
+    closeExitModal();
+    await loadTrades({ fit: false });   // repaint with the override applied / removed
+  } catch (e) {
+    err.textContent = 'Network error.';
+    conf.disabled = false;
+  }
+}
+
+function refreshExitBtn() {
+  const btn = $('v-exit-btn');
+  if (btn) btn.style.display = _openLiveTrade() ? '' : 'none';
+}
+
+// Click an OPEN (live) marker to exit, or today's MANUAL marker to undo.
+function setupClickExit() {
+  if (!state.chart) return;
+  state.chart.subscribeClick((param) => {
+    if (!param || param.time == null) return;
+    const t = typeof param.time === 'number' ? param.time : Number(param.time);
+    const trs = state.tradeByTime[t];
+    if (!trs || !trs.length) return;
+    const openTr = trs.find(_isLiveOpen);
+    if (openTr) { openExitModal(openTr, 'exit'); return; }
+    const manTr = trs.find(_todayManual);
+    if (manTr) { openExitModal(manTr, 'undo'); }
+  });
+}
 
 function renderTradeTooltip(tip, trades, pt) {
   // Choose first trade — multi-trade collisions are rare on intraday TF.
@@ -1904,8 +2233,9 @@ function renderTradeTooltip(tip, trades, pt) {
   const tgt_px = tr.side === 'LONG' ? tr.entry_spot * (1 + tgt/100) : tr.entry_spot * (1 - tgt/100);
   const sign   = tr.pnl_pts >= 0 ? '+' : '';
   const pnlCol = isWin ? '#22c55e' : '#ef4444';
-  const reasonCol = _isLiveOpen(tr)       ? '#3b82f6'
-                  : tr.reason === 'TGT'   ? '#22c55e'
+  const reasonCol = _isLiveOpen(tr)        ? '#3b82f6'
+                  : tr.reason === 'MANUAL' ? '#a855f7'
+                  : tr.reason === 'TGT'    ? '#22c55e'
                   : tr.reason === 'SL'    ? '#ef4444'
                   : tr.reason === 'TRAIL' ? '#fbbf24'
                   : tr.reason === 'TIME'  ? '#f97316'
@@ -2077,6 +2407,7 @@ async function loadTrades(opts) {
     state.bt.stats  = j.stats  || null;
     renderViewStats();
     applyAllMarkers();
+    refreshExitBtn();
     showTradeLevels(_openLiveTrade());   // live trade's SL/TGT marks
     try { updateCumPnLChart(); } catch (e) { console.error('[updateCumPnL] failed:', e); }
     if (fit && state.bt.trades.length) {
@@ -2104,6 +2435,7 @@ function renderViewStats() {
   $('v-eod').textContent      = fmt(s.eod_exits, 0);
   $('v-trail-hits').textContent = fmt(s.trail_hits || 0, 0);
   $('v-time').textContent     = fmt(s.time_exits || 0, 0);
+  $('v-manual').textContent   = fmt(s.manual_exits || 0, 0);
   $('v-per-day').textContent  = fmt(s.avg_per_day || 0, 2);
   $('v-long').textContent     = fmt(s.long_n, 0);
   $('v-short').textContent    = fmt(s.short_n, 0);
@@ -2752,6 +3084,7 @@ function init() {
         // formBar is always the overlay's last bar — in-order amend.
         try { state.formCandle.update(formBar); } catch (_) {}
       }
+      state._lastLtp = j.ltp;
       $("last-val").textContent = fmtPrice(j.ltp);
     } catch (_) {}
   };
@@ -2759,6 +3092,16 @@ function init() {
 
   // Rich hover tooltip on entry/exit arrows — shows SL/Target/exit/P&L.
   setupHoverTooltip();
+  // Manual-exit: click the OPEN/MANUAL marker, or the Exit button in the panel.
+  setupClickExit();
+  $('v-exit-btn').addEventListener('click', () => { const o = _openLiveTrade(); if (o) openExitModal(o, 'exit'); });
+  $('exit-cancel').addEventListener('click', closeExitModal);
+  $('exit-confirm').addEventListener('click', submitExit);
+  $('exit-overlay').addEventListener('click', (e) => { if (e.target === $('exit-overlay')) closeExitModal(); });
+  $('exit-pin').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitExit(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && $('exit-overlay').style.display === 'flex') closeExitModal();
+  });
   // Auto-load default view (Both) so the chart shows trades immediately
   // on page open — no clicks required.
   loadTrades();
