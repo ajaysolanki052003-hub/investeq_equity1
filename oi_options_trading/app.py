@@ -924,25 +924,29 @@ def api_merged_trades(mode: str   = Query("both", description="sigma10 | sigma_o
     # override a trade a real SL/TGT/TRAIL/TIME already closed at/before the
     # manual click — an EOD (still-open) trade is always overridable.
     _overrides = _manual_exits_load()
-    if _overrides:
+    if isinstance(_overrides, dict) and _overrides:
         for t in trades:
-            ov = _overrides.get(_trade_id(t["source"], t["side"], t["entry_time"]))
-            if not ov:
-                continue
+            # A single malformed/hand-corrupted override entry must never take
+            # the whole (recomputed-every-request) endpoint down — skip it.
             try:
+                ov = _overrides.get(_trade_id(t["source"], t["side"], t["entry_time"]))
+                if not ov:
+                    continue
                 man_t = pd.Timestamp(ov["exit_time"])
-            except Exception:
+                exit_p = float(ov["exit_price"])
+                if pd.isna(man_t) or not np.isfinite(exit_p):
+                    continue
+                if t["reason"] != "EOD" and pd.Timestamp(t["exit_time"]) <= man_t:
+                    continue   # a real exit already fired at/before the manual click
+                spot = t["entry_spot"]
+                pnl = (exit_p - spot) if t["side"] == "LONG" else (spot - exit_p)
+                t["exit_time"] = man_t.isoformat()
+                t["exit_spot"] = exit_p
+                t["reason"] = "MANUAL"
+                t["pnl_pts"] = float(pnl)
+                t["pnl_pct"] = float(pnl / spot * 100.0) if spot else 0.0
+            except (KeyError, TypeError, ValueError):
                 continue
-            if t["reason"] != "EOD" and pd.Timestamp(t["exit_time"]) <= man_t:
-                continue   # a real exit already fired at/before the manual click
-            spot = t["entry_spot"]
-            exit_p = float(ov["exit_price"])
-            pnl = (exit_p - spot) if t["side"] == "LONG" else (spot - exit_p)
-            t["exit_time"] = man_t.isoformat()
-            t["exit_spot"] = exit_p
-            t["reason"] = "MANUAL"
-            t["pnl_pts"] = float(pnl)
-            t["pnl_pct"] = float(pnl / spot * 100.0) if spot else 0.0
 
     # 2b. Position-overlap filter — two modes:
     #   opposite_ok: block only SAME-side re-entries while a trade is open
@@ -1046,9 +1050,10 @@ _EXIT_LOCK_SEC  = 300
 
 
 def _client_ip(request: Request) -> str:
-    xff = request.headers.get("x-forwarded-for", "")
-    if xff:
-        return xff.split(",")[0].strip()
+    # Key the lockout on X-Real-IP — our nginx sets it to $remote_addr (the real
+    # peer) and OVERWRITES any client value, so it is not spoofable. Do NOT use
+    # X-Forwarded-For: nginx APPENDS to it ($proxy_add_x_forwarded_for), so the
+    # client controls its leftmost token and could rotate it to dodge the lockout.
     return (request.headers.get("x-real-ip")
             or (request.client.host if request.client else "?"))
 
@@ -1472,6 +1477,7 @@ HTML = """<!doctype html>
 
 <script>
 const APP_BASE = "__APP_BASE__";
+const EXIT_ENABLED = __EXIT_ENABLED__;   // false when STRATEGY_EXIT_PIN is unset
 const apiUrl = (p) => (APP_BASE || "") + p;
 
 const state = {
@@ -2206,12 +2212,12 @@ async function submitExit() {
 
 function refreshExitBtn() {
   const btn = $('v-exit-btn');
-  if (btn) btn.style.display = _openLiveTrade() ? '' : 'none';
+  if (btn) btn.style.display = (EXIT_ENABLED && _openLiveTrade()) ? '' : 'none';
 }
 
 // Click an OPEN (live) marker to exit, or today's MANUAL marker to undo.
 function setupClickExit() {
-  if (!state.chart) return;
+  if (!state.chart || !EXIT_ENABLED) return;
   state.chart.subscribeClick((param) => {
     if (!param || param.time == null) return;
     const t = typeof param.time === 'number' ? param.time : Number(param.time);
@@ -3183,4 +3189,5 @@ document.addEventListener("DOMContentLoaded", init);
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTML.replace("__APP_BASE__", APP_BASE)
+    return (HTML.replace("__APP_BASE__", APP_BASE)
+                .replace("__EXIT_ENABLED__", "true" if EXIT_PIN else "false"))
