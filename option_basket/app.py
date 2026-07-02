@@ -98,6 +98,16 @@ def _resample_close(df: pd.DataFrame, tf: str) -> pd.Series:
               .dropna())
 
 
+def _resample_ohlc(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    """Resample a single leg's 1m OHLCV to `tf`, return an OHLCV frame."""
+    if df.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    g = df.set_index("timestamp").resample(TF_RULE[tf], closed="left", label="left")
+    return pd.DataFrame({"open": g["open"].first(), "high": g["high"].max(),
+                         "low": g["low"].min(), "close": g["close"].last(),
+                         "volume": g["volume"].sum()}).dropna()
+
+
 def _line(idx: pd.Index, vals) -> list[dict]:
     t = _to_unix(pd.Series(idx))
     out = []
@@ -105,6 +115,53 @@ def _line(idx: pd.Index, vals) -> list[dict]:
         if pd.notna(v):
             out.append({"time": int(t[i]), "value": round(float(v), 2)})
     return out
+
+
+def _candles(df: pd.DataFrame) -> list[dict]:
+    """OHLC frame → lightweight-charts candlestick points."""
+    t = _to_unix(pd.Series(df.index))
+    out = []
+    for i, (o, h, l, c) in enumerate(zip(df["open"], df["high"], df["low"], df["close"])):
+        out.append({"time": int(t[i]), "open": round(float(o), 2),
+                    "high": round(float(h), 2), "low": round(float(l), 2),
+                    "close": round(float(c), 2)})
+    return out
+
+
+def _volume(df: pd.DataFrame) -> list[dict]:
+    """OHLCV frame → histogram points, tinted by the bar's direction."""
+    t = _to_unix(pd.Series(df.index))
+    up, dn = "rgba(38,166,154,.45)", "rgba(239,83,80,.45)"
+    o, c, v = df["open"].values, df["close"].values, df["volume"].values
+    return [{"time": int(t[i]), "value": float(v[i]),
+             "color": up if c[i] >= o[i] else dn} for i in range(len(df))]
+
+
+def _day_bars(dnorm: str, expiry: str, ce_strike: int, pe_strike: int, tf: str):
+    """One day's combined-premium candles for a FIXED (expiry, ce, pe) basket.
+
+    Returns (comb_df, spot_bars) or None if that day has no bars for both legs.
+    comb_df carries the summed OHLCV plus the raw leg closes (`ce`, `pe`).
+    """
+    opt = load_options(dnorm)
+    if opt.empty:
+        return None
+    sub = opt[opt["expiry"] == expiry]
+    ce = _resample_ohlc(sub[(sub.option_type == "CE") & (sub.strike == ce_strike)], tf)
+    pe = _resample_ohlc(sub[(sub.option_type == "PE") & (sub.strike == pe_strike)], tf)
+    idx = ce.index.intersection(pe.index)
+    if len(idx) == 0:
+        return None
+    ce, pe = ce.loc[idx], pe.loc[idx]
+    comb = pd.DataFrame({"open": ce["open"] + pe["open"], "high": ce["high"] + pe["high"],
+                         "low": ce["low"] + pe["low"], "close": ce["close"] + pe["close"],
+                         "volume": ce["volume"] + pe["volume"],
+                         "ce": ce["close"], "pe": pe["close"]}, index=idx)
+    sp = load_spot(dnorm)
+    spot_bars = (sp.set_index("timestamp")["close"]
+                   .resample(TF_RULE[tf], closed="left", label="left").last().dropna()
+                 if not sp.empty else pd.Series(dtype=float))
+    return comb, spot_bars
 
 
 def _nearest(cands: list[int], target: int):
@@ -152,7 +209,7 @@ def api_expiries(date: str = ""):
 
 @app.get("/api/basket")
 def api_basket(date: str = "", expiry: str = "", ce_off: int = 0, pe_off: int = 0,
-               tf: str = "1m"):
+               tf: str = "1m", days: int = 1):
     if tf not in TF_RULE:
         tf = "1m"
     d = _norm_date(date)
@@ -200,26 +257,39 @@ def api_basket(date: str = "", expiry: str = "", ce_off: int = 0, pe_off: int = 
     if pe_strike != pe_target:
         warnings.append(f"Put {pe_target} unavailable — snapped to {pe_strike}.")
 
-    ce_bars = _resample_close(sub[(sub.option_type == "CE") & (sub.strike == ce_strike)], tf)
-    pe_bars = _resample_close(sub[(sub.option_type == "PE") & (sub.strike == pe_strike)], tf)
-    if ce_bars.empty or pe_bars.empty:
+    # ── assemble the basket across one or more trading days ─────────────────
+    # Walk backward from the selected day, keeping the contiguous run of days on
+    # which BOTH legs (expiry, ce_strike, pe_strike) trade. days=1 → selected day
+    # only; days=N → the last N such days; days<=0 → the strike's whole life ≤ date.
+    avail = [x for x in list_trading_days() if x <= d]        # ascending YYYYMMDD
+    cap = days if (days and days > 0) else 60
+    picked: list[tuple[str, tuple]] = []
+    for x in reversed(avail):
+        db = _day_bars(x, expiry, ce_strike, pe_strike, tf)
+        if db is None:
+            if picked:            # a gap after data began = before the strike was listed
+                break
+            continue
+        picked.append((x, db))
+        if len(picked) >= cap:
+            break
+    if not picked:
         return JSONResponse({"error": "leg has no intraday data", "date": date,
                              "expiry": expiry, "ce_strike": ce_strike,
                              "pe_strike": pe_strike}, status_code=422)
+    picked.reverse()                                          # chronological
+    comb      = pd.concat([db[0] for _, db in picked]).sort_index()
+    spot_bars = pd.concat([db[1] for _, db in picked]).sort_index()
+    day_list  = [x for x, _ in picked]
+    day_marks = [{"time": int(_to_unix(pd.Series([db[0].index[0]]))[0]),
+                  "label": pd.to_datetime(x).strftime("%d %b")}
+                 for x, db in picked]
 
-    merged = pd.concat({"ce": ce_bars, "pe": pe_bars}, axis=1).dropna()
-    if merged.empty:
-        return JSONResponse({"error": "legs do not overlap in time"}, status_code=422)
-    merged["comb"] = merged["ce"] + merged["pe"]
-
-    spot_bars = (spot.set_index("timestamp")["close"]
-                     .resample(TF_RULE[tf], closed="left", label="left").last().dropna())
-
-    credit  = float(merged["comb"].iloc[0])       # premium collected at entry (open)
-    current = float(merged["comb"].iloc[-1])
-    hi = float(merged["comb"].max())
-    lo = float(merged["comb"].min())
-    mtm = credit - current                        # short seller: profit as premium decays
+    credit  = float(comb["open"].iloc[0])         # entry = open of the FIRST day shown
+    current = float(comb["close"].iloc[-1])        # mark  = last bar of the selected day
+    hi = float(comb["high"].max())
+    lo = float(comb["low"].min())
+    mtm = credit - current                         # short seller: profit as premium decays
     is_straddle = (ce_strike == pe_strike)
 
     stats = {
@@ -241,13 +311,17 @@ def api_basket(date: str = "", expiry: str = "", ce_off: int = 0, pe_off: int = 
         "ce_off": (ce_strike - atm_strike) // STRIKE_STEP,
         "pe_off": (pe_strike - atm_strike) // STRIKE_STEP,
         "is_straddle": is_straddle, "lot": LOT_SIZE,
-        "n_bars": len(merged), "warnings": warnings,
-        "expiries": exps,
+        "n_bars": len(comb), "warnings": warnings, "expiries": exps,
+        "days_req": days, "n_days": len(day_list),
+        "day_start": pd.to_datetime(day_list[0]).strftime("%d %b %Y"),
+        "day_end": pd.to_datetime(day_list[-1]).strftime("%d %b %Y"),
+        "day_starts": day_marks,
     }
     series = {
-        "combined": _line(merged.index, merged["comb"].values),
-        "ce": _line(merged.index, merged["ce"].values),
-        "pe": _line(merged.index, merged["pe"].values),
+        "combined": _candles(comb),
+        "volume": _volume(comb),
+        "ce": _line(comb.index, comb["ce"].values),
+        "pe": _line(comb.index, comb["pe"].values),
         "spot": _line(spot_bars.index, spot_bars.values),
     }
     return JSONResponse({"meta": meta, "stats": stats, "series": series})
@@ -314,7 +388,18 @@ HTML = r"""<!DOCTYPE html>
   .toggles label{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--mut);cursor:pointer;
       background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:5px 10px}
   .toggles label .sw{width:12px;height:3px;border-radius:2px}
-  #chart{height:440px}
+  .toggles label input[type=number]{width:44px;background:var(--bg);border:1px solid var(--line);
+      color:var(--txt);border-radius:5px;padding:2px 5px;font-size:11px;margin-left:3px;color-scheme:dark;
+      font-variant-numeric:tabular-nums}
+  #chartwrap{position:relative;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#0b111d}
+  #chart{height:530px}
+  #ohlcLegend{position:absolute;top:9px;left:12px;z-index:6;pointer-events:none;
+      font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--mut);
+      display:flex;gap:13px;align-items:baseline;flex-wrap:wrap;text-shadow:0 1px 5px #000c}
+  #ohlcLegend .sym{font-weight:800;font-size:13px;color:var(--txt);letter-spacing:.02em;
+      font-family:'Inter',system-ui,sans-serif}
+  #ohlcLegend .lab{color:var(--mut);margin-right:2px}
+  #ohlcLegend b{font-weight:700}
   .empty{padding:44px;text-align:center;color:var(--mut)}
   .spin{padding:36px;text-align:center;color:var(--mut)}
 </style>
@@ -344,6 +429,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div class="grp"><span class="lab">&nbsp;</span><button class="mini" id="resetBtn">Reset ATM</button></div>
     <div class="grp"><span class="lab">Timeframe</span><div class="seg" id="tfSeg"></div></div>
+    <div class="grp"><span class="lab">Days shown</span><div class="seg" id="dSeg"></div></div>
   </div>
 
   <div id="warnBox"></div>
@@ -356,21 +442,33 @@ HTML = r"""<!DOCTYPE html>
       <label><input type="checkbox" id="tgCE"/> <span class="sw" style="background:#2dd4bf"></span> Call leg</label>
       <label><input type="checkbox" id="tgPE"/> <span class="sw" style="background:#fb7185"></span> Put leg</label>
       <label><input type="checkbox" id="tgSpot"/> <span class="sw" style="background:#8a98b2"></span> Spot</label>
+      <label><input type="checkbox" id="tgEMA"/> <span class="sw" style="background:#eab308"></span> EMA
+        <input type="number" id="emaLen" value="20" min="2" max="200"/></label>
     </div>
-    <div id="chart"></div>
+    <div id="chartwrap">
+      <div id="ohlcLegend"></div>
+      <div id="chart"></div>
+    </div>
   </div>
 </div>
 
 <script>
 const BASE="__APP_BASE__";
 const TFS=["1m","3m","5m","15m","30m","1h"];
-let STATE={date:"",expiry:"",ce_off:0,pe_off:0,tf:"1m"};
+let STATE={date:"",expiry:"",ce_off:0,pe_off:0,tf:"1m",days:0};
 let DAYS=null, RESP=null;
-let chart=null, sComb=null, sCE=null, sPE=null, sSpot=null;
+let chart=null, sComb=null, sVol=null, sCE=null, sPE=null, sSpot=null, sEMA=null;
+let emaData=[];
+const DSEG=[{v:1,l:"1"},{v:3,l:"3"},{v:5,l:"5"},{v:0,l:"Max"}];
+const MO=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
 function j(u){return fetch(BASE+u).then(r=>{if(!r.ok)return r.json().then(e=>{throw e;});return r.json();});}
 function fmt(v,d=2){return (v===null||v===undefined||isNaN(v))?"—":Number(v).toFixed(d);}
 function signed(v,d=2){return (v>=0?"+":"")+fmt(v,d);}
+// naive-IST-as-UTC encoding → read back with UTC getters
+function fmtDT(t){if(!t)return"";const d=new Date(t*1000);
+  return String(d.getUTCDate()).padStart(2,"0")+" "+MO[d.getUTCMonth()]+" "+
+         String(d.getUTCHours()).padStart(2,"0")+":"+String(d.getUTCMinutes()).padStart(2,"0");}
 
 async function init(){
   DAYS=await j("/api/days");
@@ -382,12 +480,17 @@ async function init(){
   tf.innerHTML=TFS.map(t=>`<button data-t="${t}" class="${t===STATE.tf?'on':''}">${t}</button>`).join("");
   tf.querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.tf=b.dataset.t;
     tf.querySelectorAll("button").forEach(x=>x.classList.remove("on"));b.classList.add("on");load();});
+  const ds=document.getElementById("dSeg");
+  ds.innerHTML=DSEG.map(o=>`<button data-d="${o.v}" class="${o.v===STATE.days?'on':''}">${o.l}</button>`).join("");
+  ds.querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.days=parseInt(b.dataset.d);
+    ds.querySelectorAll("button").forEach(x=>x.classList.remove("on"));b.classList.add("on");load();});
   document.getElementById("expiry").onchange=e=>{STATE.expiry=e.target.value;STATE.ce_off=0;STATE.pe_off=0;load();};
   document.querySelectorAll(".stepper button").forEach(b=>b.onclick=()=>{
     const leg=b.dataset.leg, d=parseInt(b.dataset.d);
     if(leg==="ce")STATE.ce_off+=d; else STATE.pe_off+=d; load();});
   document.getElementById("resetBtn").onclick=()=>{STATE.ce_off=0;STATE.pe_off=0;load();};
-  ["tgCE","tgPE","tgSpot"].forEach(id=>document.getElementById(id).onchange=drawExtras);
+  ["tgCE","tgPE","tgSpot","tgEMA"].forEach(id=>document.getElementById(id).onchange=drawExtras);
+  document.getElementById("emaLen").oninput=()=>{if(document.getElementById("tgEMA").checked)drawExtras();};
   buildChart();
   await loadExpiries(); load();
 }
@@ -411,10 +514,11 @@ async function load(){
   document.getElementById("warnBox").innerHTML="";
   let d;
   try{
-    d=await j(`/api/basket?date=${STATE.date}&expiry=${STATE.expiry}&ce_off=${STATE.ce_off}&pe_off=${STATE.pe_off}&tf=${STATE.tf}`);
+    d=await j(`/api/basket?date=${STATE.date}&expiry=${STATE.expiry}&ce_off=${STATE.ce_off}&pe_off=${STATE.pe_off}&tf=${STATE.tf}&days=${STATE.days}`);
   }catch(err){
     document.getElementById("chips").innerHTML=`<div class="empty">${(err&&err.error)||"No data for this selection."}</div>`;
-    if(sComb)sComb.setData([]); if(sCE)sCE.setData([]); if(sPE)sPE.setData([]); if(sSpot)sSpot.setData([]);
+    if(sComb){sComb.setData([]);sComb.setMarkers([]);} if(sVol)sVol.setData([]); if(sCE)sCE.setData([]); if(sPE)sPE.setData([]); if(sSpot)sSpot.setData([]); if(sEMA)sEMA.setData([]); emaData=[];
+    document.getElementById("ohlcLegend").innerHTML="";
     return;
   }
   RESP=d; const m=d.meta, s=d.stats;
@@ -425,10 +529,14 @@ async function load(){
   document.getElementById("peV").innerHTML=(m.pe_off>=0?"ATM+"+m.pe_off:"ATM"+m.pe_off)+`<small>${m.pe_strike} PE</small>`;
   const es=document.getElementById("expiry"); if(es.value!==m.expiry)es.value=m.expiry;
 
+  const dayspan=m.n_days>1
+    ? `<span>${m.day_start} → ${m.day_end} · <b style="color:var(--txt)">${m.n_days} days</b></span>`
+    : `<span>${m.day_end}</span>`;
   document.getElementById("legsBar").innerHTML=
     `<span>Opening spot <b style="color:var(--txt)">${fmt(m.opening_spot)}</b> → ATM ${m.atm_strike}</span>`+
     `<span class="tag ce">SELL ${m.ce_strike} CE</span>`+
     `<span class="tag pe">SELL ${m.pe_strike} PE</span>`+
+    dayspan+
     `<span>· ${m.n_bars} bars · lot ${m.lot}</span>`;
 
   const mtmCls=s.mtm>=0?"pos":"neg";
@@ -443,7 +551,14 @@ async function load(){
   document.getElementById("warnBox").innerHTML=(m.warnings||[]).map(w=>`<div class="warn">⚠ ${w}</div>`).join("");
 
   sComb.setData(d.series.combined);
+  sVol.setData(d.series.volume||[]);
+  const marks=(m.n_days>1 && (m.day_starts||[]).length<=15)
+    ? m.day_starts.map(x=>({time:x.time,position:"belowBar",color:"#64789e",shape:"arrowUp",text:x.label}))
+    : [];
+  sComb.setMarkers(marks);
+  chart.applyOptions({watermark:{text:`NIFTY ${m.atm_strike} · ${m.is_straddle?"STRADDLE":"STRANGLE"}`}});
   chart.timeScale().fitContent();
+  updateLegend();
   drawExtras();
 }
 
@@ -454,18 +569,73 @@ function chip(k,v,sub,cls=""){
 function buildChart(){
   const box=document.getElementById("chart");
   chart=LightweightCharts.createChart(box,{
-    layout:{background:{color:"transparent"},textColor:"#8a98b2"},
-    grid:{vertLines:{color:"#16203a"},horzLines:{color:"#16203a"}},
-    rightPriceScale:{borderColor:"#1e2940"},timeScale:{borderColor:"#1e2940",timeVisible:true,secondsVisible:false},
-    crosshair:{mode:0}, height:440,
+    layout:{background:{type:"solid",color:"#0b111d"},textColor:"#b2becd",
+            fontFamily:"'Inter',ui-sans-serif,system-ui,sans-serif",fontSize:11},
+    grid:{vertLines:{color:"rgba(130,150,190,.05)"},horzLines:{color:"rgba(130,150,190,.05)"}},
+    rightPriceScale:{borderColor:"#1e2940",scaleMargins:{top:0.08,bottom:0.26},entireTextOnly:true},
+    timeScale:{borderColor:"#1e2940",timeVisible:true,secondsVisible:false,rightOffset:4,barSpacing:8},
+    crosshair:{mode:1,
+      vertLine:{color:"#64789e",width:1,style:3,labelBackgroundColor:"#2a3550"},
+      horzLine:{color:"#64789e",width:1,style:3,labelBackgroundColor:"#2a3550"}},
+    watermark:{visible:true,color:"rgba(251,146,60,.05)",fontSize:36,fontStyle:"bold",
+               horzAlign:"center",vertAlign:"center",text:""},
+    height:530,
   });
-  sComb=chart.addAreaSeries({lineColor:"#fb923c",topColor:"rgba(251,146,60,.28)",bottomColor:"rgba(251,146,60,.02)",
-    lineWidth:2,priceLineVisible:false,title:"Combined"});
-  sCE=chart.addLineSeries({color:"#2dd4bf",lineWidth:1,priceLineVisible:false,lastValueVisible:false,visible:false,title:"CE"});
-  sPE=chart.addLineSeries({color:"#fb7185",lineWidth:1,priceLineVisible:false,lastValueVisible:false,visible:false,title:"PE"});
-  sSpot=chart.addLineSeries({color:"#8a98b2",lineWidth:1,priceScaleId:"spot",priceLineVisible:false,lastValueVisible:false,visible:false,title:"Spot"});
-  chart.priceScale("spot").applyOptions({scaleMargins:{top:0.1,bottom:0.1},visible:false});
+  sComb=chart.addCandlestickSeries({upColor:"#26a69a",downColor:"#ef5350",borderVisible:false,
+    wickUpColor:"#26a69a",wickDownColor:"#ef5350",
+    priceLineVisible:true,priceLineColor:"#fb923c",priceLineStyle:2,priceLineWidth:1,
+    priceFormat:{type:"price",precision:2,minMove:0.05},title:""});
+  sVol=chart.addHistogramSeries({priceScaleId:"vol",priceFormat:{type:"volume"},
+    priceLineVisible:false,lastValueVisible:false});
+  chart.priceScale("vol").applyOptions({scaleMargins:{top:0.84,bottom:0}});
+  sCE=chart.addLineSeries({color:"#2dd4bf",lineWidth:2,priceLineVisible:false,lastValueVisible:false,visible:false,title:"CE"});
+  sPE=chart.addLineSeries({color:"#fb7185",lineWidth:2,priceLineVisible:false,lastValueVisible:false,visible:false,title:"PE"});
+  sSpot=chart.addLineSeries({color:"#8a98b2",lineWidth:1,lineStyle:2,priceScaleId:"spot",priceLineVisible:false,lastValueVisible:false,visible:false,title:"Spot"});
+  chart.priceScale("spot").applyOptions({scaleMargins:{top:0.1,bottom:0.28},visible:false});
+  sEMA=chart.addLineSeries({color:"#eab308",lineWidth:2,priceLineVisible:false,lastValueVisible:false,visible:false,title:"EMA"});
+  chart.subscribeCrosshairMove(updateLegend);
   new ResizeObserver(()=>chart.applyOptions({width:box.clientWidth})).observe(box);
+}
+
+function updateLegend(param){
+  const el=document.getElementById("ohlcLegend");
+  if(!RESP||!RESP.series.combined.length){el.innerHTML="";return;}
+  const cnd=RESP.series.combined;
+  let bar=cnd[cnd.length-1], tval=bar.time;
+  if(param&&param.time&&param.seriesData){
+    const v=param.seriesData.get(sComb); if(v){bar=v; tval=param.time;}
+  }
+  const {open:o,high:h,low:l,close:c}=bar;
+  const col=c>=o?"#26a69a":"#ef5350";
+  const chg=c-o, chgp=o?chg/o*100:0;
+  const sym=RESP.meta.is_straddle?"STRADDLE":"STRANGLE";
+  const cell=(k,val)=>`<span><span class="lab">${k}</span><b style="color:${col}">${fmt(val)}</b></span>`;
+  let emaTxt="";
+  if(document.getElementById("tgEMA").checked && emaData.length){
+    let ev=null;
+    if(param&&param.seriesData){const e=param.seriesData.get(sEMA); if(e&&e.value!=null)ev=e.value;}
+    if(ev==null)ev=emaData[emaData.length-1].value;
+    emaTxt=`<span style="color:#eab308"><span class="lab">EMA${document.getElementById("emaLen").value}</span>${fmt(ev)}</span>`;
+  }
+  el.innerHTML=
+    `<span class="sym">NIFTY ${RESP.meta.atm_strike} ${sym}</span>`+
+    `<span class="lab">${fmtDT(tval)}</span>`+
+    cell("O",o)+cell("H",h)+cell("L",l)+cell("C",c)+
+    `<span style="color:${col}">${signed(chg)} (${signed(chgp,2)}%)</span>`+
+    emaTxt;
+}
+
+// EMA of the combined-premium closes, SMA-seeded (TradingView convention).
+function emaLine(cnd,len){
+  if(!cnd||cnd.length<len)return [];
+  const k=2/(len+1); const out=[]; let ema=null;
+  for(let i=0;i<cnd.length;i++){
+    if(i<len-1)continue;
+    if(ema===null){let s=0;for(let x=i-len+1;x<=i;x++)s+=cnd[x].close;ema=s/len;}
+    else ema=cnd[i].close*k+ema*(1-k);
+    out.push({time:cnd[i].time,value:Math.round(ema*100)/100});
+  }
+  return out;
 }
 
 function drawExtras(){
@@ -474,6 +644,11 @@ function drawExtras(){
   sCE.applyOptions({visible:ce}); sCE.setData(ce?RESP.series.ce:[]);
   sPE.applyOptions({visible:pe}); sPE.setData(pe?RESP.series.pe:[]);
   sSpot.applyOptions({visible:sp}); sSpot.setData(sp?RESP.series.spot:[]);
+  const emaOn=document.getElementById("tgEMA").checked;
+  const len=Math.max(2,Math.min(200,parseInt(document.getElementById("emaLen").value)||20));
+  emaData=emaOn?emaLine(RESP.series.combined,len):[];
+  sEMA.applyOptions({visible:emaOn}); sEMA.setData(emaData);
+  updateLegend();
 }
 
 init();
