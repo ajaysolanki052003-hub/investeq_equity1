@@ -561,6 +561,24 @@ HTML = r"""<!DOCTYPE html>
   #chartBox{height:min(64vh,560px)}
   .empty{padding:48px;text-align:center;color:var(--mut)}
   .spin{padding:40px;text-align:center;color:var(--mut)}
+  .pie-wrap{display:flex;gap:28px;align-items:center;flex-wrap:wrap;justify-content:center}
+  #pie svg{width:236px;height:236px}
+  #pie .seg{cursor:pointer;transition:opacity .12s}
+  .pie-legend{flex:1 1 340px;display:grid;grid-template-columns:repeat(2,minmax(150px,1fr));gap:6px 18px;min-width:280px}
+  .pl{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut)}
+  .pl .sw{width:11px;height:11px;border-radius:3px;flex:0 0 auto}
+  .pl .nm{color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pl .pc{margin-left:auto;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .quad-wrap{display:flex;gap:26px;align-items:center;flex-wrap:wrap;justify-content:center}
+  #quad svg{width:460px;max-width:100%;height:auto}
+  #quad circle{cursor:pointer}
+  .quad-key{flex:1 1 230px;display:flex;flex-direction:column;gap:9px;font-size:12.5px;color:var(--mut);min-width:220px}
+  .quad-key b{font-weight:700}
+  .quad-key .qnote{font-size:11.5px;margin-top:2px;border-top:1px solid var(--line);padding-top:9px;line-height:1.5}
+  .heat{display:grid;gap:2px;min-width:660px}
+  .heat .hc{padding:6px 3px;text-align:center;font-size:11px;font-variant-numeric:tabular-nums;border-radius:3px;font-weight:700}
+  .heat .hh{color:var(--mut);font-size:10px;text-transform:uppercase;letter-spacing:.06em;padding:4px;text-align:center;font-weight:600}
+  .heat .hn{text-align:left;color:var(--txt);font-size:11.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:6px 8px 6px 2px}
 </style>
 </head>
 <body>
@@ -601,6 +619,30 @@ HTML = r"""<!DOCTYPE html>
       <div id="rotChart"></div>
       <div id="legend"></div>
     </div>
+  </div>
+
+  <div class="card">
+    <h3>Universe composition <span class="pill">stocks per group</span></h3>
+    <div class="pie-wrap"><div id="pie"></div><div class="pie-legend" id="pieLegend"></div></div>
+  </div>
+
+  <div class="card">
+    <h3>Momentum quadrant <span class="pill">1M vs 3M return</span></h3>
+    <div class="quad-wrap">
+      <div id="quad"></div>
+      <div class="quad-key">
+        <div><b style="color:var(--pos)">Leading</b> — strong 1M &amp; 3M</div>
+        <div><b style="color:#60a5fa">Improving</b> — 1M up, 3M still down</div>
+        <div><b style="color:#fbbf24">Weakening</b> — 1M down, 3M up</div>
+        <div><b style="color:var(--neg)">Lagging</b> — weak on both</div>
+        <div class="qnote">Each dot is a group; size = number of stocks. Top-right leads; bottom-right is turning up. Hover for details.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Return heatmap <span class="pill">group × timeframe</span> <span class="pill">sorted by 1M</span></h3>
+    <div class="tablewrap"><div id="heat"></div></div>
   </div>
 
   <div class="card">
@@ -697,6 +739,61 @@ async function load(){
   const saEl=document.getElementById("scopeAvg"); saEl.textContent=fmtPct(sa); saEl.className=cls(sa);
   assignColors(DATA.sectors.map(s=>s.sector));
   renderBars(); renderTable(); renderRotation();
+  renderPie(); renderQuadrant(); renderHeatmap();
+}
+
+const PIE_PAL=["#a78bfa","#22d3ee","#34d399","#f472b6","#fbbf24","#60a5fa","#f87171","#c084fc","#2dd4bf","#fb923c","#818cf8","#4ade80","#e879f9"];
+function renderPie(){
+  const arr=DATA.sectors.map(s=>({name:s.sector,n:s.n})).sort((a,b)=>b.n-a.n);
+  const TOPN=13, top=arr.slice(0,TOPN), rest=arr.slice(TOPN);
+  const restN=rest.reduce((a,b)=>a+b.n,0);
+  const slices=top.map((s,i)=>({name:s.name,value:s.n,color:PIE_PAL[i%PIE_PAL.length]}));
+  if(restN>0) slices.push({name:`Other (${rest.length} groups)`,value:restN,color:"#64748b"});
+  const total=slices.reduce((a,b)=>a+b.value,0)||1;
+  const r=70,C=2*Math.PI*r,cx=90,cy=90; let cum=0;
+  const segs=slices.map(s=>{const f=s.value/total,dash=f*C;
+    const el=`<circle class="seg" cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${s.color}" stroke-width="30" stroke-dasharray="${dash.toFixed(2)} ${(C-dash).toFixed(2)}" transform="rotate(${(cum*360-90).toFixed(2)} ${cx} ${cy})" data-v="${s.value}" data-p="${(f*100).toFixed(1)}"><title>${s.name}: ${s.value} (${(f*100).toFixed(1)}%)</title></circle>`;
+    cum+=f; return el;}).join("");
+  document.getElementById("pie").innerHTML=`<svg viewBox="0 0 180 180" role="img" aria-label="Stocks per group">${segs}<text id="pieC1" x="90" y="86" text-anchor="middle" fill="#e6edf6" font-size="23" font-weight="800">${total}</text><text id="pieC2" x="90" y="103" text-anchor="middle" fill="#8a98b2" font-size="10">priced stocks</text></svg>`;
+  document.getElementById("pieLegend").innerHTML=slices.map(s=>`<span class="pl"><span class="sw" style="background:${s.color}"></span><span class="nm" title="${s.name}">${s.name}</span><span class="pc" style="color:var(--mut)">${s.value} · ${(s.value/total*100).toFixed(1)}%</span></span>`).join("");
+  const c1=document.getElementById("pieC1"),c2=document.getElementById("pieC2");
+  document.querySelectorAll("#pie .seg").forEach(seg=>{
+    seg.onmouseenter=()=>{document.querySelectorAll("#pie .seg").forEach(x=>x.style.opacity=x===seg?"1":".3");c1.textContent=seg.dataset.v;c2.textContent=seg.dataset.p+"% of priced";};
+    seg.onmouseleave=()=>{document.querySelectorAll("#pie .seg").forEach(x=>x.style.opacity="1");c1.textContent=total;c2.textContent="priced stocks";};
+  });
+}
+function renderQuadrant(){
+  const pts=DATA.sectors.filter(s=>s.rets["1M"]!=null&&s.rets["3M"]!=null).map(s=>({name:s.sector,x:s.rets["1M"],y:s.rets["3M"],n:s.n}));
+  const el=document.getElementById("quad");
+  if(!pts.length){el.innerHTML='<div class="empty">Need 1M &amp; 3M returns</div>';return;}
+  const W=460,H=360,m=36;
+  const xmax=Math.max(5,...pts.map(p=>Math.abs(p.x)))*1.12, ymax=Math.max(5,...pts.map(p=>Math.abs(p.y)))*1.12;
+  const px=x=>m+((x+xmax)/(2*xmax))*(W-2*m), py=y=>m+(1-(y+ymax)/(2*ymax))*(H-2*m);
+  const nmax=Math.max(1,...pts.map(p=>p.n)), rad=n=>4+Math.sqrt(n/nmax)*9;
+  const x0=px(0),y0=py(0);
+  let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Momentum quadrant 1M vs 3M">`;
+  s+=`<rect x="${x0}" y="${m}" width="${W-m-x0}" height="${y0-m}" fill="rgba(52,211,153,.055)"/><rect x="${m}" y="${m}" width="${x0-m}" height="${y0-m}" fill="rgba(251,191,36,.05)"/><rect x="${m}" y="${y0}" width="${x0-m}" height="${H-m-y0}" fill="rgba(248,113,113,.055)"/><rect x="${x0}" y="${y0}" width="${W-m-x0}" height="${H-m-y0}" fill="rgba(96,165,250,.055)"/>`;
+  s+=`<line x1="${m}" y1="${y0.toFixed(1)}" x2="${W-m}" y2="${y0.toFixed(1)}" stroke="#39466a"/><line x1="${x0.toFixed(1)}" y1="${m}" x2="${x0.toFixed(1)}" y2="${H-m}" stroke="#39466a"/>`;
+  s+=`<text x="${W-m-4}" y="${m+11}" text-anchor="end" fill="#34d399" font-size="10" font-weight="700">LEADING</text><text x="${m+4}" y="${m+11}" fill="#fbbf24" font-size="10" font-weight="700">WEAKENING</text><text x="${m+4}" y="${H-m-5}" fill="#f87171" font-size="10" font-weight="700">LAGGING</text><text x="${W-m-4}" y="${H-m-5}" text-anchor="end" fill="#60a5fa" font-size="10" font-weight="700">IMPROVING</text>`;
+  s+=`<text x="${W-m}" y="${(y0-5).toFixed(1)}" text-anchor="end" fill="#5c6b8a" font-size="9">1M %  →</text><text x="${(x0+5).toFixed(1)}" y="${m+9}" fill="#5c6b8a" font-size="9">↑ 3M %</text>`;
+  pts.forEach(p=>{const c=p.x>=0?(p.y>=0?"#34d399":"#60a5fa"):(p.y>=0?"#fbbf24":"#f87171");
+    s+=`<circle cx="${px(p.x).toFixed(1)}" cy="${py(p.y).toFixed(1)}" r="${rad(p.n).toFixed(1)}" fill="${c}" fill-opacity="0.5" stroke="${c}" stroke-width="1"><title>${p.name} — 1M ${p.x.toFixed(1)}%, 3M ${p.y.toFixed(1)}% · ${p.n} stocks</title></circle>`;});
+  pts.slice().sort((a,b)=>(Math.abs(b.x)+Math.abs(b.y))-(Math.abs(a.x)+Math.abs(a.y))).slice(0,4).forEach(p=>{
+    s+=`<text x="${(px(p.x)+rad(p.n)+3).toFixed(1)}" y="${(py(p.y)+3).toFixed(1)}" fill="#c7d2f0" font-size="9">${p.name.length>15?p.name.slice(0,14)+'…':p.name}</text>`;});
+  el.innerHTML=s+`</svg>`;
+}
+function renderHeatmap(){
+  const WK=(META.windows||[]).map(w=>w.key);
+  const rows=DATA.sectors.slice().sort((a,b)=>{const x=a.rets["1M"],y=b.rets["1M"];if(x==null)return 1;if(y==null)return -1;return y-x;});
+  const cap=18;
+  const cell=v=>{if(v==null||isNaN(v))return `<div class="hc" style="background:#141d31;color:#5c6b8a;font-weight:500">—</div>`;
+    const a=Math.min(0.92,Math.abs(v)/cap*0.85+0.1);
+    const bg=v>=0?`rgba(52,211,153,${a.toFixed(2)})`:`rgba(248,113,113,${a.toFixed(2)})`;
+    const fg=a>0.42?"#0a0e17":(v>=0?"#8ff0c8":"#ffb4b4");
+    return `<div class="hc" style="background:${bg};color:${fg}">${(v>=0?"+":"")+v.toFixed(1)}</div>`;};
+  let h=`<div class="heat" style="grid-template-columns:minmax(150px,1.4fr) repeat(${WK.length},1fr)"><div class="hh" style="text-align:left">Group</div>`+WK.map(w=>`<div class="hh">${w}</div>`).join("");
+  rows.forEach(r=>{h+=`<div class="hn" title="${r.sector}">${r.sector} <small style="color:#5c6b8a">${r.n}</small></div>`+WK.map(w=>cell(r.rets[w])).join("");});
+  document.getElementById("heat").innerHTML=h+`</div>`;
 }
 
 function renderBars(){
