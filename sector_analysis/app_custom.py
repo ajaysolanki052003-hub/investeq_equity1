@@ -558,7 +558,7 @@ HTML = r"""<!DOCTYPE html>
         width:30px;height:30px;cursor:pointer;font-size:16px;line-height:1;margin-left:auto}
   .xbtn:hover{border-color:var(--neg);color:var(--neg)}
   .sheetbody{padding:6px 4px;overflow:auto}
-  #chartBox{height:min(64vh,560px)}
+  #chartBox{height:min(64vh,560px);width:100%}
   .empty{padding:48px;text-align:center;color:var(--mut)}
   .spin{padding:40px;text-align:center;color:var(--mut)}
   .pie-wrap{display:flex;gap:28px;align-items:center;flex-wrap:wrap;justify-content:center}
@@ -918,24 +918,30 @@ async function openChart(sym){
   document.getElementById("chNm").textContent=sym;
   document.getElementById("chDd").textContent="Loading…";
   showModal("chModal");
-  const d=await jget(`/api/chart?sym=${encodeURIComponent(sym)}&date=${STATE.date}`);
+  let d;
+  try{ d=await jget(`/api/chart?sym=${encodeURIComponent(sym)}&date=${STATE.date}`); }
+  catch(e){ document.getElementById("chDd").textContent="No chart data for this stock.";
+    if(candleSeries)candleSeries.setData([]); return; }
   document.getElementById("chNm").textContent=sym;
-  document.getElementById("chDd").textContent=`${d.company||""} · ${d.sector||""}`;
+  document.getElementById("chDd").textContent=`${d.company||""}${d.company?" · ":""}${d.sector||""}`;
   const box=document.getElementById("chartBox");
   if(!chart){
+    // autoSize lets the chart track the modal container — robust vs. reading
+    // clientWidth before the modal has laid out (which rendered it zero-width).
     chart=LightweightCharts.createChart(box,{
-      layout:{background:{color:"transparent"},textColor:"#8a98b2"},
+      autoSize:true,
+      layout:{background:{type:"solid",color:"transparent"},textColor:"#8a98b2"},
       grid:{vertLines:{color:"#16203a"},horzLines:{color:"#16203a"}},
       rightPriceScale:{borderColor:"#1e2940"},timeScale:{borderColor:"#1e2940"},
-      height:Math.min(window.innerHeight*0.64,560),
+      crosshair:{mode:0},
     });
     candleSeries=chart.addCandlestickSeries({upColor:"#34d399",downColor:"#f87171",
       wickUpColor:"#34d399",wickDownColor:"#f87171",borderVisible:false});
-    new ResizeObserver(()=>chart.applyOptions({width:box.clientWidth})).observe(box);
   }
-  candleSeries.setData(d.candles);
+  candleSeries.setData(d.candles||[]);
   chart.timeScale().fitContent();
-  chart.applyOptions({width:box.clientWidth});
+  // re-fit once the modal has painted (first frame can still be mid-layout)
+  requestAnimationFrame(()=>{ try{ chart.timeScale().fitContent(); }catch(_){} });
 }
 
 function showModal(id){document.getElementById(id).classList.add("show");}
