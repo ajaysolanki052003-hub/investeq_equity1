@@ -1,0 +1,17 @@
+[Unit]
+Description=Investeq Straddle Basket intraday fetch — every ~15 min during NSE hours (IST)
+
+[Timer]
+# Market opens 09:15; the NIFTY spot master refreshes at 09:16 and hourly. Start at
+# 09:20 so the first run already has option candles + a spot bar, then every 15 min.
+# The 15:35 run captures the full session (options close 15:30); the 15:50 run is a
+# harmless final sweep. Not Persistent — a skipped intraday tick is irrelevant since
+# the next tick re-fetches the whole day, and the morning voldesk job is the
+# authoritative T+1 rebuild.
+OnCalendar=Mon..Fri 09:20,35,50 Asia/Kolkata
+OnCalendar=Mon..Fri 10..15:05,20,35,50 Asia/Kolkata
+Persistent=false
+Unit=investeq-basket-live.service
+
+[Install]
+WantedBy=timers.target

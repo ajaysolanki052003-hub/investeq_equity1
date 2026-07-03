@@ -1,0 +1,20 @@
+[Unit]
+Description=Investeq Straddle Basket — intraday TODAY option OHLCV fetch (one-shot, triggered by .timer)
+
+[Service]
+Type=oneshot
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+Environment=INVESTEQ_DATA=/home/ajay/investeq_ajs/DATA
+# Groww serves per-minute OPTION OHLCV/volume candles LIVE intraday — only the OI
+# column settles overnight. The morning voldesk timer is T+1, so nothing fed the
+# Straddle Basket during TODAY's session; this fills that gap by re-fetching today's
+# ATM-band CE/PE 1m candles + the per-day spot file every ~15 min. --today re-pulls
+# the whole 09:15..now window each run (idempotent atomic overwrite), so a missed
+# tick self-heals. No OI, no straddle-P&L rebuild — those stay in the morning voldesk
+# job, which remains the authoritative T+1 rebuild (--pad 3 matches it for consistency).
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python fetch_option_ohlcv.py --today --pad 3 --delay 0.35
+StandardOutput=journal
+StandardError=journal

@@ -49,33 +49,54 @@ app = FastAPI(title="Straddle Basket")
 
 
 # ─────────────────────────────── loaders ───────────────────────────────────
-@lru_cache(maxsize=64)
-def load_options(date: str) -> pd.DataFrame:
-    p = OPT_DIR / f"{date}.parquet"
-    if not p.exists():
-        return pd.DataFrame()
-    df = pd.read_parquet(p)
+# Historical per-day files never change once written, so they cache forever; but
+# TODAY's file grows through the session (the intraday basket-live timer rewrites
+# it every ~15 min). Key the cache on the file's mtime — a new mtime is a cache
+# miss that reloads the fuller file, while every past day stays a permanent hit.
+@lru_cache(maxsize=128)
+def _load_options_at(date: str, _mtime: float) -> pd.DataFrame:
+    df = pd.read_parquet(OPT_DIR / f"{date}.parquet")
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df["expiry"] = df["expiry"].astype(str)
     df["strike"] = df["strike"].astype(int)
     return df
 
 
-@lru_cache(maxsize=64)
-def load_spot(date: str) -> pd.DataFrame:
-    p = SPOT_DIR / f"{date}.parquet"
+def load_options(date: str) -> pd.DataFrame:
+    p = OPT_DIR / f"{date}.parquet"
     if not p.exists():
         return pd.DataFrame()
-    df = pd.read_parquet(p)
+    return _load_options_at(date, p.stat().st_mtime)
+
+
+@lru_cache(maxsize=128)
+def _load_spot_at(date: str, _mtime: float) -> pd.DataFrame:
+    df = pd.read_parquet(SPOT_DIR / f"{date}.parquet")
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-@lru_cache(maxsize=1)
-def list_trading_days() -> tuple[str, ...]:
+def load_spot(date: str) -> pd.DataFrame:
+    p = SPOT_DIR / f"{date}.parquet"
+    if not p.exists():
+        return pd.DataFrame()
+    return _load_spot_at(date, p.stat().st_mtime)
+
+
+# The day list changes when a NEW per-day file first lands (e.g. today at ~09:20).
+# Key on the two dirs' mtimes so it refreshes the moment today's files appear,
+# without re-globbing on every request.
+@lru_cache(maxsize=8)
+def _list_trading_days_at(_sig: tuple) -> tuple[str, ...]:
     opt = {p.stem for p in OPT_DIR.glob("*.parquet")}
     spot = {p.stem for p in SPOT_DIR.glob("*.parquet")}
     return tuple(sorted(opt & spot))
+
+
+def list_trading_days() -> tuple[str, ...]:
+    sig = (OPT_DIR.stat().st_mtime if OPT_DIR.exists() else 0.0,
+           SPOT_DIR.stat().st_mtime if SPOT_DIR.exists() else 0.0)
+    return _list_trading_days_at(sig)
 
 
 def _norm_date(date: str) -> str:
