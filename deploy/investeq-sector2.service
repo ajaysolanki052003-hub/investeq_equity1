@@ -1,0 +1,19 @@
+[Unit]
+Description=Investeq Sector Analysis (Custom universe) — user-provided Sector/Sub-sector map (FastAPI on 8715, served at /sector2)
+After=network.target
+
+[Service]
+Type=simple
+User=ajay
+Group=ajay
+WorkingDirectory=/home/ajay/investeq_ajs
+EnvironmentFile=/etc/investeq.env
+Environment=APP_BASE=/sector2
+ExecStart=/home/ajay/investeq_ajs/.venv/bin/python -m uvicorn sector_analysis.app_custom:app --host 127.0.0.1 --port 8715
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

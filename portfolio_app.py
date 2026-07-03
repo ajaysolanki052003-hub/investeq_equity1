@@ -264,6 +264,24 @@ PROJECTS = [
         "accent": "#a78bfa",
     },
     {
+        "id": "sector-analysis-custom",
+        "name": "Sector Analysis · Custom",
+        "instrument": "Equities",
+        "tag": "TOOL",
+        "category": "EQUITIES",
+        "thesis": "The same sector engine on a custom universe you define — 2,800+ "
+                  "NSE stocks mapped across 59 sectors and 187 sub-sectors. Start on "
+                  "'All Sectors' for the top-level ranking, pick any sector to drill "
+                  "into its sub-sectors, and click through to individual stocks. "
+                  "Equal-weight returns over 1D–1Y with a ranked bar and rotation chart.",
+        "stack": [],
+        "port": 8715,
+        "url": "/sector2/",
+        "path": "",
+        "metrics": [],
+        "accent": "#34d399",
+    },
+    {
         "id": "straddle-basket",
         "name": "Straddle Basket",
         "instrument": "NIFTY · options",
