@@ -109,39 +109,61 @@ def years_to_expiry(ts: pd.Timestamp, expiry: str) -> float:
 
 
 # ─── Loaders (memoised in-process) ────────────────────────────────────────────
-@lru_cache(maxsize=64)
-def load_spot(date: str) -> pd.DataFrame:
-    p = SPOT_DIR / f"{date}.parquet"
-    if not p.exists():
-        return pd.DataFrame()
-    df = pd.read_parquet(p)
+# TODAY's per-day files grow through the session (the basket-live timer rewrites
+# them every ~15 min), so the loaders key their cache on the file's mtime: past
+# days stay a permanent hit, today's file reloads whenever it changes. A plain
+# lru_cache here froze the first snapshot and silently dropped strikes added later
+# (e.g. the straddle collapsing to call-only when the ATM band recentred).
+@lru_cache(maxsize=128)
+def _load_spot_at(date: str, _mtime: float) -> pd.DataFrame:
+    df = pd.read_parquet(SPOT_DIR / f"{date}.parquet")
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-@lru_cache(maxsize=64)
+def load_spot(date: str) -> pd.DataFrame:
+    p = SPOT_DIR / f"{date}.parquet"
+    if not p.exists():
+        return pd.DataFrame()
+    return _load_spot_at(date, p.stat().st_mtime)
+
+
+@lru_cache(maxsize=128)
+def _load_options_at(date: str, _mtime: float) -> pd.DataFrame:
+    df = pd.read_parquet(OPT_DIR / f"{date}.parquet")
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df
+
+
 def load_options(date: str) -> pd.DataFrame:
     p = OPT_DIR / f"{date}.parquet"
     if not p.exists():
         return pd.DataFrame()
-    df = pd.read_parquet(p)
+    return _load_options_at(date, p.stat().st_mtime)
+
+
+@lru_cache(maxsize=128)
+def _load_oi_at(date: str, _mtime: float) -> pd.DataFrame:
+    df = pd.read_parquet(OI_DIR / f"{date}.parquet")
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     return df
 
 
-@lru_cache(maxsize=64)
 def load_oi(date: str) -> pd.DataFrame:
     p = OI_DIR / f"{date}.parquet"
     if not p.exists():
         return pd.DataFrame()
-    df = pd.read_parquet(p)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    return df
+    return _load_oi_at(date, p.stat().st_mtime)
 
 
-@lru_cache(maxsize=1)
-def list_trading_days() -> tuple[str, ...]:
+@lru_cache(maxsize=8)
+def _list_trading_days_at(_sig: float) -> tuple[str, ...]:
     return tuple(sorted(p.stem for p in SPOT_DIR.glob("*.parquet")))
+
+
+def list_trading_days() -> tuple[str, ...]:
+    sig = SPOT_DIR.stat().st_mtime if SPOT_DIR.exists() else 0.0
+    return _list_trading_days_at(sig)
 
 
 def recent_trading_days(date: str, n: int) -> list[str]:
@@ -263,10 +285,14 @@ def strikes(date: str = Query(...), expiry: str = Query(...)):
     ks = sorted(df.loc[df["expiry"] == expiry, "strike"].unique().tolist())
     spot = load_spot(date)
     atm = None
+    atm_open = None
     if not spot.empty and ks:
         last_spot = float(spot.iloc[-1]["close"])
-        atm = min(ks, key=lambda k: abs(k - last_spot))
-    return {"strikes": ks, "atm": atm}
+        open_spot = float(spot.iloc[0]["open"])
+        atm      = min(ks, key=lambda k: abs(k - last_spot))
+        atm_open = min(ks, key=lambda k: abs(k - open_spot))   # Basket anchor: short at the open
+    step = int(np.median(np.diff(ks))) if len(ks) > 1 else 50
+    return {"strikes": ks, "atm": atm, "atm_open": atm_open, "step": step}
 
 
 @app.get("/api/leg")
@@ -651,7 +677,28 @@ body { background:#0d0f1a; color:#c9d1d9; font:12px/1.4 'Segoe UI',monospace; he
 h1 { color:#fff; font-size:15px; font-weight:700; margin-right:8px; }
 label { color:#6b7280; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
 select, button { background:#1a1d27; border:1px solid #3a3d4e; color:#e0e0e0; border-radius:5px; padding:5px 9px; cursor:pointer; font:inherit; }
+input[type=date] { background:#1a1d27; border:1px solid #3a3d4e; color:#e0e0e0; border-radius:5px; padding:4px 8px; font:inherit; color-scheme:dark; }
+input[type=number] { width:52px; background:#1a1d27; border:1px solid #3a3d4e; color:#e0e0e0; border-radius:5px; padding:4px 6px; font:inherit; color-scheme:dark; font-variant-numeric:tabular-nums; }
+input[type=color] { width:24px; height:26px; padding:1px 2px; background:#1a1d27; border:1px solid #3a3d4e; border-radius:5px; cursor:pointer; }
+/* Active-indicator pills (one per added indicator) */
+.ind-active { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:6px 16px; background:#10121b; border-bottom:1px solid #2a2d3a; }
+.ind-active:empty { display:none; }
+.ind-pill { display:inline-flex; align-items:center; gap:4px; background:#1a1d27; border:1px solid #3a3d4e; border-radius:16px; padding:3px 6px 3px 11px; font-size:11px; }
+.ind-pill b { color:#e6e9f2; font-weight:600; margin-right:3px; }
+.ind-pill input[type=number] { width:44px; padding:2px 4px; }
+.ind-pill input[type=color] { width:22px; height:20px; }
+.ind-pill .rm { background:transparent; border:none; color:#9ca3af; font-size:16px; line-height:1; padding:0 3px; cursor:pointer; }
+.ind-pill .rm:hover { color:#f87171; background:transparent; }
 button:hover, select:hover { background:#252837; }
+/* Basket-style Call/Put strike steppers */
+.stepper { display:inline-flex; align-items:stretch; }
+.stepper button { padding:3px 9px; font-weight:800; font-size:13px; line-height:1; border-radius:5px; }
+.stepper button:first-child { border-top-right-radius:0; border-bottom-right-radius:0; }
+.stepper button:last-child  { border-top-left-radius:0;  border-bottom-left-radius:0; }
+.stepper .stepv { display:inline-flex; flex-direction:column; align-items:center; justify-content:center;
+  line-height:1.05; min-width:56px; padding:2px 6px; background:#1a1d27; border:1px solid #3a3d4e;
+  border-left:none; border-right:none; color:#e6e9f2; font-size:11px; font-weight:700; }
+.stepper .stepv small { color:#9ca3af; font-size:10px; font-weight:600; font-variant-numeric:tabular-nums; }
 button.on { background:#1e3a5f; border-color:#2563eb; color:#93c5fd; }
 .tf-grp button { padding:4px 10px; font-size:11px; font-weight:600; }
 .tf-grp button.on { background:#2563eb; border-color:#2563eb; color:#fff; }
@@ -678,6 +725,8 @@ body.resizing iframe, body.resizing canvas { pointer-events:none; }
                      background:#0d0f1a; border:1px solid #1e2030; border-radius:6px; }
 .pane-price.solo-ce > .sub-pe { display:none; }
 .pane-price.solo-pe > .sub-ce { display:none; }
+.pane-comb { flex:3.0; }
+#pane-comb-chart { position:absolute; inset:0; }
 #status { color:#6b7280; font-size:11px; margin-left:auto; }
 .legend-dot { display:inline-block; width:8px; height:8px; border-radius:50%; vertical-align:middle; margin-right:4px; }
 
@@ -698,6 +747,19 @@ body.resizing iframe, body.resizing canvas { pointer-events:none; }
 .chip.iv  .val { color:#60a5fa; } .chip.rv  .val { color:#fb923c; }
 .chip.live { border-color:#2563eb; box-shadow:0 0 0 1px #2563eb40 inset; }
 .chip.live .lbl { color:#93c5fd; }
+
+/* ── Basket entry/exit strip (short straddle/strangle P&L) ─────────────── */
+.basket {
+  display:flex; gap:10px; align-items:stretch; flex-wrap:wrap;
+  padding:6px 16px; background:#12172a; border-bottom:1px solid #2a2d3a; font-size:11px;
+}
+.basket.hidden { display:none; }
+.basket .kind { display:flex; flex-direction:column; justify-content:center;
+  padding:5px 12px; color:#93c5fd; font-weight:800; letter-spacing:.4px;
+  border:1px solid #2563eb55; border-radius:6px; background:#15213a; min-width:104px; }
+.basket .kind small { color:#7b8294; font-weight:600; font-size:10px; letter-spacing:.3px; }
+.basket .chip.credit { border-color:#facc1555; } .basket .chip.credit .val { color:#facc15; }
+.basket .chip.mark   { border-color:#60a5fa55; } .basket .chip.mark   .val { color:#93c5fd; }
 
 /* Trade-info banner (visible when a strategy event is active) */
 .trade {
@@ -736,7 +798,7 @@ body.resizing iframe, body.resizing canvas { pointer-events:none; }
   <div class="spot"><span>Spot</span><strong id="spotval">—</strong></div>
 
   <label>Date</label>
-  <select id="date"></select>
+  <input type="date" id="date"/>
 
   <label>Lookback</label>
   <select id="lookback">
@@ -747,15 +809,29 @@ body.resizing iframe, body.resizing canvas { pointer-events:none; }
     <option value="10">10 days</option>
   </select>
 
-  <label>Strategy event</label>
-  <select id="event" style="min-width:240px"></select>
-  <button id="tg-signals" class="on" title="Show SELL/BUY markers + LGBM probability">Signals</button>
-
   <label>Expiry</label>
   <select id="expiry"></select>
 
-  <label>Strike</label>
-  <select id="strike"></select>
+  <label>Call K</label>
+  <span class="stepper" id="ceStep">
+    <button data-leg="ce" data-d="-1" title="Call strike down">−</button>
+    <span class="stepv" id="ceV">ATM<small id="ceK">—</small></span>
+    <button data-leg="ce" data-d="1" title="Call strike up">+</button>
+  </span>
+
+  <label>Put K</label>
+  <span class="stepper" id="peStep">
+    <button data-leg="pe" data-d="-1" title="Put strike down">−</button>
+    <span class="stepv" id="peV">ATM<small id="peK">—</small></span>
+    <button data-leg="pe" data-d="1" title="Put strike up">+</button>
+  </span>
+  <button id="resetK" title="Reset both legs to ATM">ATM</button>
+
+  <label>View</label>
+  <span class="tf-grp" id="view-grp">
+    <button data-view="straddle" class="on">Straddle</button>
+    <button data-view="legs">Legs</button>
+  </span>
 
   <label>Side</label>
   <select id="otype">
@@ -774,14 +850,28 @@ body.resizing iframe, body.resizing canvas { pointer-events:none; }
     <button data-tf="1h">1h</button>
   </span>
 
-  <label>Show</label>
-  <button id="tg-spot" class="on">Spot</button>
+  <label>Indicators</label>
+  <select id="ind-add" title="Add an indicator">
+    <option value="">+ Add indicator…</option>
+    <option value="ema">EMA</option>
+    <option value="sma">SMA</option>
+    <option value="bb">Bollinger Bands</option>
+    <option value="vwap">VWAP</option>
+  </select>
 
   <span id="status"></span>
 </div>
 
+<div class="ind-active" id="ind-active">
+  <!-- Filled by renderIndList(): one pill per added indicator -->
+</div>
+
 <div class="trade hidden" id="trade-info">
   <!-- Filled by renderTradeBanner() when a strategy event is active -->
+</div>
+
+<div class="basket hidden" id="basket">
+  <!-- Filled by renderBasketStats(): short straddle/strangle entry→exit P&L -->
 </div>
 
 <div class="stats" id="stats">
@@ -789,18 +879,23 @@ body.resizing iframe, body.resizing canvas { pointer-events:none; }
 </div>
 
 <div id="charts">
+  <div class="pane pane-comb" id="pane-comb">
+    <span class="pane-label">
+      <span class="legend-dot" style="background:#e5b53a"></span>Straddle · combined premium (CE + PE)
+      <span class="legend-dot" style="background:#3b82f6;margin-left:8px"></span>Volume
+    </span>
+    <div id="pane-comb-chart"></div>
+  </div>
   <div class="pane pane-price" id="pane-price">
     <div class="sub sub-ce" id="pane-price-ce">
       <span class="pane-label">
         <span class="legend-dot" style="background:#26a69a"></span>CE candles
-        <span class="legend-dot" style="background:#facc15;margin-left:8px"></span>Spot
         <span class="legend-dot" style="background:#3b82f6;margin-left:8px"></span>Volume
       </span>
     </div>
     <div class="sub sub-pe" id="pane-price-pe">
       <span class="pane-label">
         <span class="legend-dot" style="background:#ef5350"></span>PE candles
-        <span class="legend-dot" style="background:#facc15;margin-left:8px"></span>Spot
         <span class="legend-dot" style="background:#3b82f6;margin-left:8px"></span>Volume
       </span>
     </div>
@@ -815,16 +910,27 @@ const setStatus = s => $('status').textContent = s;
 const state = {
   date: null, expiry: null, strike: null, otype: 'BOTH',
   tfPrice: '5m',
-  showSpot: true,
+  showSpot: false,               // spot overlay removed; spot still fetched for the top readout + IV/RV
   lookbackDays: 3,
+  // Basket-style strike model: ATM anchor (from opening spot) + per-leg offsets.
+  // strike (above) stays as the ATM anchor for strategy-event compatibility.
+  daysAll: [], strikesList: [], step: 50,
+  atm: null, ceOff: 0, peOff: 0, ceStrike: null, peStrike: null,
+  lot: 75,                       // NIFTY lot — combined premium ₹ = points × lot
+  view: 'straddle',              // 'straddle' = combined CE+PE pane (default) | 'legs' = CE & PE panes
   // chart handles per side (CE / PE candle panes only)
   cPriceCe: null, cPricePe: null,
   sCandleCe: null, sVolCe: null, sSpotCe: null,
   sCandlePe: null, sVolPe: null, sSpotPe: null,
+  // combined straddle/strangle pane handles
+  cComb: null, sCandleComb: null, sVolComb: null, sSpotComb: null,
+  // overlay indicators added from the dropdown; each instance keeps its own
+  // params (period/σ + colour) and its line series per chart.
+  indInstances: [], indSeq: 0,
   syncing: false,
-  // Per-leg datasets kept for crosshair-driven stats chips
-  lastCe: { candles: [], iv: [], oi: [], greeks: {delta:[],gamma:[],theta:[],vega:[]}, stats: null },
-  lastPe: { candles: [], iv: [], oi: [], greeks: {delta:[],gamma:[],theta:[],vega:[]}, stats: null },
+  // Per-leg datasets kept for crosshair-driven stats chips (+ volume for the combined pane)
+  lastCe: { candles: [], volume: [], iv: [], oi: [], greeks: {delta:[],gamma:[],theta:[],vega:[]}, stats: null },
+  lastPe: { candles: [], volume: [], iv: [], oi: [], greeks: {delta:[],gamma:[],theta:[],vega:[]}, stats: null },
   lastShared: { rv: [], spot: [], days: [] },
   // For backward compat with existing helpers expecting state.last
   get last() {
@@ -925,8 +1031,155 @@ function buildCharts() {
   state.cPriceCe = ce.chart; state.sCandleCe = ce.candle; state.sVolCe = ce.vol; state.sSpotCe = ce.spot;
   state.cPricePe = pe.chart; state.sCandlePe = pe.candle; state.sVolPe = pe.vol; state.sSpotPe = pe.spot;
 
-  // Time-axis + crosshair sync between CE and PE candle panes
-  [state.cPriceCe, state.cPricePe].forEach(registerSync);
+  const comb = buildPriceChart($('pane-comb-chart'), false);
+  state.cComb = comb.chart; state.sCandleComb = comb.candle;
+  state.sVolComb = comb.vol; state.sSpotComb = comb.spot;
+
+  // Time-axis + crosshair sync across CE, PE and the combined straddle pane
+  [state.cPriceCe, state.cPricePe, state.cComb].forEach(registerSync);
+
+  applyView();
+}
+
+// ── Indicator math (computed client-side from a candle array's closes) ───────
+function smaLine(cnd, len) {
+  if (!cnd || cnd.length < len) return [];
+  const out = []; let sum = 0;
+  for (let i = 0; i < cnd.length; i++) {
+    sum += cnd[i].close;
+    if (i >= len) sum -= cnd[i - len].close;
+    if (i >= len - 1) out.push({time: cnd[i].time, value: Math.round(sum / len * 100) / 100});
+  }
+  return out;
+}
+// EMA, SMA-seeded (TradingView convention).
+function emaLine(cnd, len) {
+  if (!cnd || cnd.length < len) return [];
+  const k = 2 / (len + 1); const out = []; let ema = null;
+  for (let i = len - 1; i < cnd.length; i++) {
+    if (ema === null) { let s = 0; for (let x = i - len + 1; x <= i; x++) s += cnd[x].close; ema = s / len; }
+    else ema = cnd[i].close * k + ema * (1 - k);
+    out.push({time: cnd[i].time, value: Math.round(ema * 100) / 100});
+  }
+  return out;
+}
+function bbLines(cnd, len, mult) {
+  if (!cnd || cnd.length < len) return {upper: [], mid: [], lower: []};
+  const upper = [], mid = [], lower = [];
+  for (let i = len - 1; i < cnd.length; i++) {
+    let s = 0; for (let x = i - len + 1; x <= i; x++) s += cnd[x].close;
+    const m = s / len;
+    let v = 0; for (let x = i - len + 1; x <= i; x++) { const d = cnd[x].close - m; v += d * d; }
+    const sd = Math.sqrt(v / len); const t = cnd[i].time; const r = x => Math.round(x * 100) / 100;
+    mid.push({time: t, value: r(m)});
+    upper.push({time: t, value: r(m + mult * sd)});
+    lower.push({time: t, value: r(m - mult * sd)});
+  }
+  return {upper, mid, lower};
+}
+// Session-anchored VWAP: typical-price × volume, reset at each day boundary.
+function vwapLine(cnd, vol) {
+  if (!cnd || !cnd.length) return [];
+  const vm = new Map((vol || []).map(v => [v.time, v.value]));
+  const out = []; let cumPV = 0, cumV = 0, day = null;
+  for (const c of cnd) {
+    const dk = dayKey(c.time);
+    if (dk !== day) { day = dk; cumPV = 0; cumV = 0; }
+    const tp = (c.high + c.low + c.close) / 3;
+    const v = vm.get(c.time) || 0;
+    cumPV += tp * v; cumV += v;
+    out.push({time: c.time, value: cumV ? Math.round(cumPV / cumV * 100) / 100 : tp});
+  }
+  return out;
+}
+
+// ── Indicator catalog (overlays only) + add/remove instance engine ───────────
+// Each catalog entry: inputs (numeric), colors, and build(candles,vol,params)
+// returning one or more {data,color,width,style} overlay lines. Instances are
+// added from the toolbar dropdown and listed as removable pills; the SAME
+// indicator can be added multiple times with different settings.
+const IND_CATALOG = {
+  ema:  { name: 'EMA', inputs: [{k:'len', label:'Length', def:20, min:2, max:500}],
+          colors: [{k:'color', def:'#eab308'}],
+          build: (c,v,p) => [{data: emaLine(c, p.len), color: p.color, width: 2}] },
+  sma:  { name: 'SMA', inputs: [{k:'len', label:'Length', def:20, min:2, max:500}],
+          colors: [{k:'color', def:'#38bdf8'}],
+          build: (c,v,p) => [{data: smaLine(c, p.len), color: p.color, width: 2}] },
+  bb:   { name: 'Bollinger', inputs: [{k:'len', label:'Length', def:20, min:2, max:500},
+                                      {k:'mult', label:'StdDev', def:2, min:0.5, max:5, step:0.5}],
+          colors: [{k:'color', def:'#a78bfa'}],
+          build: (c,v,p) => { const b = bbLines(c, p.len, p.mult);
+            return [{data:b.upper, color:p.color, width:1}, {data:b.mid, color:p.color, width:1, style:2},
+                    {data:b.lower, color:p.color, width:1}]; } },
+  vwap: { name: 'VWAP', inputs: [], colors: [{k:'color', def:'#f472b6'}],
+          build: (c,v,p) => [{data: vwapLine(c, v), color: p.color, width: 2}] },
+};
+
+function indChartCtx(ck) {
+  if (ck === 'comb') { const c = computeCombined(); return {chart: state.cComb, candles: c.candles, volume: c.volume}; }
+  if (ck === 'ce')   return {chart: state.cPriceCe, candles: state.lastCe.candles, volume: state.lastCe.volume};
+  return {chart: state.cPricePe, candles: state.lastPe.candles, volume: state.lastPe.volume};
+}
+function ensureLine(chart, arr, i, o) {
+  if (!arr[i]) arr[i] = chart.addLineSeries({priceLineVisible:false, lastValueVisible:false, crosshairMarkerVisible:false});
+  arr[i].applyOptions({color: o.color, lineWidth: o.width || 2, lineStyle: o.style || 0});
+  arr[i].setData(o.data);
+}
+// Draw one instance's overlay lines on all three candle charts.
+function drawInstance(inst) {
+  const def = IND_CATALOG[inst.key];
+  for (const ck of ['comb', 'ce', 'pe']) {
+    const ctx = indChartCtx(ck);
+    const outs = def.build(ctx.candles, ctx.volume, inst.params);
+    const arr = inst.series[ck];
+    outs.forEach((o, i) => ensureLine(ctx.chart, arr, i, o));
+    for (let i = outs.length; i < arr.length; i++) arr[i].setData([]);
+  }
+}
+function drawAllIndicators() { try { state.indInstances.forEach(drawInstance); } catch (_) {} }
+
+function addInstance(key) {
+  const def = IND_CATALOG[key]; if (!def) return;
+  const params = {};
+  def.inputs.forEach(i => params[i.k] = i.def);
+  def.colors.forEach(c => params[c.k] = c.def);
+  const inst = {id: ++state.indSeq, key, params, series: {comb: [], ce: [], pe: []}};
+  state.indInstances.push(inst);
+  renderIndList();
+  drawInstance(inst);
+}
+function removeInstance(id) {
+  const idx = state.indInstances.findIndex(x => x.id === id); if (idx < 0) return;
+  const inst = state.indInstances[idx];
+  for (const ck of ['comb', 'ce', 'pe']) {
+    const chart = indChartCtx(ck).chart;
+    (inst.series[ck] || []).forEach(s => { try { chart.removeSeries(s); } catch (_) {} });
+  }
+  state.indInstances.splice(idx, 1);
+  renderIndList();
+}
+// Render the active-indicator pills (name + its own inputs + colours + remove).
+function renderIndList() {
+  const box = $('ind-active'); box.innerHTML = '';
+  state.indInstances.forEach(inst => {
+    const def = IND_CATALOG[inst.key];
+    const row = document.createElement('span'); row.className = 'ind-pill';
+    let h = `<b>${def.name}</b>`;
+    def.inputs.forEach(inp => h += `<input type="number" data-id="${inst.id}" data-p="${inp.k}" value="${inst.params[inp.k]}" min="${inp.min||1}" max="${inp.max||999}" step="${inp.step||1}" title="${inp.label||inp.k}"/>`);
+    def.colors.forEach(c => h += `<input type="color" data-id="${inst.id}" data-p="${c.k}" value="${inst.params[c.k]}"/>`);
+    h += `<button class="rm" data-rm="${inst.id}" title="Remove">×</button>`;
+    row.innerHTML = h; box.appendChild(row);
+  });
+  box.querySelectorAll('input[data-p]').forEach(inp => {
+    const ev = inp.type === 'color' ? 'input' : 'change';
+    inp.addEventListener(ev, () => {
+      const inst = state.indInstances.find(x => x.id === +inp.dataset.id); if (!inst) return;
+      if (inp.type === 'color') inst.params[inp.dataset.p] = inp.value;
+      else { const n = Math.max(+inp.min || 1, Math.min(+inp.max || 999, parseFloat(inp.value) || inst.params[inp.dataset.p])); inst.params[inp.dataset.p] = n; inp.value = n; }
+      drawInstance(inst);
+    });
+  });
+  box.querySelectorAll('button[data-rm]').forEach(b => b.addEventListener('click', () => removeInstance(+b.dataset.rm)));
 }
 
 // ── Stats / live-snapshot helpers ───────────────────────────────────────────
@@ -1052,36 +1305,108 @@ function renderStats(t) {
     c ? `<div class="chip"><span class="lbl">O / H / L / C</span>
        <span class="val">${fmt(c.close)}</span>
        <span class="sub">${fmt(c.open)} · ${fmt(c.high)} · ${fmt(c.low)}</span></div>` : '',
-    `<div class="chip iv"><span class="lbl">IV</span>
-       <span class="val">${fmtPct(iv)}</span>
-       <span class="sub">day ${fmtPct(ivToday.low)} → ${fmtPct(ivToday.high)}</span></div>`,
-    `<div class="chip rv"><span class="lbl">RV (spot)</span>
-       <span class="val">${fmtPct(rv)}</span>
-       <span class="sub">day ${fmtPct(rvToday.low)} → ${fmtPct(rvToday.high)}</span></div>`,
-    `<div class="chip ${ivSpread != null && ivSpread > 0 ? 'pos' : 'neg'}">
-       <span class="lbl">IV − RV</span>
-       <span class="val">${fmtSigned(ivSpread)}</span>
-       <span class="sub">VRP at cursor</span></div>`,
     `<div class="chip"><span class="lbl">Spot</span>
        <span class="val">${fmt(spt, 1)}</span>
        <span class="sub">day ${fmt(sptToday.low,1)} → ${fmt(sptToday.high,1)}</span></div>`,
-    `<div class="chip ${(dOI||0) >= 0 ? 'pos' : 'neg'}">
-       <span class="lbl">ΔOI from open</span>
-       <span class="val">${fmtSigned(dOI, 0)}</span>
-       <span class="sub">${fmtOI(oi)} @ cursor · ${fmtOI(oiToday.open)} @ open</span></div>`,
-    `<div class="chip"><span class="lbl">Δ / Γ</span>
-       <span class="val">${fmt(del, 2)} / ${fmt(gam, 4)}</span>
-       <span class="sub">delta · gamma</span></div>`,
-    `<div class="chip"><span class="lbl">Θ / ν</span>
-       <span class="val">${fmt(tht, 2)} / ${fmt(veg, 2)}</span>
-       <span class="sub">theta·day · vega·%</span></div>`,
-    c && prToday.open != null
-      ? `<div class="chip ${(dPremium||0) >= 0 ? 'pos' : 'neg'}">
-           <span class="lbl">premium Δ today</span>
-           <span class="val">${fmtSigned(dPremium, 2)}</span>
-           <span class="sub">${fmt(prToday.open)} → ${fmt(c.close)}</span></div>` : '',
   ].filter(Boolean).join('');
   document.getElementById('stats').innerHTML = chips;
+}
+
+// ── Basket entry→exit P&L (short straddle / strangle) ──────────────────────
+// Combined premium = CE + PE aligned bar-by-bar. Entry credit = combined OPEN of
+// the first bar in the window; mark = latest combined CLOSE. A short seller
+// profits as premium decays, so MtM = credit − mark. Mirrors the Straddle Basket.
+// Combined premium (CE+PE) aligned bar-by-bar, plus summed volume. Falls back to
+// the one traded leg when only CE or PE is loaded (Side = CE/PE). Shared by the
+// combined "Straddle" chart pane and the basket entry/exit stats strip.
+function computeCombined() {
+  const ceC = (state.lastCe && state.lastCe.candles) || [];
+  const peC = (state.lastPe && state.lastPe.candles) || [];
+  const ceV = (state.lastCe && state.lastCe.volume)  || [];
+  const peV = (state.lastPe && state.lastPe.volume)  || [];
+  const UP = 'rgba(38,166,154,.5)', DN = 'rgba(239,83,80,.5)';
+  let candles = [], volume = [];
+  if (ceC.length && peC.length) {
+    const pm = new Map(peC.map(c => [c.time, c]));
+    const cv = new Map(ceV.map(v => [v.time, v.value]));
+    const pv = new Map(peV.map(v => [v.time, v.value]));
+    for (const a of ceC) {
+      const b = pm.get(a.time);
+      if (!b) continue;
+      const cand = {time: a.time, open: a.open + b.open, high: a.high + b.high,
+                    low: a.low + b.low, close: a.close + b.close};
+      candles.push(cand);
+      volume.push({time: a.time, value: (cv.get(a.time) || 0) + (pv.get(a.time) || 0),
+                   color: cand.close >= cand.open ? UP : DN});
+    }
+  } else {
+    candles = (ceC.length ? ceC : peC).map(c => ({...c}));
+    volume  = (ceC.length ? ceV : peV).map(v => ({...v}));
+  }
+  return {candles, volume, both: !!(ceC.length && peC.length)};
+}
+
+// Draw the combined-premium candles (+ volume + spot) on the Straddle pane.
+function renderCombChart() {
+  const {candles, volume} = computeCombined();
+  if (state.sCandleComb) state.sCandleComb.setData(candles);
+  if (state.sVolComb)    state.sVolComb.setData(volume);
+  if (state.sSpotComb)   state.sSpotComb.setData(state.showSpot ? (state.lastShared.spot || []) : []);
+  if (state.view === 'straddle' && state.cComb) { try { state.cComb.timeScale().fitContent(); } catch (_) {} }
+}
+
+// Show either the combined Straddle pane (default) or the CE/PE Legs panes.
+function applyView() {
+  const straddle = state.view === 'straddle';
+  const combEl  = document.getElementById('pane-comb');
+  const priceEl = document.getElementById('pane-price');
+  if (combEl)  combEl.style.display  = straddle ? '' : 'none';
+  if (priceEl) priceEl.style.display = straddle ? 'none' : '';
+  const c = straddle ? state.cComb : state.cPriceCe;
+  if (c) { try { c.timeScale().fitContent(); } catch (_) {} }
+}
+
+function renderBasketStats() {
+  const el = document.getElementById('basket');
+  const ceC = (state.lastCe && state.lastCe.candles) || [];
+  const peC = (state.lastPe && state.lastPe.candles) || [];
+  const comb = computeCombined().candles;
+  if (!comb.length) { el.classList.add('hidden'); el.innerHTML = ''; return; }
+
+  const credit = comb[0].open;
+  const mark   = comb[comb.length - 1].close;
+  const hi = Math.max(...comb.map(c => c.high));
+  const lo = Math.min(...comb.map(c => c.low));
+  const mtm    = credit - mark;
+  const mtmPct = credit ? mtm / credit * 100 : null;
+  const both = ceC.length && peC.length;
+  const isStraddle = both && state.ceStrike === state.peStrike;
+  const kind = !both ? (ceC.length ? 'CALL' : 'PUT')
+                     : (isStraddle ? 'STRADDLE' : 'STRANGLE');
+  const legLbl = !both ? (ceC.length ? `${state.ceStrike} CE` : `${state.peStrike} PE`)
+                       : `${state.ceStrike} CE / ${state.peStrike} PE`;
+  const rupees = v => '₹' + Math.round(v * state.lot).toLocaleString('en-IN');
+  const pn = mtm >= 0 ? 'pos' : 'neg';
+
+  const chips = [
+    `<div class="kind">${kind}<small>${legLbl}</small></div>`,
+    `<div class="chip credit"><span class="lbl">credit · entry</span>
+       <span class="val">${fmt(credit)}</span>
+       <span class="sub">${rupees(credit)} · max profit</span></div>`,
+    `<div class="chip mark"><span class="lbl">mark · now</span>
+       <span class="val">${fmt(mark)}</span>
+       <span class="sub">window ${fmt(lo)} → ${fmt(hi)}</span></div>`,
+    `<div class="chip ${pn}"><span class="lbl">MtM · short</span>
+       <span class="val">${fmtSigned(mtm)}</span>
+       <span class="sub">${fmtSigned(mtmPct, 1)}% · ${rupees(mtm)}</span></div>`,
+    both
+      ? `<div class="chip"><span class="lbl">break-evens</span>
+           <span class="val">${Math.round(state.peStrike - credit)} / ${Math.round(state.ceStrike + credit)}</span>
+           <span class="sub">width ${state.ceStrike - state.peStrike}</span></div>`
+      : '',
+  ].filter(Boolean).join('');
+  el.innerHTML = chips;
+  el.classList.remove('hidden');
 }
 
 // ── Strategy events ────────────────────────────────────────────────────────
@@ -1092,103 +1417,6 @@ function istUnix(y, mo, da, h, m) {
 }
 const ENTRY_HHMM = [15, 20];   // matches notebook ENTRY_TIME
 const EXIT_HHMM  = [9, 20];    // matches notebook EXIT_TIME
-
-async function loadEvents() {
-  try {
-    const r = await fetch('/api/events');
-    if (!r.ok) return;
-    const j = await r.json();
-    state.events = j.events || [];
-    const sel = document.getElementById('event');
-    sel.innerHTML = '';
-    const opt0 = document.createElement('option');
-    opt0.value = ''; opt0.textContent = `— pick an expiry (${state.events.length} events) —`;
-    sel.appendChild(opt0);
-    state.events.forEach((ev, i) => {
-      const o = document.createElement('option');
-      o.value = String(i);
-      const wl = ev.profitable ? 'WIN ' : 'LOSS';
-      const sign = ev.pnl_points >= 0 ? '+' : '';
-      const pml = ev.p_lgbm != null ? ` · p=${ev.p_lgbm.toFixed(2)}` : '';
-      o.textContent = `${ev.expiry}  ${wl}  ${sign}${ev.pnl_points.toFixed(1)}pts${pml}`;
-      sel.appendChild(o);
-    });
-  } catch (_) {}
-}
-
-async function pickEvent(idx) {
-  const ev = state.events[idx];
-  if (!ev) { state.activeEvent = null; applyAllMarkers(); return; }
-  state.activeEvent = ev;
-
-  // Anchor the window on the EXPIRY day so the 09:20 exit marker is visible.
-  // Lookback=3 → [entry-day-1, entry-day, expiry-day], so entry @ prev-day 15:20
-  // and exit @ expiry-day 09:20 (plus rest of expiry-day candles) are all on-screen.
-  const expiryDate = ev.expiry.replace(/-/g, '');   // 'YYYY-MM-DD' → 'YYYYMMDD'
-
-  state.programmaticChange = true;
-  document.getElementById('lookback').value = '3';
-  state.lookbackDays = 3;
-
-  state.date = expiryDate;
-  const dateSel = document.getElementById('date');
-  if (![...dateSel.options].some(o => o.value === expiryDate)) {
-    const o = document.createElement('option'); o.value = expiryDate;
-    o.textContent = `${expiryDate.slice(0,4)}-${expiryDate.slice(4,6)}-${expiryDate.slice(6)}`;
-    dateSel.appendChild(o);
-  }
-  dateSel.value = expiryDate;
-
-  await loadExpiries();
-  state.expiry = ev.expiry;
-  const exSel = document.getElementById('expiry');
-  if (![...exSel.options].some(o => o.value === ev.expiry)) {
-    const o = document.createElement('option'); o.value = ev.expiry; o.textContent = ev.expiry;
-    exSel.appendChild(o);
-  }
-  exSel.value = ev.expiry;
-
-  await loadStrikes();
-  state.strike = ev.atm_strike;
-  const kSel = document.getElementById('strike');
-  if (![...kSel.options].some(o => +o.value === ev.atm_strike)) {
-    const o = document.createElement('option'); o.value = String(ev.atm_strike);
-    o.textContent = `${ev.atm_strike}  ★ ATM (event)`; kSel.appendChild(o);
-  }
-  kSel.value = String(ev.atm_strike);
-
-  // Show CE + PE split for the straddle
-  state.otype = 'BOTH';
-  document.getElementById('otype').value = 'BOTH';
-
-  state.programmaticChange = false;
-  await loadLeg();
-  await loadTradeDetail();
-}
-
-// Resolve full per-leg trade detail for the active event, draw banner + lines.
-async function loadTradeDetail() {
-  clearTradePriceLines();
-  if (!state.activeEvent) {
-    state.activeTrade = null;
-    renderTradeBanner();
-    return;
-  }
-  const ev = state.activeEvent;
-  try {
-    const qs = new URLSearchParams({
-      expiry: ev.expiry,
-      entry_date: ev.entry_date,
-      atm_strike: ev.atm_strike,
-    });
-    const r = await fetch('/api/event_detail?' + qs);
-    if (!r.ok) { state.activeTrade = null; renderTradeBanner(); return; }
-    state.activeTrade = await r.json();
-  } catch (_) { state.activeTrade = null; }
-  renderTradeBanner();
-  applyTradePriceLines();
-  applyAllMarkers();   // refresh markers now that per-leg prices are known
-}
 
 function renderTradeBanner() {
   const el = document.getElementById('trade-info');
@@ -1342,17 +1570,31 @@ function applyAllMarkers() {
 }
 
 // ── Data loading ───────────────────────────────────────────────────────────
+const isoDate = s => (s && s.length === 8) ? `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6)}` : s;
+const ymdDate = s => (s || '').replace(/-/g, '');
+
+// Snap an ISO date to the nearest available trading day at-or-before it, so the
+// calendar can be pointed at any date (weekends/holidays roll back to the last
+// session with data).
+function snapDay(iso) {
+  const t = ymdDate(iso);
+  const days = state.daysAll;
+  if (!days.length) return t;
+  if (days.includes(t)) return t;
+  let best = null;
+  for (const d of days) { if (d <= t) best = d; else break; }
+  return best || days[0];
+}
+
 async function loadDays() {
   const r = await fetch('/api/days');
   const days = await r.json();
-  const sel = $('date'); sel.innerHTML = '';
-  days.forEach(d => {
-    const o = document.createElement('option');
-    o.value = d; o.textContent = `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6)}`;
-    sel.appendChild(o);
-  });
-  const pref = days.includes('20240321') ? '20240321' : days[days.length - 1];
-  sel.value = pref; state.date = pref;
+  state.daysAll = days;
+  const inp = $('date');
+  inp.min = isoDate(days[0]);
+  inp.max = isoDate(days[days.length - 1]);
+  const pref = days[days.length - 1];        // most recent trading day (today's data when available)
+  inp.value = isoDate(pref); state.date = pref;
 }
 
 async function loadExpiries() {
@@ -1370,14 +1612,33 @@ async function loadStrikes() {
   const r = await fetch(`/api/strikes?date=${state.date}&expiry=${encodeURIComponent(state.expiry)}`);
   if (!r.ok) return;
   const j = await r.json();
-  const sel = $('strike'); sel.innerHTML = '';
-  j.strikes.forEach(k => {
-    const o = document.createElement('option'); o.value = k; o.textContent = k;
-    if (k === j.atm) o.textContent += '  ★ ATM';
-    sel.appendChild(o);
-  });
-  state.strike = j.atm ?? j.strikes[Math.floor(j.strikes.length / 2)];
-  sel.value = state.strike;
+  state.strikesList = j.strikes || [];
+  state.step = j.step || 50;
+  // ATM anchored on the day's opening spot (Basket convention: short at the open).
+  state.atm = j.atm_open ?? j.atm ??
+              (state.strikesList.length ? state.strikesList[Math.floor(state.strikesList.length / 2)] : null);
+  state.strike = state.atm;          // keep anchor in sync for strategy-event code
+  resolveLegs();
+}
+
+// Snap a target strike to the nearest available strike in the current expiry.
+function snapStrike(target) {
+  const ks = state.strikesList;
+  if (!ks || !ks.length || target == null) return null;
+  return ks.reduce((a, b) => Math.abs(b - target) < Math.abs(a - target) ? b : a);
+}
+
+// Resolve ceStrike/peStrike from the ATM anchor + per-leg offsets; refresh labels.
+function resolveLegs() {
+  if (state.atm == null) { state.ceStrike = state.peStrike = null; }
+  else {
+    state.ceStrike = snapStrike(state.atm + state.ceOff * state.step);
+    state.peStrike = snapStrike(state.atm + state.peOff * state.step);
+  }
+  const offLbl = o => o === 0 ? 'ATM' : (o > 0 ? `+${o}` : `${o}`);
+  const ceV = $('ceV'), peV = $('peV');
+  if (ceV) ceV.innerHTML = `${offLbl(state.ceOff)}<small>${state.ceStrike ?? '—'}</small>`;
+  if (peV) peV.innerHTML = `${offLbl(state.peOff)}<small>${state.peStrike ?? '—'}</small>`;
 }
 
 function fetchLeg(qsParams) {
@@ -1386,7 +1647,7 @@ function fetchLeg(qsParams) {
 }
 
 async function loadLeg() {
-  if (!state.date || !state.expiry || !state.strike) return;
+  if (!state.date || !state.expiry || (state.ceStrike == null && state.peStrike == null)) return;
   setStatus('Loading…');
 
   // Toggle CE/PE pane visibility based on otype
@@ -1401,16 +1662,16 @@ async function loadLeg() {
   // IV / OI / RV are no longer charted, but the API still computes them so
   // the cursor-driven stats chips (IV / RV / IV-RV / ΔOI / greeks) keep working.
   const baseQs = {
-    date: state.date, expiry: state.expiry, strike: state.strike,
+    date: state.date, expiry: state.expiry,
     tf: state.tfPrice,
     with_iv: true, with_oi: true,
-    with_spot: state.showSpot, with_rv: true,
+    with_spot: true, with_rv: true,     // fetch spot for the top readout + IV/RV (overlay not drawn)
     rv_window: 30, rv_estimator: 'close',
     lookback_days: state.lookbackDays,
   };
   const [ce, pe] = await Promise.all([
-    needCe ? fetchLeg({...baseQs, type: 'CE'}) : null,
-    needPe ? fetchLeg({...baseQs, type: 'PE'}) : null,
+    (needCe && state.ceStrike != null) ? fetchLeg({...baseQs, strike: state.ceStrike, type: 'CE'}) : null,
+    (needPe && state.peStrike != null) ? fetchLeg({...baseQs, strike: state.peStrike, type: 'PE'}) : null,
   ]);
 
   if (!ce && !pe) { setStatus('Error: leg fetch failed'); return; }
@@ -1433,16 +1694,16 @@ async function loadLeg() {
 
   const rvSrc = ce || pe;
 
-  // ── Cache per-leg ──
-  state.lastCe = ce ? {candles: ce.candles, iv: ce.iv||[], oi: ce.oi||[],
+  // ── Cache per-leg (volume kept too so the combined pane can sum it) ──
+  state.lastCe = ce ? {candles: ce.candles, volume: ce.volume||[], iv: ce.iv||[], oi: ce.oi||[],
                        greeks: ce.greeks||{delta:[],gamma:[],theta:[],vega:[]},
                        stats: ce.stats||null}
-                    : {candles: [], iv: [], oi: [],
+                    : {candles: [], volume: [], iv: [], oi: [],
                        greeks:{delta:[],gamma:[],theta:[],vega:[]}, stats: null};
-  state.lastPe = pe ? {candles: pe.candles, iv: pe.iv||[], oi: pe.oi||[],
+  state.lastPe = pe ? {candles: pe.candles, volume: pe.volume||[], iv: pe.iv||[], oi: pe.oi||[],
                        greeks: pe.greeks||{delta:[],gamma:[],theta:[],vega:[]},
                        stats: pe.stats||null}
-                    : {candles: [], iv: [], oi: [],
+                    : {candles: [], volume: [], iv: [], oi: [],
                        greeks:{delta:[],gamma:[],theta:[],vega:[]}, stats: null};
   state.lastShared = {
     rv: (rvSrc && rvSrc.rv) || [],
@@ -1468,28 +1729,38 @@ async function loadLeg() {
   applyAllMarkers();
   applyTradePriceLines();   // re-attach trade lines after series.setData()
   renderStats(null);
+  renderBasketStats();
+  renderCombChart();
+  drawAllIndicators();
 }
 
 // ── Wire UI ────────────────────────────────────────────────────────────────
 function attachToggles() {
+  document.querySelectorAll('#view-grp button').forEach(b => b.addEventListener('click', () => {
+    document.querySelectorAll('#view-grp button').forEach(x => x.classList.remove('on'));
+    b.classList.add('on'); state.view = b.dataset.view; applyView();
+  }));
   document.querySelectorAll('#tf-price button').forEach(b => b.addEventListener('click', () => {
     document.querySelectorAll('#tf-price button').forEach(x => x.classList.remove('on'));
     b.classList.add('on'); state.tfPrice = b.dataset.tf; loadLeg();
   }));
-  $('tg-spot').addEventListener('click', () => { state.showSpot = !state.showSpot; $('tg-spot').classList.toggle('on', state.showSpot); loadLeg(); });
+  $('ind-add').addEventListener('change', e => {
+    if (e.target.value) { addInstance(e.target.value); e.target.value = ''; }
+  });
 
   function dropTrade() {
     state.activeEvent = null;
     state.activeTrade = null;
     clearTradePriceLines();
     renderTradeBanner();
-    const evSel = document.getElementById('event');
-    if (evSel) evSel.value = '';
   }
   $('date').addEventListener('change', async e => {
     if (state.programmaticChange) return;
-    state.date = e.target.value;
+    const snapped = snapDay(e.target.value);
+    state.date = snapped;
+    e.target.value = isoDate(snapped);          // reflect the snapped trading day
     dropTrade();
+    state.ceOff = 0; state.peOff = 0;           // re-centre legs on the new day's ATM
     await loadExpiries(); await loadStrikes(); loadLeg();
   });
   $('expiry').addEventListener('change', async e => {
@@ -1498,11 +1769,16 @@ function attachToggles() {
     dropTrade();
     await loadStrikes(); loadLeg();
   });
-  $('strike').addEventListener('change', e => {
-    if (state.programmaticChange) return;
-    state.strike = +e.target.value;
+  document.querySelectorAll('.stepper button').forEach(b => b.addEventListener('click', () => {
+    const leg = b.dataset.leg, d = +b.dataset.d;
+    if (leg === 'ce') state.ceOff += d; else state.peOff += d;
+    dropTrade();                                 // nudging leaves any pre-baked event
+    resolveLegs(); loadLeg();
+  }));
+  $('resetK').addEventListener('click', () => {
+    state.ceOff = 0; state.peOff = 0;
     dropTrade();
-    loadLeg();
+    resolveLegs(); loadLeg();
   });
   $('otype').addEventListener('change',  e => { state.otype  =  e.target.value; loadLeg(); });
   $('lookback').addEventListener('change', e => {
@@ -1510,23 +1786,6 @@ function attachToggles() {
     state.lookbackDays = +e.target.value; loadLeg();
   });
 
-  $('event').addEventListener('change', e => {
-    const v = e.target.value;
-    if (v === '') {
-      state.activeEvent = null;
-      state.activeTrade = null;
-      clearTradePriceLines();
-      renderTradeBanner();
-      applyAllMarkers();
-      return;
-    }
-    pickEvent(parseInt(v, 10));
-  });
-  $('tg-signals').addEventListener('click', () => {
-    state.showSignals = !state.showSignals;
-    $('tg-signals').classList.toggle('on', state.showSignals);
-    applyAllMarkers();
-  });
 }
 
 // ── Pane resize handles ───────────────────────────────────────────────────
@@ -1582,7 +1841,6 @@ async function boot() {
   attachToggles();
   attachResizers();
   await loadDays();
-  await loadEvents();
   await loadExpiries();
   await loadStrikes();
   loadLeg();
