@@ -166,8 +166,12 @@ def get_access_token(totp_jwt: str, totp_secret: str, timeout: int = 30) -> str:
 
 
 def _groww_symbol(symbol: str, exchange: str = 'NSE') -> str:
-    """Convert a plain trading symbol like 'RELIANCE' to Groww's namespaced form 'NSE-RELIANCE'."""
-    if '-' in symbol:
+    """Convert a plain trading symbol like 'RELIANCE' to Groww's namespaced form
+    'NSE-RELIANCE'. A bare hyphen is NOT a namespace marker — many real tickers
+    contain one (BAJAJ-AUTO, NAM-INDIA, HCL-INSYS, M-M), so we key off the
+    exchange prefix. (The old '-' in symbol test silently mangled every
+    hyphenated ticker into an unqueryable groww_symbol.)"""
+    if symbol.startswith(('NSE-', 'BSE-')):
         return symbol  # already namespaced
     return f'{exchange}-{symbol}'
 

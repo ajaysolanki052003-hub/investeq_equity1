@@ -578,6 +578,9 @@ HTML = r"""<!DOCTYPE html>
   .heat{display:grid;gap:2px;min-width:660px}
   .heat .hc{padding:6px 3px;text-align:center;font-size:11px;font-variant-numeric:tabular-nums;border-radius:3px;font-weight:700}
   .heat .hh{color:var(--mut);font-size:10px;text-transform:uppercase;letter-spacing:.06em;padding:4px;text-align:center;font-weight:600}
+  .heat .hsort{cursor:pointer;user-select:none;border-radius:4px}
+  .heat .hsort:hover{color:var(--txt);background:var(--chip)}
+  .heat .hh.on{color:var(--accent2)}
   .heat .hn{text-align:left;color:var(--txt);font-size:11.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:6px 8px 6px 2px}
 </style>
 </head>
@@ -635,13 +638,13 @@ HTML = r"""<!DOCTYPE html>
         <div><b style="color:#60a5fa">Improving</b> — 1M up, 3M still down</div>
         <div><b style="color:#fbbf24">Weakening</b> — 1M down, 3M up</div>
         <div><b style="color:var(--neg)">Lagging</b> — weak on both</div>
-        <div class="qnote">Each dot is a group; size = number of stocks. Top-right leads; bottom-right is turning up. Hover for details.</div>
+        <div class="qnote">Each dot is a group; size = number of stocks. Top-right leads; bottom-right is turning up. <b style="color:var(--accent2)">Click a dot for its stock list.</b></div>
       </div>
     </div>
   </div>
 
   <div class="card">
-    <h3>Return heatmap <span class="pill">group × timeframe</span> <span class="pill">sorted by 1M</span></h3>
+    <h3>Return heatmap <span class="pill">group × timeframe</span> <span class="pill">click a column to sort</span></h3>
     <div class="tablewrap"><div id="heat"></div></div>
   </div>
 
@@ -777,21 +780,24 @@ function renderQuadrant(){
   s+=`<text x="${W-m-4}" y="${m+11}" text-anchor="end" fill="#34d399" font-size="10" font-weight="700">LEADING</text><text x="${m+4}" y="${m+11}" fill="#fbbf24" font-size="10" font-weight="700">WEAKENING</text><text x="${m+4}" y="${H-m-5}" fill="#f87171" font-size="10" font-weight="700">LAGGING</text><text x="${W-m-4}" y="${H-m-5}" text-anchor="end" fill="#60a5fa" font-size="10" font-weight="700">IMPROVING</text>`;
   s+=`<text x="${W-m}" y="${(y0-5).toFixed(1)}" text-anchor="end" fill="#5c6b8a" font-size="9">1M %  →</text><text x="${(x0+5).toFixed(1)}" y="${m+9}" fill="#5c6b8a" font-size="9">↑ 3M %</text>`;
   pts.forEach(p=>{const c=p.x>=0?(p.y>=0?"#34d399":"#60a5fa"):(p.y>=0?"#fbbf24":"#f87171");
-    s+=`<circle cx="${px(p.x).toFixed(1)}" cy="${py(p.y).toFixed(1)}" r="${rad(p.n).toFixed(1)}" fill="${c}" fill-opacity="0.5" stroke="${c}" stroke-width="1"><title>${p.name} — 1M ${p.x.toFixed(1)}%, 3M ${p.y.toFixed(1)}% · ${p.n} stocks</title></circle>`;});
+    s+=`<circle cx="${px(p.x).toFixed(1)}" cy="${py(p.y).toFixed(1)}" r="${rad(p.n).toFixed(1)}" fill="${c}" fill-opacity="0.5" stroke="${c}" stroke-width="1.4" onclick="openSector('${p.name.replace(/'/g,"\\'")}')"><title>${p.name} — 1M ${p.x.toFixed(1)}%, 3M ${p.y.toFixed(1)}% · ${p.n} stocks — click for the list</title></circle>`;});
   pts.slice().sort((a,b)=>(Math.abs(b.x)+Math.abs(b.y))-(Math.abs(a.x)+Math.abs(a.y))).slice(0,4).forEach(p=>{
     s+=`<text x="${(px(p.x)+rad(p.n)+3).toFixed(1)}" y="${(py(p.y)+3).toFixed(1)}" fill="#c7d2f0" font-size="9">${p.name.length>15?p.name.slice(0,14)+'…':p.name}</text>`;});
   el.innerHTML=s+`</svg>`;
 }
+let HEATSORT="1M", HEATDIR=-1;
+function setHeatSort(w){ if(HEATSORT===w) HEATDIR*=-1; else {HEATSORT=w; HEATDIR=-1;} renderHeatmap(); }
 function renderHeatmap(){
   const WK=(META.windows||[]).map(w=>w.key);
-  const rows=DATA.sectors.slice().sort((a,b)=>{const x=a.rets["1M"],y=b.rets["1M"];if(x==null)return 1;if(y==null)return -1;return y-x;});
+  if(WK.indexOf(HEATSORT)<0) HEATSORT="1M";
+  const rows=DATA.sectors.slice().sort((a,b)=>{const x=a.rets[HEATSORT],y=b.rets[HEATSORT];if(x==null)return 1;if(y==null)return -1;return HEATDIR*(x-y);});
   const cap=18;
   const cell=v=>{if(v==null||isNaN(v))return `<div class="hc" style="background:#141d31;color:#5c6b8a;font-weight:500">—</div>`;
     const a=Math.min(0.92,Math.abs(v)/cap*0.85+0.1);
     const bg=v>=0?`rgba(52,211,153,${a.toFixed(2)})`:`rgba(248,113,113,${a.toFixed(2)})`;
     const fg=a>0.42?"#0a0e17":(v>=0?"#8ff0c8":"#ffb4b4");
     return `<div class="hc" style="background:${bg};color:${fg}">${(v>=0?"+":"")+v.toFixed(1)}</div>`;};
-  let h=`<div class="heat" style="grid-template-columns:minmax(150px,1.4fr) repeat(${WK.length},1fr)"><div class="hh" style="text-align:left">Group</div>`+WK.map(w=>`<div class="hh">${w}</div>`).join("");
+  let h=`<div class="heat" style="grid-template-columns:minmax(150px,1.4fr) repeat(${WK.length},1fr)"><div class="hh" style="text-align:left">Group</div>`+WK.map(w=>`<div class="hh hsort${w===HEATSORT?' on':''}" onclick="setHeatSort('${w}')">${w}${w===HEATSORT?(HEATDIR<0?' ▾':' ▴'):''}</div>`).join("");
   rows.forEach(r=>{h+=`<div class="hn" title="${r.sector}">${r.sector} <small style="color:#5c6b8a">${r.n}</small></div>`+WK.map(w=>cell(r.rets[w])).join("");});
   document.getElementById("heat").innerHTML=h+`</div>`;
 }
