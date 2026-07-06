@@ -564,14 +564,13 @@ def _intraday_payload(scope: str, date: str, topn: int = 7) -> dict:
     if not groups:
         return {"day": day, "times": [], "groups": {}}
 
-    # rank candidates by 1D daily move (cheap) so we only read 1m for the movers
-    rank_win = "1D" if "1D" in WIN_KEYS else WIN_KEYS[0]
-    def score(g):
-        col = rets.loc[[m for m in groups[g] if m in rets.index], rank_win].dropna()
-        return float(col.mean()) if len(col) else -1e9
-    # wide pool (the intraday day may differ from the daily as-of, so daily
-    # ranking is only a proxy) — compute intraday for the pool, then re-rank.
-    candidates = sorted(groups, key=score, reverse=True)[:max(topn + 13, 20)]
+    # Evaluate EVERY group's intraday return (no daily pre-filter) so the top-N
+    # is provably the true intraday top-N. The daily 1D ranking is only a proxy
+    # (the 1m feed can be a fresher day than the daily as-of) and was demonstrably
+    # dropping real intraday leaders, so we read all groups and rank on the 5m
+    # series itself. Cost is a one-time ~read-all per day, then cached.
+    rank_win = "intraday"
+    candidates = list(groups)
 
     # 5-minute session grid 09:15 .. 15:25 (session 09:15→15:30 = 375 min)
     grid = []
