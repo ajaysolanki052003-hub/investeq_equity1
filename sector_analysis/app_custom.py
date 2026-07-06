@@ -45,8 +45,11 @@ APP_BASE = os.environ.get("APP_BASE", "").rstrip("/")
 ROOT      = Path(__file__).resolve().parent.parent
 REF_DIR   = Path(__file__).resolve().parent / "ref"           # sector/index reference csvs
 DATA_DIR  = ROOT / "ema_scanner" / "data" / "1d"              # daily OHLCV feed
+INTRA_DIR = ROOT / "ema_scanner" / "data" / "1m"              # 1-minute feed (intraday)
 CACHE_DIR = ROOT / "ema_scanner" / "data" / "_sector2_cache"  # precomputed snapshot (custom universe)
 CHART_TAIL_DAYS = 400        # daily bars in the single-stock chart modal
+INTRA_TF_MIN = 5             # intraday resample: 5-minute buckets
+_INTRA_CACHE: dict = {}      # {(scope,date): payload} — per-day intraday sector lines
 
 # Return windows in TRADING days (approx NSE sessions).
 WINDOWS = [
@@ -456,6 +459,167 @@ def api_chart(sym: str = "", date: str = ""):
                          "sector": sec.get(sym, ""), "candles": candles})
 
 
+# ───────────────────────── intraday (5m) sector lines ──────────────────────
+def _intra_files() -> list[str]:
+    return sorted(glob.glob(str(INTRA_DIR / "*_historical.csv")))
+
+
+def latest_intraday_day() -> str | None:
+    """Most recent date present in the 1m feed (probe a few liquid names)."""
+    best = None
+    for sym in ("RELIANCE", "HDFCBANK", "INFY", "SBIN"):
+        p = INTRA_DIR / f"{sym}_historical.csv"
+        if not p.exists():
+            continue
+        try:
+            size = p.stat().st_size
+            with open(p, "rb") as f:
+                f.seek(max(0, size - 4000))
+                tail = f.read().decode("utf-8", "ignore").strip().split("\n")
+            d = tail[-1].split(",")[-1][:10]
+            if d and (best is None or d > best):
+                best = d
+        except Exception:
+            continue
+    return best
+
+
+def _read_1m_day(sym: str, day: str) -> list[tuple[str, float]]:
+    """One day's (datetime, close) 1-minute rows for a symbol via a tail read
+    (the day we want is near the end of the file). 1m schema:
+    timestamp,open,high,low,close,volume,datetime."""
+    p = INTRA_DIR / f"{sym}_historical.csv"
+    if not p.exists():
+        return []
+    size = p.stat().st_size
+    step = min(size, 260_000)            # ~last ~2 weeks of 1m bars
+    try:
+        with open(p, "rb") as f:
+            f.seek(size - step)
+            data = f.read().decode("utf-8", "ignore")
+    except Exception:
+        return []
+    out = []
+    for ln in data.split("\n"):
+        if not ln:
+            continue
+        parts = ln.split(",")
+        if len(parts) < 7:
+            continue
+        dt = parts[-1]
+        if not dt.startswith(day):
+            continue
+        try:
+            out.append((dt, float(parts[4])))
+        except ValueError:
+            continue
+    return out
+
+
+def _five_min_norm(rows: list[tuple[str, float]], grid: list[str]) -> np.ndarray | None:
+    """Normalised (base-100) 5-minute closes reindexed onto `grid` (list of
+    'YYYY-MM-DD HH:MM' bucket starts). Returns None if too sparse."""
+    if len(rows) < 10:
+        return None
+    s = pd.Series({pd.Timestamp(dt): c for dt, c in rows}).sort_index()
+    b = (s.resample(f"{INTRA_TF_MIN}min", closed="left", label="left").last().dropna())
+    if len(b) < 5:
+        return None
+    base = b.iloc[0]
+    if base <= 0:
+        return None
+    norm = b / base * 100.0
+    norm.index = norm.index.strftime("%Y-%m-%d %H:%M")
+    arr = np.array([norm.get(g, np.nan) for g in grid], float)
+    real = np.where(~np.isnan(arr))[0]
+    if len(real) == 0:
+        return None
+    last_real = real[-1]
+    # forward-fill INTERNAL gaps only; leave trailing NaN so a partial/live
+    # session ends the line at the last real bar instead of a flat stub to EOD.
+    last = np.nan
+    for i in range(last_real + 1):
+        if np.isnan(arr[i]):
+            arr[i] = last
+        else:
+            last = arr[i]
+    return arr
+
+
+def _intraday_payload(scope: str, date: str, topn: int = 7) -> dict:
+    snap = _snapshot()
+    day = date or latest_intraday_day()
+    if not day:
+        return {"day": None, "times": [], "groups": {}, "note": "no intraday data"}
+    ck = (scope, day, topn)
+    sig = INTRA_DIR.stat().st_mtime if INTRA_DIR.exists() else 0.0
+    hit = _INTRA_CACHE.get(ck)
+    if hit and hit.get("_sig") == sig:
+        return hit
+
+    # groups (Sector at top level, else Sub-sector) with their members
+    resolved = _resolve_day(snap, day)
+    rets = _rets_asof(snap, resolved)
+    groups = _sector_groups(snap, scope, rets)
+    if not groups:
+        return {"day": day, "times": [], "groups": {}}
+
+    # rank candidates by 1D daily move (cheap) so we only read 1m for the movers
+    rank_win = "1D" if "1D" in WIN_KEYS else WIN_KEYS[0]
+    def score(g):
+        col = rets.loc[[m for m in groups[g] if m in rets.index], rank_win].dropna()
+        return float(col.mean()) if len(col) else -1e9
+    # wide pool (the intraday day may differ from the daily as-of, so daily
+    # ranking is only a proxy) — compute intraday for the pool, then re-rank.
+    candidates = sorted(groups, key=score, reverse=True)[:max(topn + 13, 20)]
+
+    # 5-minute session grid 09:15 .. 15:25 (session 09:15→15:30 = 375 min)
+    grid = []
+    mins = 9 * 60 + 15
+    while mins <= 15 * 60 + 25:
+        grid.append(f"{day} {mins//60:02d}:{mins%60:02d}")
+        mins += INTRA_TF_MIN
+
+    lines = {}
+    for g in candidates:
+        arrs = []
+        for sym in groups[g]:
+            rows = _read_1m_day(sym, day)
+            a = _five_min_norm(rows, grid) if rows else None
+            if a is not None:
+                arrs.append(a)
+        if len(arrs) >= 2:                     # need a few names for an equal-weight line
+            lines[g] = (np.nanmean(np.vstack(arrs), axis=0), len(arrs))
+
+    # rank by intraday return (last valid normalised value), take topn
+    def last_val(a):
+        v = a[~np.isnan(a)]
+        return v[-1] if len(v) else -1e9
+    top = sorted(lines, key=lambda g: last_val(lines[g][0]), reverse=True)[:topn]
+
+    # naive-IST-as-UTC unix for lightweight-charts
+    def to_unix(s):
+        return int((pd.Timestamp(s) - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1))
+    times = [to_unix(g) for g in grid]
+    out_groups = {}
+    for g in top:
+        arr, n = lines[g]
+        out_groups[g] = {"n": n,
+                         "series": [None if np.isnan(v) else round(float(v), 3) for v in arr]}
+    payload = {"day": day, "times": times, "groups": out_groups,
+               "rank_win": rank_win, "_sig": sig}
+    _INTRA_CACHE[ck] = payload
+    return payload
+
+
+@app.get("/api/intraday")
+def api_intraday(scope: str = ALL_SCOPE, date: str = "", n: int = 7):
+    snap = _snapshot()
+    scope = _valid_scope(snap, scope)
+    n = max(1, min(int(n), 12))
+    return JSONResponse(_intraday_payload(scope, date or "", n))
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTML.replace("__APP_BASE__", APP_BASE)
@@ -525,6 +689,7 @@ HTML = r"""<!DOCTYPE html>
   .lg.off{opacity:.35}
   .lg .sw{width:14px;height:3px;border-radius:2px}
   #rotChart{height:340px}
+  #intraChart{height:360px}
   .resbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:10px}
   .count{font-size:14px;color:var(--mut)}
   .count b{color:var(--txt)}
@@ -625,6 +790,13 @@ HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h3>Intraday — top 7 groups at 5m <span class="pill" id="intraDay">—</span>
+      <span class="pill">equal-weight · base 100</span></h3>
+    <div id="intraChart"></div>
+    <div id="intraLegend"></div>
+  </div>
+
+  <div class="card">
     <h3>Universe composition <span class="pill">stocks per group</span></h3>
     <div class="pie-wrap"><div id="pie"></div><div class="pie-legend" id="pieLegend"></div></div>
   </div>
@@ -693,6 +865,7 @@ const BASE="__APP_BASE__";
 const WINS=["1D","1W","1M","3M","6M","1Y"];
 let META=null, STATE={scope:"all", win:"1M", date:""}, DATA=null, SORT={key:"win", dir:-1};
 let chart=null, candleSeries=null, rotChart=null, rotSeries={}, hidden={};
+let intraChart=null, intraSeries={}, intraHidden={};
 
 const PALETTE=["#a78bfa","#22d3ee","#34d399","#f472b6","#fbbf24","#60a5fa","#f87171",
   "#c084fc","#2dd4bf","#a3e635","#fb923c","#38bdf8","#e879f9","#4ade80","#facc15",
@@ -722,6 +895,7 @@ async function init(){
   dp.onchange=()=>{STATE.date=dp.value;load();};
   document.getElementById("latestBtn").onclick=()=>{dp.value=META.max_date||"";STATE.date=dp.value;load();};
   buildRotChart();
+  buildIntraChart();
   load();
 }
 function syncSeg(seg,btn){ seg.querySelectorAll("button").forEach(x=>x.classList.remove("on")); btn.classList.add("on"); }
@@ -743,6 +917,7 @@ async function load(){
   assignColors(DATA.sectors.map(s=>s.sector));
   renderBars(); renderTable(); renderRotation();
   renderPie(); renderQuadrant(); renderHeatmap();
+  renderIntraday();   // async, fire-and-forget (reads 1m data, cached per day)
 }
 
 const PIE_PAL=["#a78bfa","#22d3ee","#34d399","#f472b6","#fbbf24","#60a5fa","#f87171","#c084fc","#2dd4bf","#fb923c","#818cf8","#4ade80","#e879f9"];
@@ -892,6 +1067,58 @@ function renderLegend(){
     const n=g.dataset.n; hidden[n]=!hidden[n];
     if(rotSeries[n])rotSeries[n].applyOptions({visible:!hidden[n]});
     g.classList.toggle("off",hidden[n]);
+  });
+}
+
+/* ---- intraday top-7 (5m) chart ---- */
+// times are naive-IST-as-UTC unix -> read back with getUTC* to show the IST clock
+function fmtHM(t){const d=new Date(t*1000);return String(d.getUTCHours()).padStart(2,"0")+":"+String(d.getUTCMinutes()).padStart(2,"0");}
+function buildIntraChart(){
+  const box=document.getElementById("intraChart");
+  intraChart=LightweightCharts.createChart(box,{
+    layout:{background:{color:"transparent"},textColor:"#8a98b2"},
+    grid:{vertLines:{color:"#16203a"},horzLines:{color:"#16203a"}},
+    rightPriceScale:{borderColor:"#1e2940"},
+    timeScale:{borderColor:"#1e2940",timeVisible:true,secondsVisible:false,
+               tickMarkFormatter:(t)=>fmtHM(t)},
+    localization:{timeFormatter:(t)=>fmtHM(t)},
+    crosshair:{mode:0}, height:360,
+  });
+  new ResizeObserver(()=>intraChart.applyOptions({width:box.clientWidth})).observe(box);
+}
+async function renderIntraday(){
+  if(!intraChart)return;
+  Object.values(intraSeries).forEach(s=>intraChart.removeSeries(s)); intraSeries={};
+  document.getElementById("intraDay").textContent="loading…";
+  let d;
+  try{ d=await jget(`/api/intraday?scope=${encodeURIComponent(STATE.scope)}&date=${STATE.date}&n=7`); }
+  catch(e){ document.getElementById("intraDay").textContent="unavailable"; return; }
+  document.getElementById("intraDay").textContent=d.day||"—";
+  const names=Object.keys(d.groups||{});
+  if(!names.length){ document.getElementById("intraLegend").innerHTML='<div class="lg">No intraday data for the selected day.</div>'; return; }
+  // 100 reference line (flat)
+  const refSer=intraChart.addLineSeries({color:"#39466a",lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});
+  refSer.setData(d.times.map(t=>({time:t,value:100})));
+  intraSeries["__ref"]=refSer;
+  names.forEach((name,i)=>{
+    const col=PALETTE[i%PALETTE.length];
+    const ser=intraChart.addLineSeries({color:col,lineWidth:2,priceLineVisible:false,lastValueVisible:false});
+    const pts=[]; const S=d.groups[name].series;
+    for(let k=0;k<d.times.length;k++){ if(S[k]!==null&&S[k]!==undefined) pts.push({time:d.times[k],value:S[k]}); }
+    ser.setData(pts); ser.applyOptions({visible:!intraHidden[name]});
+    intraSeries[name]=ser;
+  });
+  intraChart.timeScale().fitContent();
+  // legend with intraday return + stock count
+  const el=document.getElementById("intraLegend");
+  el.innerHTML=names.map((n,i)=>{
+    const S=d.groups[n].series.filter(v=>v!==null); const ret=S.length?(S[S.length-1]-100):0;
+    return `<div class="lg ${intraHidden[n]?'off':''}" data-n="${n}"><span class="sw" style="background:${PALETTE[i%PALETTE.length]}"></span>${n} <b style="color:${ret>=0?'var(--pos)':'var(--neg)'}">${ret>=0?'+':''}${ret.toFixed(2)}%</b> <span style="color:var(--mut)">·${d.groups[n].n}</span></div>`;
+  }).join("");
+  el.querySelectorAll(".lg[data-n]").forEach(g=>g.onclick=()=>{
+    const n=g.dataset.n; intraHidden[n]=!intraHidden[n];
+    if(intraSeries[n])intraSeries[n].applyOptions({visible:!intraHidden[n]});
+    g.classList.toggle("off",intraHidden[n]);
   });
 }
 
