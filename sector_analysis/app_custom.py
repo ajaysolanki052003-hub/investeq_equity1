@@ -32,6 +32,7 @@ import csv
 import glob
 import os
 import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -516,29 +517,36 @@ def _read_1m_day(sym: str, day: str) -> list[tuple[str, float]]:
     return out
 
 
-def _five_min_norm(rows: list[tuple[str, float]], grid: list[str]) -> np.ndarray | None:
-    """Normalised (base-100) 5-minute closes reindexed onto `grid` (list of
-    'YYYY-MM-DD HH:MM' bucket starts). Returns None if too sparse."""
-    if len(rows) < 10:
+# Opening-session evaluation checkpoints (3-min steps, first 15 min) + EOD.
+INTRA_CHECKPOINTS = ["09:15", "09:18", "09:21", "09:24", "09:27", "09:30"]
+
+
+def _norm_1m_series(rows: list[tuple[str, float]]):
+    """Per-minute normalised (base-100 vs the 09:15 open) close series, or None."""
+    if len(rows) < 8:
         return None
     s = pd.Series({pd.Timestamp(dt): c for dt, c in rows}).sort_index()
-    b = (s.resample(f"{INTRA_TF_MIN}min", closed="left", label="left").last().dropna())
-    if len(b) < 5:
+    s = s[~s.index.duplicated(keep="last")]
+    if len(s) < 5:
         return None
-    base = b.iloc[0]
+    base = s.iloc[0]
     if base <= 0:
         return None
-    norm = b / base * 100.0
-    norm.index = norm.index.strftime("%Y-%m-%d %H:%M")
-    arr = np.array([norm.get(g, np.nan) for g in grid], float)
+    return s / base * 100.0
+
+
+def _series_to_grid(s, grid: list[str]) -> np.ndarray | None:
+    """Resample a normalised 1m series to 5m and reindex onto the chart grid."""
+    b = s.resample(f"{INTRA_TF_MIN}min", closed="left", label="left").last()
+    b.index = b.index.strftime("%Y-%m-%d %H:%M")
+    arr = np.array([b.get(g, np.nan) for g in grid], float)
     real = np.where(~np.isnan(arr))[0]
     if len(real) == 0:
         return None
-    last_real = real[-1]
     # forward-fill INTERNAL gaps only; leave trailing NaN so a partial/live
     # session ends the line at the last real bar instead of a flat stub to EOD.
     last = np.nan
-    for i in range(last_real + 1):
+    for i in range(real[-1] + 1):
         if np.isnan(arr[i]):
             arr[i] = last
         else:
@@ -546,77 +554,101 @@ def _five_min_norm(rows: list[tuple[str, float]], grid: list[str]) -> np.ndarray
     return arr
 
 
-def _intraday_payload(scope: str, date: str, topn: int = 7) -> dict:
-    snap = _snapshot()
-    day = date or latest_intraday_day()
-    if not day:
-        return {"day": None, "times": [], "groups": {}, "note": "no intraday data"}
-    ck = (scope, day, topn)
-    sig = INTRA_DIR.stat().st_mtime if INTRA_DIR.exists() else 0.0
-    hit = _INTRA_CACHE.get(ck)
-    if hit and hit.get("_sig") == sig:
-        return hit
+def _val_at(s, ts: pd.Timestamp):
+    """Normalised value at the last minute <= ts (i.e. return from 09:15 to ts)."""
+    sub = s[s.index <= ts]
+    return float(sub.iloc[-1]) if len(sub) else np.nan
 
-    # groups (Sector at top level, else Sub-sector) with their members
+
+def _intraday_compute(scope: str, day: str) -> dict:
+    """Heavy step (cached per scope/day): every group's 5m line + its equal-weight
+    normalised value at each opening checkpoint + its end-of-day return."""
+    snap = _snapshot()
     resolved = _resolve_day(snap, day)
     rets = _rets_asof(snap, resolved)
     groups = _sector_groups(snap, scope, rets)
-    if not groups:
-        return {"day": day, "times": [], "groups": {}}
 
-    # Evaluate EVERY group's intraday return (no daily pre-filter) so the top-N
-    # is provably the true intraday top-N. The daily 1D ranking is only a proxy
-    # (the 1m feed can be a fresher day than the daily as-of) and was demonstrably
-    # dropping real intraday leaders, so we read all groups and rank on the 5m
-    # series itself. Cost is a one-time ~read-all per day, then cached.
-    rank_win = "intraday"
-    candidates = list(groups)
-
-    # 5-minute session grid 09:15 .. 15:25 (session 09:15→15:30 = 375 min)
     grid = []
     mins = 9 * 60 + 15
-    while mins <= 15 * 60 + 25:
+    while mins <= 15 * 60 + 25:                       # 09:15 .. 15:25
         grid.append(f"{day} {mins//60:02d}:{mins%60:02d}")
         mins += INTRA_TF_MIN
+    cp_ts = {cp: pd.Timestamp(f"{day} {cp}:00") for cp in INTRA_CHECKPOINTS}
 
-    lines = {}
-    for g in candidates:
-        arrs = []
-        for sym in groups[g]:
+    allg = {}
+    for g, members in groups.items():
+        chart_arrs, cpv = [], {cp: [] for cp in INTRA_CHECKPOINTS}
+        for sym in members:
             rows = _read_1m_day(sym, day)
-            a = _five_min_norm(rows, grid) if rows else None
-            if a is not None:
-                arrs.append(a)
-        if len(arrs) >= 2:                     # need a few names for an equal-weight line
-            lines[g] = (np.nanmean(np.vstack(arrs), axis=0), len(arrs))
+            if not rows:
+                continue
+            s = _norm_1m_series(rows)
+            if s is None:
+                continue
+            arr = _series_to_grid(s, grid)
+            if arr is None:
+                continue
+            chart_arrs.append(arr)
+            for cp in INTRA_CHECKPOINTS:
+                cpv[cp].append(_val_at(s, cp_ts[cp]))
+        if len(chart_arrs) >= 2:                       # need a few names to average
+            line = np.nanmean(np.vstack(chart_arrs), axis=0)
+            v = line[~np.isnan(line)]
+            checks = {}
+            for cp in INTRA_CHECKPOINTS:
+                col = [x for x in cpv[cp] if not np.isnan(x)]
+                checks[cp] = round(float(np.mean(col)), 3) if col else None
+            allg[g] = {"line": line, "n": len(chart_arrs),
+                       "checks": checks, "final": float(v[-1]) if len(v) else None}
 
-    # rank by intraday return (last valid normalised value), take topn
-    def last_val(a):
-        v = a[~np.isnan(a)]
-        return v[-1] if len(v) else -1e9
-    top = sorted(lines, key=lambda g: last_val(lines[g][0]), reverse=True)[:topn]
+    def to_unix(x):
+        return int((pd.Timestamp(x) - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1))
+    return {"day": day, "grid": grid, "times": [to_unix(x) for x in grid], "all": allg}
 
-    # naive-IST-as-UTC unix for lightweight-charts
-    def to_unix(s):
-        return int((pd.Timestamp(s) - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1))
-    times = [to_unix(g) for g in grid]
-    out_groups = {}
+
+def _intraday_payload(scope: str, date: str, topn: int = 7, evalat: str = "eod") -> dict:
+    today = latest_intraday_day()
+    day = date or today
+    if not day:
+        return {"day": None, "times": [], "groups": {}, "eval": evalat,
+                "checkpoints": INTRA_CHECKPOINTS, "note": "no intraday data"}
+    # A past day's 1m data is immutable -> cache forever. The LIVE day keeps
+    # growing, so refresh at most once a minute (the 1m dir mtime churns on every
+    # atomic write and can't be used as the cache key during market hours).
+    sig = "final" if day != today else int(time.time() // 60)
+    ck = (scope, day)
+    comp = _INTRA_CACHE.get(ck)
+    if not (comp and comp.get("_sig") == sig):        # cache the heavy read per scope/day
+        comp = _intraday_compute(scope, day)
+        comp["_sig"] = sig
+        _INTRA_CACHE[ck] = comp
+
+    allg = comp["all"]
+    # ranking metric: normalised value at the chosen checkpoint, else the EOD move
+    def rankval(g):
+        if evalat in INTRA_CHECKPOINTS:
+            v = allg[g]["checks"].get(evalat)
+        else:
+            v = allg[g]["final"]
+        return v if v is not None else -1e9
+    top = sorted(allg, key=rankval, reverse=True)[:topn]
+
+    groups = {}
     for g in top:
-        arr, n = lines[g]
-        out_groups[g] = {"n": n,
-                         "series": [None if np.isnan(v) else round(float(v), 3) for v in arr]}
-    payload = {"day": day, "times": times, "groups": out_groups,
-               "rank_win": rank_win, "_sig": sig}
-    _INTRA_CACHE[ck] = payload
-    return payload
+        d = allg[g]
+        groups[g] = {"n": d["n"], "checks": d["checks"], "final": d["final"],
+                     "series": [None if np.isnan(v) else round(float(v), 3) for v in d["line"]]}
+    return {"day": day, "times": comp["times"], "groups": groups,
+            "eval": evalat, "checkpoints": INTRA_CHECKPOINTS}
 
 
 @app.get("/api/intraday")
-def api_intraday(scope: str = ALL_SCOPE, date: str = "", n: int = 7):
+def api_intraday(scope: str = ALL_SCOPE, date: str = "", n: int = 7, eval: str = "eod"):
     snap = _snapshot()
     scope = _valid_scope(snap, scope)
     n = max(1, min(int(n), 12))
-    return JSONResponse(_intraday_payload(scope, date or "", n))
+    ev = eval if eval in INTRA_CHECKPOINTS else "eod"
+    return JSONResponse(_intraday_payload(scope, date or "", n, ev))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -689,6 +721,9 @@ HTML = r"""<!DOCTYPE html>
   .lg .sw{width:14px;height:3px;border-radius:2px}
   #rotChart{height:340px}
   #intraChart{height:360px}
+  .intra-eval{display:flex;align-items:center;gap:10px;margin:2px 0 12px;flex-wrap:wrap}
+  .intra-eval .lab{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--mut)}
+  #intraEvalSeg button{font-size:12px;padding:6px 11px}
   .resbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:10px}
   .count{font-size:14px;color:var(--mut)}
   .count b{color:var(--txt)}
@@ -789,8 +824,10 @@ HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h3>Intraday — top 7 groups at 5m <span class="pill" id="intraDay">—</span>
-      <span class="pill">equal-weight · base 100</span></h3>
+    <h3>Intraday — top 7 groups <span class="pill" id="intraDay">—</span>
+      <span class="pill">equal-weight · base 100 (vs 09:15)</span></h3>
+    <div class="intra-eval"><span class="lab">Evaluate top 7 at:</span>
+      <div class="seg" id="intraEvalSeg"></div></div>
     <div id="intraChart"></div>
     <div id="intraLegend"></div>
   </div>
@@ -862,7 +899,7 @@ HTML = r"""<!DOCTYPE html>
 <script>
 const BASE="__APP_BASE__";
 const WINS=["1D","1W","1M","3M","6M","1Y"];
-let META=null, STATE={scope:"all", win:"1M", date:""}, DATA=null, SORT={key:"win", dir:-1};
+let META=null, STATE={scope:"all", win:"1M", date:"", intraEval:"eod"}, DATA=null, SORT={key:"win", dir:-1};
 let chart=null, candleSeries=null, rotChart=null, rotSeries={}, hidden={};
 let intraChart=null, intraSeries={}, intraHidden={};
 
@@ -895,6 +932,7 @@ async function init(){
   document.getElementById("latestBtn").onclick=()=>{dp.value=META.max_date||"";STATE.date=dp.value;load();};
   buildRotChart();
   buildIntraChart();
+  buildIntraEval();
   load();
 }
 function syncSeg(seg,btn){ seg.querySelectorAll("button").forEach(x=>x.classList.remove("on")); btn.classList.add("on"); }
@@ -1085,14 +1123,29 @@ function buildIntraChart(){
   });
   new ResizeObserver(()=>intraChart.applyOptions({width:box.clientWidth})).observe(box);
 }
+function buildIntraEval(){
+  const seg=document.getElementById("intraEvalSeg");
+  const cps=["09:15","09:18","09:21","09:24","09:27","09:30"];
+  const opts=cps.map(c=>({v:c,l:c})).concat([{v:"eod",l:"Full day"}]);
+  seg.innerHTML=opts.map(o=>`<button data-v="${o.v}" class="${o.v===STATE.intraEval?'on':''}">${o.l}</button>`).join("");
+  seg.querySelectorAll("button").forEach(b=>b.onclick=()=>{
+    STATE.intraEval=b.dataset.v; syncSeg(seg,b); renderIntraday();
+  });
+}
+// return each group's normalised value AT the selected evaluation time
+function intraRet(G,evalAt){
+  let v=(evalAt && evalAt!=="eod" && G.checks) ? G.checks[evalAt] : G.final;
+  return (v===null||v===undefined)?null:(v-100);
+}
 async function renderIntraday(){
   if(!intraChart)return;
   Object.values(intraSeries).forEach(s=>intraChart.removeSeries(s)); intraSeries={};
   document.getElementById("intraDay").textContent="loading…";
   let d;
-  try{ d=await jget(`/api/intraday?scope=${encodeURIComponent(STATE.scope)}&date=${STATE.date}&n=7`); }
+  try{ d=await jget(`/api/intraday?scope=${encodeURIComponent(STATE.scope)}&date=${STATE.date}&n=7&eval=${STATE.intraEval}`); }
   catch(e){ document.getElementById("intraDay").textContent="unavailable"; return; }
-  document.getElementById("intraDay").textContent=d.day||"—";
+  const evLbl=STATE.intraEval==="eod"?"full day":STATE.intraEval;
+  document.getElementById("intraDay").textContent=`${d.day||"—"} · ranked at ${evLbl}`;
   const names=Object.keys(d.groups||{});
   if(!names.length){ document.getElementById("intraLegend").innerHTML='<div class="lg">No intraday data for the selected day.</div>'; return; }
   // 100 reference line (flat)
@@ -1108,11 +1161,11 @@ async function renderIntraday(){
     intraSeries[name]=ser;
   });
   intraChart.timeScale().fitContent();
-  // legend with intraday return + stock count
+  // legend shows each group's return AT the selected evaluation time
   const el=document.getElementById("intraLegend");
   el.innerHTML=names.map((n,i)=>{
-    const S=d.groups[n].series.filter(v=>v!==null); const ret=S.length?(S[S.length-1]-100):0;
-    return `<div class="lg ${intraHidden[n]?'off':''}" data-n="${n}"><span class="sw" style="background:${PALETTE[i%PALETTE.length]}"></span>${n} <b style="color:${ret>=0?'var(--pos)':'var(--neg)'}">${ret>=0?'+':''}${ret.toFixed(2)}%</b> <span style="color:var(--mut)">·${d.groups[n].n}</span></div>`;
+    const ret=intraRet(d.groups[n],d.eval); const rv=ret===null?0:ret;
+    return `<div class="lg ${intraHidden[n]?'off':''}" data-n="${n}"><span class="sw" style="background:${PALETTE[i%PALETTE.length]}"></span>${n} <b style="color:${rv>=0?'var(--pos)':'var(--neg)'}">${rv>=0?'+':''}${rv.toFixed(2)}%</b> <span style="color:var(--mut)">·${d.groups[n].n}</span></div>`;
   }).join("");
   el.querySelectorAll(".lg[data-n]").forEach(g=>g.onclick=()=>{
     const n=g.dataset.n; intraHidden[n]=!intraHidden[n];
