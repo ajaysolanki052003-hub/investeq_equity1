@@ -761,6 +761,23 @@ body.resizing iframe, body.resizing canvas { pointer-events:none; }
 .basket .chip.credit { border-color:#facc1555; } .basket .chip.credit .val { color:#facc15; }
 .basket .chip.mark   { border-color:#60a5fa55; } .basket .chip.mark   .val { color:#93c5fd; }
 
+/* Gamma Blast signal banner (long-straddle EMA21 breakout) */
+.gb {
+  display:flex; gap:10px; align-items:stretch; flex-wrap:wrap;
+  padding:6px 16px; background:#101c14; border-bottom:1px solid #1f3a28; font-size:11px;
+}
+.gb.hidden { display:none; }
+.gb .kind { display:flex; flex-direction:column; justify-content:center; padding:5px 12px;
+  font-weight:800; letter-spacing:.4px; border:1px solid #22c55e55; border-radius:6px;
+  background:#122b1c; color:#4ade80; min-width:118px; }
+.gb .kind small { color:#7b8294; font-weight:600; font-size:10px; letter-spacing:.3px; }
+.gb.wait .kind { border-color:#6b7280aa; background:#1a1d27; color:#9ca3af; }
+.gb .chip.entry { border-color:#22c55e55; } .gb .chip.entry .val { color:#4ade80; }
+.gb .chip.sl    { border-color:#f8717155; } .gb .chip.sl .val    { color:#f87171; }
+.gb .chip.rule  { min-width:150px; } .gb .chip.rule .val { font-size:11px; }
+.gb .ok  { color:#4ade80; } .gb .no { color:#f87171; }
+#tg-gb.armed { background:#14532d; border-color:#22c55e; color:#86efac; }
+
 /* Trade-info banner (visible when a strategy event is active) */
 .trade {
   display:flex; gap:10px; align-items:stretch; flex-wrap:wrap;
@@ -833,6 +850,9 @@ body.resizing iframe, body.resizing canvas { pointer-events:none; }
     <button data-view="legs">Legs</button>
   </span>
 
+  <label>Signal</label>
+  <button id="tg-gb" title="Gamma Blast — long-straddle EMA21 breakout entry (after 12:30, spot move &lt;0.60%)">⚡ Gamma Blast</button>
+
   <label>Side</label>
   <select id="otype">
     <option value="BOTH" selected>BOTH (CE | PE)</option>
@@ -872,6 +892,10 @@ body.resizing iframe, body.resizing canvas { pointer-events:none; }
 
 <div class="basket hidden" id="basket">
   <!-- Filled by renderBasketStats(): short straddle/strangle entry→exit P&L -->
+</div>
+
+<div class="gb hidden" id="gbbar">
+  <!-- Filled by drawGammaBlast(): long-straddle EMA21-breakout entry signal -->
 </div>
 
 <div class="stats" id="stats">
@@ -918,6 +942,9 @@ const state = {
   atm: null, ceOff: 0, peOff: 0, ceStrike: null, peStrike: null,
   lot: 75,                       // NIFTY lot — combined premium ₹ = points × lot
   view: 'straddle',              // 'straddle' = combined CE+PE pane (default) | 'legs' = CE & PE panes
+  // Gamma Blast: long-straddle EMA21-breakout signal (rules from the trading note)
+  gammaBlast: false, gbEma: null, gbSL: null,
+  gbCeMarker: null, gbPeMarker: null,
   // chart handles per side (CE / PE candle panes only)
   cPriceCe: null, cPricePe: null,
   sCandleCe: null, sVolCe: null, sSpotCe: null,
@@ -1409,6 +1436,153 @@ function renderBasketStats() {
   el.classList.remove('hidden');
 }
 
+// ── Gamma Blast: long-straddle EMA21-breakout signal ────────────────────────
+// Rules (from the trading note):
+//   R1 trade active only after 12:30 IST
+//   R2 NIFTY spot net move < 0.60% from the day's open until 12:30
+//   R3 on the STRADDLE (combined premium) chart, a candle closes above EMA21,
+//      then the next candle breaks that candle's high  -> LONG straddle entry
+//   R4 SL = setup-candle low, or 25 points (whichever risks less)
+// Chart times are naive-IST-as-UTC, so getUTC* gives the IST wall clock.
+function _istHM(t){ const d=new Date(t*1000); return d.getUTCHours()*60 + d.getUTCMinutes(); }
+const GB_1230 = 12*60 + 30;
+
+function computeGammaBlast(){
+  const comb = computeCombined().candles;
+  if (comb.length < 3) return {ok:false, reason:'Not enough bars'};
+  const lastDay = dayKey(comb[comb.length-1].time);
+  const day = comb.filter(c => dayKey(c.time) === lastDay);
+  if (day.length < 3) return {ok:false, reason:'Not enough bars today', lastDay};
+
+  // EMA21 across the whole loaded window (proper warm-up), keyed by time.
+  const emaArr = emaLine(comb, 21);
+  const emaMap = new Map(emaArr.map(p => [p.time, p.value]));
+
+  // R2 — spot net move from open to 12:30
+  const spot = (state.lastShared.spot || []).filter(p => dayKey(p.time) === lastDay);
+  let spotMovePct = null;
+  if (spot.length){
+    const open = spot[0].value;
+    const till = spot.filter(p => _istHM(p.time) <= GB_1230);
+    const at1230 = till.length ? till[till.length-1].value : open;
+    if (open) spotMovePct = Math.abs(at1230 - open) / open * 100;
+  }
+  const spotOk = spotMovePct != null && spotMovePct < 0.60;
+
+  // R1+R3 — first candle after 12:30 whose PREVIOUS candle closed above EMA21
+  // and which breaks that previous candle's high.
+  let entry = null;
+  for (let i = 1; i < day.length; i++){
+    const c = day[i], p = day[i-1];
+    if (_istHM(c.time) < GB_1230) continue;
+    const ep = emaMap.get(p.time);
+    if (ep == null) continue;
+    if (p.close > ep && c.high > p.high){
+      const level = p.high;                          // breakout / entry level
+      const sl = Math.max(p.low, level - 25);        // R4: candle low, capped at 25 pts
+      entry = {setup:p, breakCand:c, level, sl, ema:ep};
+      break;
+    }
+  }
+  return {ok:true, lastDay, spotMovePct, spotOk, entry,
+          emaArr: emaArr.filter(p => dayKey(p.time) === lastDay)};
+}
+
+function drawGammaBlast(){
+  const bar = document.getElementById('gbbar');
+  // tear down any prior drawing
+  if (state.gbSL && state.sCandleComb){ try { state.sCandleComb.removePriceLine(state.gbSL); } catch(_){} state.gbSL = null; }
+  if (state.gbEma){ try { state.gbEma.setData([]); } catch(_){} }
+  state.gbCeMarker = state.gbPeMarker = null;
+
+  if (!state.gammaBlast){
+    bar.classList.add('hidden'); bar.innerHTML = '';
+    if (state.sCandleComb){ try { state.sCandleComb.setMarkers([]); } catch(_){} }
+    applyAllMarkers();
+    return;
+  }
+
+  const sig = computeGammaBlast();
+  const combMarkers = [];
+
+  // EMA21 basis line on the combined pane (dashed, distinct from user EMAs)
+  if (sig.ok && sig.emaArr && sig.emaArr.length){
+    if (!state.gbEma && state.cComb){
+      state.gbEma = state.cComb.addLineSeries({color:'#f59e0b', lineWidth:2, lineStyle:2,
+        priceLineVisible:false, lastValueVisible:false, crosshairMarkerVisible:false});
+    }
+    if (state.gbEma) state.gbEma.setData(sig.emaArr);
+  }
+
+  const e = sig.ok ? sig.entry : null;
+  if (e){
+    // combined chart: setup + entry markers
+    combMarkers.push({time:e.setup.time, position:'aboveBar', color:'#38bdf8', shape:'circle',
+                      text:'close>EMA21'});
+    combMarkers.push({time:e.breakCand.time, position:'belowBar', color:'#22c55e', shape:'arrowUp',
+                      text:`LONG @ ${fmt(e.level)}`});
+    // SL line
+    if (state.sCandleComb){
+      state.gbSL = state.sCandleComb.createPriceLine({price:e.sl, color:'#f87171', lineWidth:1,
+        lineStyle:2, axisLabelVisible:true, title:'SL'});
+    }
+    // per-leg entry markers at the breakout candle's time
+    const ceC = (state.lastCe.candles||[]).find(c => c.time === e.breakCand.time);
+    const peC = (state.lastPe.candles||[]).find(c => c.time === e.breakCand.time);
+    if (ceC) state.gbCeMarker = {time:e.breakCand.time, position:'belowBar', color:'#26a69a',
+      shape:'arrowUp', text:`BUY CE @ ${fmt(ceC.close)}`};
+    if (peC) state.gbPeMarker = {time:e.breakCand.time, position:'belowBar', color:'#ef5350',
+      shape:'arrowUp', text:`BUY PE @ ${fmt(peC.close)}`};
+  }
+  if (state.sCandleComb){ try { state.sCandleComb.setMarkers(combMarkers); } catch(_){} }
+  applyAllMarkers();
+  renderGbBanner(sig);
+}
+
+function renderGbBanner(sig){
+  const bar = document.getElementById('gbbar');
+  const spotTxt = sig.spotMovePct==null ? '—'
+    : `<span class="${sig.spotOk?'ok':'no'}">${sig.spotMovePct.toFixed(2)}%</span> ${sig.spotOk?'&lt;':'≥'} 0.60%`;
+  const e = sig.ok ? sig.entry : null;
+  if (e){
+    const dt = new Date(e.breakCand.time*1000);
+    const hh = String(dt.getUTCHours()).padStart(2,'0'), mm = String(dt.getUTCMinutes()).padStart(2,'0');
+    const ceC = (state.lastCe.candles||[]).find(c => c.time===e.breakCand.time);
+    const peC = (state.lastPe.candles||[]).find(c => c.time===e.breakCand.time);
+    const legTxt = (ceC&&peC) ? `${fmt(ceC.close)} CE + ${fmt(peC.close)} PE` : '—';
+    bar.className = 'gb';
+    bar.innerHTML = [
+      `<div class="kind">⚡ LONG STRADDLE<small>EMA21 breakout · entry ${hh}:${mm}</small></div>`,
+      `<div class="chip entry"><span class="lbl">entry (combined)</span>
+         <span class="val">${fmt(e.level)}</span>
+         <span class="sub">buy ${state.ceStrike} CE + ${state.peStrike} PE</span></div>`,
+      `<div class="chip"><span class="lbl">legs @ entry</span>
+         <span class="val" style="font-size:12px">${legTxt}</span>
+         <span class="sub">premium paid per leg</span></div>`,
+      `<div class="chip sl"><span class="lbl">stop loss</span>
+         <span class="val">${fmt(e.sl)}</span>
+         <span class="sub">candle low / 25 pts</span></div>`,
+      `<div class="chip rule"><span class="lbl">filters</span>
+         <span class="val">spot ${spotTxt}</span>
+         <span class="sub">after 12:30 · ${sig.spotOk?'setup valid':'move too big'}</span></div>`,
+    ].join('');
+  } else {
+    bar.className = 'gb wait';
+    const why = !sig.ok ? sig.reason
+      : (!sig.spotOk && sig.spotMovePct!=null ? `spot moved ${sig.spotMovePct.toFixed(2)}% (need &lt;0.60%)`
+      : 'no candle has closed above EMA21 then broken its high after 12:30 yet');
+    bar.innerHTML = [
+      `<div class="kind">⚡ GAMMA BLAST<small>watching · no entry</small></div>`,
+      `<div class="chip rule"><span class="lbl">spot move till 12:30</span>
+         <span class="val">${spotTxt}</span><span class="sub">R2 filter</span></div>`,
+      `<div class="chip"><span class="lbl">status</span>
+         <span class="val" style="font-size:12px">no trigger</span>
+         <span class="sub">${why}</span></div>`,
+    ].join('');
+  }
+  bar.classList.remove('hidden');
+}
+
 // ── Strategy events ────────────────────────────────────────────────────────
 // Backend stores naive IST timestamps as if UTC. To place a marker at "15:20 IST
 // on YYYY-MM-DD", construct the matching Unix value via Date.UTC.
@@ -1561,9 +1735,11 @@ function applyAllMarkers() {
   const evCE  = eventMarkersFor('CE');
   const evPE  = eventMarkersFor('PE');
   const evTOT = eventMarkersFor('TOTAL');
-  const ceMarkers = [...buildDayMarkersFor(state.lastCe.candles), ...evCE]
+  const gbCE = state.gbCeMarker ? [state.gbCeMarker] : [];
+  const gbPE = state.gbPeMarker ? [state.gbPeMarker] : [];
+  const ceMarkers = [...buildDayMarkersFor(state.lastCe.candles), ...evCE, ...gbCE]
                     .sort((a, b) => a.time - b.time);
-  const peMarkers = [...buildDayMarkersFor(state.lastPe.candles), ...evPE]
+  const peMarkers = [...buildDayMarkersFor(state.lastPe.candles), ...evPE, ...gbPE]
                     .sort((a, b) => a.time - b.time);
   try { state.sCandleCe.setMarkers(ceMarkers); } catch (_) {}
   try { state.sCandlePe.setMarkers(peMarkers); } catch (_) {}
@@ -1732,6 +1908,7 @@ async function loadLeg() {
   renderBasketStats();
   renderCombChart();
   drawAllIndicators();
+  drawGammaBlast();
 }
 
 // ── Wire UI ────────────────────────────────────────────────────────────────
@@ -1746,6 +1923,11 @@ function attachToggles() {
   }));
   $('ind-add').addEventListener('change', e => {
     if (e.target.value) { addInstance(e.target.value); e.target.value = ''; }
+  });
+  $('tg-gb').addEventListener('click', () => {
+    state.gammaBlast = !state.gammaBlast;
+    $('tg-gb').classList.toggle('armed', state.gammaBlast);
+    drawGammaBlast();
   });
 
   function dropTrade() {
