@@ -168,6 +168,7 @@ def main():
     ap.add_argument("--start", default="2020-01-01")
     ap.add_argument("--end", default="2100-01-01")
     ap.add_argument("--require-spot-filter", action="store_true", default=True)
+    ap.add_argument("--dump", default="", help="write per-trade CSV for the eval notebook")
     args = ap.parse_args()
 
     days = sorted(os.path.basename(p)[:-8] for p in glob.glob(os.path.join(OPT_DIR, "*.parquet")))
@@ -180,6 +181,9 @@ def main():
     tf_delta = pd.Timedelta(TF_RULE[args.tf])
     # gather entries once: (day, dte, path_after, level, setup_low)
     entries = []
+    signal_days = set()
+    control = {}   # day -> pnl of an UNCONDITIONAL 12:30 entry (same stop/EOD exit)
+    trade_recs = []  # rich per-trade rows for --dump / the eval notebook
     scanned = filtered_spot = 0
     for d in days:
         r = combined_straddle(d, args.tf)
@@ -192,6 +196,17 @@ def main():
         if args.require_spot_filter and not (spot_move < 0.60):
             filtered_spot += 1
             continue
+
+        # CONTROL: buy the straddle at the first candle >= 12:30 (market), same
+        # note stop (candle low / 25pt) + EOD exit. Tests whether the EMA21
+        # breakout adds anything over "just buy at 12:30 on a quiet day".
+        times = comb.index
+        ci = next((k for k in range(len(comb)) if _hm(times[k]) >= 750), None)
+        if ci is not None:
+            clvl = float(comb["close"].iloc[ci]); clow = float(comb["low"].iloc[ci])
+            cpath = path[path.index >= times[ci] + tf_delta]
+            control[d] = (simulate(cpath, clvl, clow, "note", 0)[0], dte)
+
         fe = find_entry(comb)
         if fe is None:
             continue
@@ -199,12 +214,24 @@ def main():
         brk_end = comb.index[entry_idx] + tf_delta          # monitor real fills after the breakout candle
         path_after = path[path.index >= brk_end]
         entries.append((d, dte, path_after, level, setup_low))
+        signal_days.add(d)
+        pnl, outcome = simulate(path_after, level, setup_low, "note", 0)
+        trade_recs.append(dict(
+            date=f"{d[:4]}-{d[4:6]}-{d[6:]}", dte=dte, atm=atm, expiry=expiry,
+            entry_time=comb.index[entry_idx].strftime("%H:%M"), spot_move=round(spot_move, 3),
+            level=round(level, 2), sl=round(max(setup_low, level - 25), 2),
+            pnl=round(pnl, 2), rupees=round(pnl * LOT, 0), outcome=outcome,
+            control_1230=round(control.get(d, (np.nan,))[0], 2)))
 
     print(f"days scanned (with data): {scanned}")
     print(f"days rejected by R2 spot<0.60% filter: {filtered_spot}")
     print(f"days with a valid entry: {len(entries)}  (TF={args.tf})\n")
     if not entries:
         return
+
+    if args.dump:
+        pd.DataFrame(trade_recs).to_csv(args.dump, index=False)
+        print(f"[dump] wrote {len(trade_recs)} trades -> {args.dump}\n")
 
     def stats(pnls):
         pnls = np.array(pnls, float)
@@ -259,6 +286,22 @@ def main():
         print(f"\n=== Expiry window only (DTE<=1), LONG note rule ===")
         print(f"trades={es['n']}  win%={es['win']:.1f}  avgPnL={es['avg']:.2f} pts (Rs {es['rupees']:.0f})  "
               f"total={es['total']:.0f} pts  avgWin={es['avg_win']:.1f}  avgLoss={es['avg_loss']:.1f}")
+
+    # CONTROL — does the EMA21 breakout entry beat just buying at 12:30?
+    print(f"\n=== CONTROL: EMA21-breakout signal vs unconditional 12:30 buy "
+          f"(same SL=candle-low/25pt, EOD exit) ===")
+    sig = stats([simulate(pa, lv, slw, "note", 0)[0] for (_, _, pa, lv, slw) in entries])
+    ctrl_same = stats([control[d][0] for d in signal_days if d in control])   # same days as the signal
+    ctrl_all = stats([v[0] for v in control.values()])                        # every quiet (R2) day
+    print(f"  SIGNAL      (breakout)        : n={sig['n']}  win%={sig['win']:.1f}  "
+          f"avgPnL={sig['avg']:.2f} pts  total={sig['total']:.0f}")
+    print(f"  CONTROL 12:30 (signal days)   : n={ctrl_same['n']}  win%={ctrl_same['win']:.1f}  "
+          f"avgPnL={ctrl_same['avg']:.2f} pts  total={ctrl_same['total']:.0f}")
+    print(f"  CONTROL 12:30 (all quiet days): n={ctrl_all['n']}  win%={ctrl_all['win']:.1f}  "
+          f"avgPnL={ctrl_all['avg']:.2f} pts  total={ctrl_all['total']:.0f}")
+    edge = sig['avg'] - ctrl_same['avg']
+    print(f"  -> breakout edge over 12:30-buy on the same days: {edge:+.2f} pts/trade "
+          f"({'signal adds value' if edge > 0.3 else 'signal adds little' if edge > -0.3 else 'signal WORSE'})")
 
     # DTE breakdown for the best config
     bsl, btp, _ = rows[0]
